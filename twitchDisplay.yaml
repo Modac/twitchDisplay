@@ -1,0 +1,56 @@
+esphome:
+  name: twitchdisplay
+
+esp32:
+  board: seeed_xiao_esp32c3
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: "::1"
+  password: !secret home_wifi_pw
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Twitchdisplay Fallback Hotspot"
+    password: "faw6DbuhT4m5"
+
+captive_portal:
+
+spi:
+  clk_pin: GPIO4
+  mosi_pin: GPIO6
+  miso_pin: GPIO5
+
+# Example minimal configuration entry
+display:
+  - platform: ili9xxx
+    model: ST7789V
+    dc_pin: GPIO1
+    reset_pin: GPIO10
+    cs_pin: GPIO7
+    transform:
+      swap_xy: true
+      mirror_x: true
+    dimensions:
+      height: 170
+      offset_height: 35
+      width: 320
+    # dimensions:
+    #   height: 320
+    #   width: 170
+    #   offset_width: 35
+    invert_colors: true
+    show_test_card: true
+    
