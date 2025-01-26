@@ -1,3 +1,11 @@
+# external_components:
+#   # use rtttl and dfplayer from ESPHome's dev branch in GitHub
+#   - source:
+#       type: git
+#       url: https://github.com/esphome/esphome
+#       ref: dev
+#     components: [ ili9xxx ]
+
 esphome:
   name: twitchdisplay
 
@@ -10,8 +18,8 @@ esp32:
 logger:
 
 # Enable Home Assistant API
-api:
-  password: ""
+#api:
+#  password: ""
 
 ota:
   - platform: esphome
@@ -27,6 +35,22 @@ wifi:
     password: "faw6DbuhT4m5"
 
 captive_portal:
+
+web_server:
+
+# Define a PWM output on the ESP32
+output:
+  - platform: ledc
+    pin: GPIO0
+    id: backlight_pwm
+
+# Define a monochromatic, dimmable light for the backlight
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
 
 spi:
   clk_pin: GPIO4
@@ -51,6 +75,20 @@ display:
     #   height: 320
     #   width: 170
     #   offset_width: 35
+    # color_palette: 8BIT
     invert_colors: true
-    show_test_card: true
+    #show_test_card: true
+    lambda: |-
+      it.strftime(10, 10, id(roboto_20),Color(0,0,255), "%c", id(sntp_time).now());
     
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+
+# Various ways to configure fonts
+font:
+    # gfonts://family[@weight]
+  - file: "gfonts://Roboto"
+    id: roboto_20
+    size: 20
