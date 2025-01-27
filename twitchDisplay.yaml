@@ -60,6 +60,7 @@ spi:
 # Example minimal configuration entry
 display:
   - platform: ili9xxx
+    id: my_display
     model: ST7789V
     dc_pin: GPIO1
     reset_pin: GPIO10
@@ -78,6 +79,7 @@ display:
     # color_palette: 8BIT
     invert_colors: true
     #show_test_card: true
+    auto_clear_enabled: false
     lambda: |-
       //it.strftime(10, 10, id(roboto_20),Color(0,0,255), "%c", id(sntp_time).now());
       it.rectangle(11, 14, 64, 64, Color(255,0,0));
@@ -106,6 +108,13 @@ time:
   - platform: sntp
     id: sntp_time
     timezone: Europe/Berlin
+    on_time:
+      # Every 5 minutes
+      - seconds: /5
+        then:
+          - lambda: |-
+              id(my_display).clear();
+              id(my_display).strftime(10, 10, id(roboto_20),Color(0,0,255), "%c", id(sntp_time).now());
 
 # Various ways to configure fonts
 font:
