@@ -9,6 +9,7 @@
  *    - Close message (handled by websockets lib)
  */
  
+#include "secrets.h"
 
 #include <Arduino.h>
 
@@ -113,7 +114,7 @@ void setup() {
     delay(1000);
   }
 
-  wifiMulti.addAP("::1", "pw");
+  wifiMulti.addAP("::1", WIFI_PW);
   
   // wait for WiFi connection
   while((wifiMulti.run() != WL_CONNECTED)){
@@ -147,7 +148,7 @@ void twitchCheckOnlineChannels(){
     USE_SERIAL.print("[HTTP] adding Headers...\n");
     // add headers
     http.setAuthorizationType("Bearer");
-    http.setAuthorization("");
+    http.setAuthorization(TWITCH_TOKEN);
     http.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
     
     USE_SERIAL.print("[HTTP] GET...\n");
