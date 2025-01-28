@@ -70,7 +70,7 @@ float p = 3.1415926;
 
 
 GFXcanvas16 canvas(320, 85); // 16-bit, 320x170 pixels
-GFXcanvas16 text_canvas(298+(6*8*2), 64); 
+GFXcanvas16 text_canvas(298+(6*8), 64); 
 
 void setup(void) {
   Serial.begin(9600);
@@ -150,13 +150,15 @@ void setup(void) {
   //mediabuttons();
   //delay(500);
 
+  tft.fillScreen(ST77XX_BLACK);
+  
   canvas.fillScreen(ST77XX_BLACK);
   canvas.drawRGBBitmap(11, 14, epd_bitmap_pietsmiet, 64, 64);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
 
   text_canvas.setCursor(0,0);
   text_canvas.setTextWrap(false);
-  text_canvas.setTextColor(ST77XX_WHITE);
+  text_canvas.setTextColor(ST77XX_CYAN);
   text_canvas.setTextSize(8);
   
   setHighFR();
@@ -176,13 +178,13 @@ void loop() {
     text_canvas.setCursor(0,0);
     text_canvas.print(&text[text_offset]);
     text_offset++;
-    text_offset%=15;
+    text_offset%=strlen(text)-5;
   }
   //enterPartialMode();
   tft.fillRect(11, 14+64+14, 298, 64, ST77XX_BLACK);
   drawRGBBitmapSectionFast(11, 14+64+14, text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
   //enterNormalMode();
-  o_X = (o_X+8)%(6*8);
+  o_X = (o_X+6)%(6*8);
   Serial.println(o_X);
   
   //tft.invertDisplay(true);
