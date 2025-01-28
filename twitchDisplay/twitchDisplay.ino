@@ -69,7 +69,8 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 float p = 3.1415926;
 
 
-GFXcanvas16 canvas(320, 170); // 16-bit, 320x170 pixels
+GFXcanvas16 canvas(320, 85); // 16-bit, 320x170 pixels
+GFXcanvas16 text_canvas(298+(6*8*2), 64); 
 
 void setup(void) {
   Serial.begin(9600);
@@ -97,7 +98,7 @@ void setup(void) {
   // SPI speed defaults to SPI_DEFAULT_FREQ defined in the library, you can override it here
   // Note that speed allowable depends on chip and quality of wiring, if you go too fast, you
   // may end up with a black screen some times, or all the time.
-  tft.setSPISpeed(40000000);
+  tft.setSPISpeed(80000000);
   Serial.println(F("Initialized"));
 
   uint16_t time = millis();
@@ -106,7 +107,7 @@ void setup(void) {
 
   Serial.println(time, DEC);
   delay(500);
-
+/*
   // large block of text
   tft.fillScreen(ST77XX_BLACK);
   testdrawtext("Lorem ipsum dolor sit amet, consectetur adipiscing elit. Curabitur adipiscing ante sed nibh tincidunt feugiat. Maecenas enim massa, fringilla sed malesuada et, malesuada sit amet turpis. Sed porttitor neque ut ante pretium vitae malesuada nunc bibendum. Nullam aliquet ultrices massa eu hendrerit. Ut sed nisi lorem. In vestibulum purus a tortor imperdiet posuere. ", ST77XX_WHITE);
@@ -138,6 +139,7 @@ void setup(void) {
   testfillcircles(10, ST77XX_BLUE);
   testdrawcircles(10, ST77XX_WHITE);
   delay(500);
+*/
 
   testroundrects();
   delay(500);
@@ -145,28 +147,118 @@ void setup(void) {
   testtriangles();
   delay(500);
 
-  mediabuttons();
-  delay(500);
+  //mediabuttons();
+  //delay(500);
 
   canvas.fillScreen(ST77XX_BLACK);
   canvas.drawRGBBitmap(11, 14, epd_bitmap_pietsmiet, 64, 64);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
 
+  text_canvas.setCursor(0,0);
+  text_canvas.setTextWrap(false);
+  text_canvas.setTextColor(ST77XX_WHITE);
+  text_canvas.setTextSize(8);
+  
+  setHighFR();
+
   Serial.println("done");
   delay(1000);
 }
 
+uint8_t o_X = 0;
+
+char text[] = "Hallo Test wasgehthierab?";
+uint8_t text_offset = 0;
+
 void loop() {
+  if(!o_X){
+    text_canvas.fillScreen(ST77XX_BLACK);
+    text_canvas.setCursor(0,0);
+    text_canvas.print(&text[text_offset]);
+    text_offset++;
+    text_offset%=15;
+  }
+  //enterPartialMode();
+  tft.fillRect(11, 14+64+14, 298, 64, ST77XX_BLACK);
+  drawRGBBitmapSectionFast(11, 14+64+14, text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
+  //enterNormalMode();
+  o_X = (o_X+8)%(6*8);
+  Serial.println(o_X);
+  
   //tft.invertDisplay(true);
-  canvas.fillRect(11, 14+64+14, 64, 64, ST77XX_BLACK);
+  if(o_X==0){
+  canvas.fillRect(11+64+14+64+14, 14, 64, 64, ST77XX_BLACK);
   canvas.fillRect(11+64+14, 14, 64, 64, ST77XX_BLACK);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
-  delay(500);
+  }
+  delay(20);
   //tft.invertDisplay(false);
-  canvas.drawRGBBitmap(11, 14+64+14, epd_bitmap_gronkh, 64, 64);
+  if(o_X==24){
+  canvas.drawRGBBitmap(11+64+14+64+14, 14, epd_bitmap_gronkh, 64, 64);
   canvas.drawRGBBitmap(11+64+14, 14, epd_bitmap_bonjwa, 64, 64);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
-  delay(500);
+  }
+  delay(20);
+}
+
+void setHighFR(){
+  uint8_t params[] = {0x01};
+  tft.sendCommand(0xC6, params, 1);
+}
+
+void set60FR(){
+  uint8_t params[] = {0x0F};
+  tft.sendCommand(0xC6, params, 1);
+}
+
+void enterPartialMode(){
+  uint8_t params[] = {0,50,0,50};
+  tft.sendCommand(ST77XX_PTLAR, params, 4);
+  tft.sendCommand(ST77XX_PTLON, params, 0);
+  delay(10);
+}
+
+void enterNormalMode(){
+  tft.sendCommand(ST77XX_NORON);
+  delay(10);
+}
+
+/*!
+   @brief   Draw a RAM-resident 8-bit image (grayscale) at the specified (x,y)
+   pos. But only the section specified by (o_x, o_y, w, h). Specifically for
+   8-bit display devices such as IS31FL3731; no color reduction/expansion is performed.
+    @param    x   Top left corner x coordinate
+    @param    y   Top left corner y coordinate
+    @param    bitmap  byte array with grayscale bitmap
+    @param    o_x  x offset of section in bitmap
+    @param    o_y  y offset of section in bitmap
+    @param    w   Width of section in pixels
+    @param    h   Height of section in pixels
+    @param    b_w  width of bitmap in pixels
+*/
+/**************************************************************************/
+void drawGrayscaleBitmapSection(int16_t x, int16_t y, uint8_t *bitmap,
+                                       int16_t o_x, int16_t o_y, int16_t w, int16_t h, int16_t b_w) {
+  tft.startWrite();
+  y += o_y;
+  for (int16_t j = o_y; j < (o_y+h); j++, y++) {
+    for (int16_t i = o_x; i < (o_x+w); i++) {
+      tft.writePixel(x + i - o_x, y - o_y, bitmap[j * b_w + i]);
+      //delayMicroseconds(1);
+    }
+  }
+  tft.endWrite();
+}
+
+void drawRGBBitmapSectionFast(int16_t x, int16_t y, uint16_t *bitmap,
+                                       int16_t o_x, int16_t o_y, int16_t w, int16_t h, int16_t b_w) {
+  tft.startWrite();
+  tft.setAddrWindow(x, y, w, h);
+  y += o_y;
+  for (int16_t j = o_y; j < (o_y+h); j++, y++) {
+      tft.writePixels(&bitmap[j * b_w + o_x], w);
+  }
+  tft.endWrite();
 }
 
 void testlines(uint16_t color) {
