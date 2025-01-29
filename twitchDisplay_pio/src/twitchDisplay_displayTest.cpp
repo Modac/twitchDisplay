@@ -39,7 +39,6 @@
 #include <SPI.h>
 #include "pics.h"
 #include "secrets.h"
-#include "twitchDisplay_displayTest.h"
 
 #if defined(ARDUINO_FEATHER_ESP32) // Feather Huzzah32
   #define TFT_CS         14
