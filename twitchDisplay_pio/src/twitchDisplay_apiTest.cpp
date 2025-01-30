@@ -27,6 +27,9 @@
 WiFiMulti wifiMulti;
 WebSocketsClient webSocket;
 
+String twitch_session_id = String();
+bool toSub = false;
+
 void hexdump(const void *mem, uint32_t len, uint8_t cols = 16) {
   const uint8_t* src = (const uint8_t*) mem;
   USE_SERIAL.printf("\n[HEXDUMP] Address: 0x%08X len: 0x%X (%d)", (ptrdiff_t)src, len, len);
@@ -45,6 +48,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
       USE_SERIAL.printf("[WSc] Disconnected! (length: %u)\n", length);
+      twitch_session_id.clear();
       break;
     case WStype_CONNECTED:
       USE_SERIAL.printf("[WSc] Connected to url: %s\n", payload);
@@ -74,6 +78,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       if(strcmp_P(message_type,(PGM_P) F("session_welcome"))==0){
         const char* session_id = doc["payload"]["session"]["id"];
         USE_SERIAL.printf("[TwitchApi] session id: %s\n", session_id);
+        // Copies session_id to global var
+        twitch_session_id = session_id;
+        toSub = true;
       }
       
       // send message to server
@@ -98,6 +105,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 }
 
 void twitchCheckOnlineChannels();
+bool twitchEventSub();
 
 void setup() {
 
@@ -132,11 +140,86 @@ void setup() {
   webSocket.onEvent(webSocketEvent);
 
   // try ever 5000 again if connection has failed
-  webSocket.setReconnectInterval(10000);
+  webSocket.setReconnectInterval(1000);
 }
 
 void loop() {
   webSocket.loop();
+  if(toSub && !twitch_session_id.isEmpty()){
+    if(twitchEventSub()){
+      toSub=false;
+    }
+  }
+}
+
+bool twitchEventSub(){
+  /*
+  curl -X POST 'https://api.twitch.tv/helix/eventsub/subscriptions' \
+  -H 'Authorization: Bearer q5ipcciplla87fjehclkow6w2a4qve' \
+  -H 'Client-Id: gp762nuuoqcoxypju8c569th9wz7q5' \
+  -H 'Content-Type: application/json' \
+  -d '{"type": "channel.update","version": "2","condition": {"broadcaster_user_id": "106159308"},"transport": {"method": "websocket","session_id": ""}}'
+
+  */
+
+  HTTPClient http;
+
+    USE_SERIAL.print("[HTTP] begin...\n");
+    http.useHTTP10(true);
+    http.begin("https://api.twitch.tv/helix/eventsub/subscriptions");  //HTTP
+
+    USE_SERIAL.print("[HTTP] adding Headers...\n");
+    // add headers
+    http.setAuthorizationType("Bearer");
+    http.setAuthorization(TWITCH_TOKEN);
+    http.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
+    http.addHeader("Content-Type", "application/json");
+    
+    USE_SERIAL.print("[HTTP] POST...\n");
+    // start connection and send HTTP header
+    int httpCode = http.POST("{\"type\": \"channel.update\",\"version\": \"2\",\"condition\": {\"broadcaster_user_id\": \"106159308\"},\"transport\": {\"method\": \"websocket\",\"session_id\": \"" + twitch_session_id + "\"}}");
+
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      USE_SERIAL.printf("[HTTP] POST... code: %d\n", httpCode);
+
+      // file found at server
+      //if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        USE_SERIAL.println(payload);
+        
+        //http.end();
+        //return true;
+        
+      //}
+    } else {
+      USE_SERIAL.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+
+    // start connection and send HTTP header
+    httpCode = http.POST("{\"type\": \"channel.update\",\"version\": \"2\",\"condition\": {\"broadcaster_user_id\": \"72793250\"},\"transport\": {\"method\": \"websocket\",\"session_id\": \"" + twitch_session_id + "\"}}");
+
+    // httpCode will be negative on error
+    if (httpCode > 0) {
+      // HTTP header has been send and Server response header has been handled
+      USE_SERIAL.printf("[HTTP] POST... code: %d\n", httpCode);
+
+      // file found at server
+      //if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        USE_SERIAL.println(payload);
+        
+        http.end();
+        return true;
+        
+      //}
+    } else {
+      USE_SERIAL.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+    return false;
 }
 
 void twitchCheckOnlineChannels(){
