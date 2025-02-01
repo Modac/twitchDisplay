@@ -22,8 +22,16 @@
 // PROGMEM and F() are pointless in ESP32
 static const char DEBUG_TAG[] = "TwitchDisplay";
 // inspiration from https://forum.arduino.cc/t/single-line-define-to-disable-code/636044/5
+
+#define SERIAL_PORT Serial
 #define USE_SERIAL true
-#define S if(USE_SERIAL)Serial
+#define DEBUG_ERROR true
+#define DEBUG_WARNING true
+#define DEBUG_INFO true
+#define S if(USE_SERIAL)SERIAL_PORT
+#define DEBUG_E if(DEBUG_ERROR)SERIAL_PORT
+#define DEBUG_W if(DEBUG_WARNING)SERIAL_PORT
+#define DEBUG_I if(DEBUG_INFO)SERIAL_PORT
 
 #define TFT_CS         7
 #define TFT_RST       10 // Or set to -1 and connect to Arduino RESET pin
@@ -46,8 +54,8 @@ void updateLiveChannels();
 //std::array<const char*, 3> channel_ids = {"21991090", "73437396", "12875057"};
 // pietsmiet, bonjwa, gronkhtv
 std::array<const char*, 3> channel_ids = {"21991090", "73437396", "106159308"};
-bool is_live[channel_ids.size()] = {false};
-std::vector<const char*> live_channel_vec;
+//bool is_live[channel_ids.size()] = {false};
+std::vector<std::string> live_channel_vec;
 
 bool update_subbed[channel_ids.size()] = {false};
 bool online_subbed[channel_ids.size()] = {false};
@@ -56,12 +64,17 @@ bool offline_subbed[channel_ids.size()] = {false};
 void setup(void) {
   live_channel_vec.reserve(channel_ids.size());
 
-  S.begin(115200);
+#if USE_SERIAL == true || DEBUG_ERROR == true || DEBUG_WARNING == true || DEBUG_INFO == true || DEBUG_NOTICE == true
+  SERIAL_PORT.begin(115200);
+#endif
   //S.setDebugOutput(true);
-  S.printf_P(PSTR("[%s] Starting...\n"), DEBUG_TAG);
+  DEBUG_I.printf("[%s] Starting...\n", DEBUG_TAG);
 
+  DEBUG_I.printf("[%s] Connecting to WIFI...\n", DEBUG_TAG);
   wifiMulti.addAP("::1", WIFI_PW);
 
+
+  DEBUG_I.printf("[%s] Initializing display...\n", DEBUG_TAG);
   pinMode(TFT_BK, OUTPUT);
   digitalWrite(TFT_BK, HIGH);
 
@@ -70,12 +83,17 @@ void setup(void) {
   tft.setSPISpeed(80000000);
   
   tft.fillScreen(ST77XX_BLACK);
+  DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
 
+  DEBUG_I.printf("[%s] Waiting for WIFI connection...\n", DEBUG_TAG);
   // wait for WiFi connection
   while((wifiMulti.run() != WL_CONNECTED)){
     delay(10);
   }
 
+  DEBUG_I.printf("[%s] WIFI connected.\n", DEBUG_TAG);
+
+  DEBUG_I.printf("[%s] Configuring WebSocket...\n", DEBUG_TAG);
   webSocket.onEvent(
     std::bind(webSocketEvent, 0,
               std::placeholders::_1,
@@ -83,6 +101,8 @@ void setup(void) {
               std::placeholders::_3)
   );
   webSocket.setReconnectInterval(WS_RECONNECT_TIMEOUT);
+
+  DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
 
 GFXcanvas16 canvas(64, 64); // 16-bit, 320x170 pixels
@@ -122,8 +142,10 @@ void loop(){
   webSocket.loop();
 
   if(state == Start){
-    state = WS_Init;
+    DEBUG_I.printf("[%s] Start: WebSocket begin SSL...\n", DEBUG_TAG);
     webSocket.beginSSL("eventsub.wss.twitch.tv", 443, "/ws?keepalive_timeout_seconds=" STR(KEEPALIVE_TIMEOUT_S));
+    DEBUG_I.printf("[%s] Start: Transitioning to WS_Init state...\n", DEBUG_TAG);
+    state = WS_Init;
     ws_init_start = millis();
     retries++;
   }
@@ -133,10 +155,11 @@ void loop(){
       return;
     }
     if(retries >= MAX_RETRIES) {
+      DEBUG_E.printf("[%s] Max retries while initializing websocket connection\n", DEBUG_TAG);
       state = Error;
-      S.printf("[%s] Max retries while initializing websocket connection\n", DEBUG_TAG);
       return;
     }
+    DEBUG_W.printf("[%s] WS_Init: Disconnect WebSocket... (Try: %u)\n", DEBUG_TAG, retries);
     webSocket.disconnect();
     // TODO: Think about how to best handle the automatic reconnect in ws lib
     ws_init_start = millis();
@@ -147,6 +170,8 @@ void loop(){
     if (millis() - ws_reconnect_start < WS_RECONNECT_TIMEOUT){
       return;
     }
+    DEBUG_W.printf("[%s] WS_WaitForReconnect: Automatic reconnect failed.\n", DEBUG_TAG);
+    DEBUG_I.printf("[%s] WS_WaitForReconnect: Transition to WS_Init.\n", DEBUG_TAG);
     state = WS_Init;
     retries = 0;
     ws_init_start = millis();
@@ -157,27 +182,31 @@ void loop(){
       return;
     }
     if(retries >= MAX_RETRIES) {
+      DEBUG_E.printf("[%s] Max retries while subscribing to EventSubs\n", DEBUG_TAG);
       state = Error;
-      S.printf("[%s] Max retries while subscribing to EventSubs\n", DEBUG_TAG);
       return;
     }
     retries++;
+    DEBUG_I.printf("[%s] Twitch_EventSub_Init: Trying to sub events...\n", DEBUG_TAG);
     if(!twitchEventSub()){
       tw_eventsub_start = millis();
       return;
     }
+    
+    DEBUG_I.printf("[%s] Twitch_EventSub_Init: Transitioning to Idle state...\n", DEBUG_TAG);
     state = Idle;
     retries = 0;
   }
 
   if(state == Idle){
     if (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL){
+      DEBUG_I.printf("[%s] Idle: Updating live channels...\n", DEBUG_TAG);
       updateLiveChannels();
       tw_last_update_start = millis();
       tw_update_now = false;
     }
     if (millis() - last_session_keepalive >= (KEEPALIVE_TIMEOUT_MS+5000)){
-      S.printf("[%s] Session keepalive timeout\n", DEBUG_TAG);
+      DEBUG_W.printf("[%s] Session keepalive timeout\n", DEBUG_TAG);
       state = WS_Init;
       ws_init_start = 0;
       retries = 0;
@@ -185,14 +214,14 @@ void loop(){
   }
 
   if(state == Error){
-    S.println("Unrecoverable error... restarting...");
+    DEBUG_E.println("Unrecoverable error... restarting...");
     delay(1000);
     ESP.restart();
   }
 }
 
 void commonHttpInit(HTTPClient& http_client){
-  S.print("[HTTP] init...\n");
+  DEBUG_I.print("[HTTP] Common init...\n");
   http_client.useHTTP10(true);
   
   // add headers
@@ -202,13 +231,23 @@ void commonHttpInit(HTTPClient& http_client){
 }
 
 void setIDLiveStatus(const char* id, bool now_live){
-  auto it = std::find(channel_ids.begin(), channel_ids.end(), id);
-  auto i = std::distance(channel_ids.begin(), it);
-  is_live[i] = now_live;
+  if(now_live){
+    if (std::find(live_channel_vec.begin(), live_channel_vec.end(), id) == live_channel_vec.end()) {
+      DEBUG_I.printf("[%s] Adding %s to live channels\n", DEBUG_TAG, id);
+      live_channel_vec.push_back(id);
+    } else {
+      DEBUG_I.printf("[%s] Not adding %s to live channels (already in vector)\n", DEBUG_TAG, id);
+    }
+  } else {
+    DEBUG_I.printf("[%s] Removing %s from live channels\n", DEBUG_TAG, id);
+    live_channel_vec.erase(
+      std::remove(live_channel_vec.begin(), live_channel_vec.end(), id),
+      live_channel_vec.end());
+  }
+  //is_live[i] = now_live;
 }
 
 void updateLiveChannels(){
-  S.printf("[%s] Updating Live Channels\n", DEBUG_TAG);
   HTTPClient http;
   // Could maybe be done as constexpr??
   String url = String("https://api.twitch.tv/helix/streams?");
@@ -217,41 +256,45 @@ void updateLiveChannels(){
     url += id;
     url += "&"; 
   }
+
+  DEBUG_I.printf("[%s] Update live channels with url: %s\n", DEBUG_TAG, url.c_str());  
   
   http.begin(url);  //HTTP
   commonHttpInit(http);
-
-  S.print("[HTTP] GET...\n");
-  S.printf("[HTTP] url: %s\n", url.c_str());
   // start connection and send HTTP header
+  DEBUG_I.print("[HTTP] GET...\n");
   int httpCode = http.GET();
   
   
   if (httpCode != HTTP_CODE_OK) {
-    S.printf(
-      "[HTTP] GET... failed, error: %s\n",
+    DEBUG_W.printf(
+      "[HTTP] GET failed, error: %s\n",
       (httpCode<=0)?
         http.errorToString(httpCode).c_str():
         String(httpCode).c_str());
     return;
   }
 
+  DEBUG_I.printf("[JSON] Deserializing response...\n", DEBUG_TAG);
+
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream());
   if (err) {
-    S.print("deserializeJson() failed with code ");
-    S.println(err.f_str());
+    DEBUG_W.print("[JSON] deserializeJson() failed with code ");
+    DEBUG_W.println(err.f_str());
     return;
   }
 
   // Reset is_live array
-  memset(is_live, false, sizeof is_live);
+  //memset(is_live, false, sizeof is_live);
+  DEBUG_I.printf("[%s] Rebuilding live channels vector...\n", DEBUG_TAG);
+  live_channel_vec.clear();
 
   for (JsonObject channel : doc["data"].as<JsonArray>()) {
     const char* name = channel["user_name"];
     const char* id = channel["user_id"];
     // TODO: Error checking?
-    S.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
+    DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
     setIDLiveStatus(id, true);
   }
 }
@@ -259,30 +302,30 @@ void updateLiveChannels(){
 void processTwitchNotification(const JsonDocument& local_doc){
   const char* subscription_type = local_doc["metadata"]["subscription_type"];
   if(!subscription_type){
-    S.printf("[%s] subscription_type not available\n", DEBUG_TAG);
+    DEBUG_W.printf("[JSON] subscription_type not available\n");
     return;
   }
 
-  S.printf("[%s] got notification: %s\n", DEBUG_TAG, subscription_type);
+  DEBUG_I.printf("[%s] got notification: %s\n", DEBUG_TAG, subscription_type);
 
   if(strcmp(subscription_type,"stream.online")==0){
     const char* id = local_doc["payload"]["event"]["broadcaster_user_id"];
     const char* name = local_doc["payload"]["event"]["broadcaster_user_name"];
     if(!id || !name){
-      //S.printf("[%s] id or name not available\n", DEBUG_TAG);
+      DEBUG_W.printf("[JSON] id or name not available\n", DEBUG_TAG);
       return;
     }
-    S.printf("[%s] Now live: %s", DEBUG_TAG, name);
+    DEBUG_I.printf("[%s] Now live: %s", DEBUG_TAG, name);
     setIDLiveStatus(id, true);
   }
   else if(strcmp(subscription_type,"stream.offline")==0){
     const char* id = local_doc["payload"]["event"]["broadcaster_user_id"];
     const char* name = local_doc["payload"]["event"]["broadcaster_user_name"];
     if(!id || !name){
-      //S.printf("[%s] id or name not available\n", DEBUG_TAG);
+      DEBUG_W.printf("[JSON] id or name not available\n", DEBUG_TAG);
       return;
     }
-    S.printf("[%s] Now offline: %s", DEBUG_TAG, name);
+    DEBUG_I.printf("[%s] Now offline: %s", DEBUG_TAG, name);
     setIDLiveStatus(id, false);
   }
   else if(strcmp(subscription_type,"channel.update")==0){
@@ -291,10 +334,10 @@ void processTwitchNotification(const JsonDocument& local_doc){
     const char* title = local_doc["payload"]["event"]["title"];
     const char* category_name = local_doc["payload"]["event"]["category_name"];
     if(!id || !name || !title || !category_name){
-      //S.printf("[%s] id or name or title or category_name not available\n", DEBUG_TAG);
+      DEBUG_W.printf("[JSON] id or name or title or category_name not available\n", DEBUG_TAG);
       return;
     }
-    S.printf("[%s] Channel: %s updated title or category: %s | %s", DEBUG_TAG, name, title, category_name);
+    DEBUG_I.printf("[%s] Channel %s updated title or category: %s | %s", DEBUG_TAG, name, title, category_name);
     // TODO
   }
 }
@@ -303,7 +346,8 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
   
   switch(type) {
     case WStype_DISCONNECTED:
-      S.print("[WSc] Disconnected!\n");
+      DEBUG_W.print("[WSc] Disconnected!\n");
+      DEBUG_I.printf("[%s] Resetting everything and transition to WS_WaitForReconnect state...\n", DEBUG_TAG);
       twitch_session_id.clear();
       memset(update_subbed, false, sizeof update_subbed);
       memset(online_subbed, false, sizeof online_subbed);
@@ -314,40 +358,39 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
       // TODO?
       break;
     case WStype_CONNECTED:
-      S.printf("[WSc] Connected to url: %s\n", payload);
+      DEBUG_I.printf("[WSc] Connected to url: %s\n", payload);
       break;
     case WStype_TEXT: {
-      S.print("[WSc] got text\n");
+      DEBUG_I.print("[WSc] got text\n");
       
-      // Deserialize the JSON document
+      DEBUG_I.print("[JSON] Deserialize message!\n");
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, payload);
-
-      // Test if parsing succeeds.
       if (error) {
-        S.print(F("deserializeJson() failed: "));
-        S.println(error.f_str());
+        DEBUG_I.print("deserializeJson() failed: ");
+        DEBUG_I.println(error.f_str());
         return;
       }
 
       const char* message_type = doc["metadata"]["message_type"];
       if(!message_type){
-        S.printf("[%s] message_type not available\n", DEBUG_TAG);
+        DEBUG_W.printf("[%s] message_type not available\n", DEBUG_TAG);
         return;
       }
 
-      S.printf("[%s] got message: %s\n", DEBUG_TAG, message_type);
+      DEBUG_I.printf("[%s] got message: %s\n", DEBUG_TAG, message_type);
 
       if(strcmp(message_type,"session_welcome")==0){
         last_session_keepalive = millis();
         const char* session_id = doc["payload"]["session"]["id"];
         if(!session_id){
-          S.printf("[%s] session_id not available\n", DEBUG_TAG);
+          DEBUG_W.printf("[%s] %s: session_id not available\n", DEBUG_TAG, message_type);
           return;
         }
-        S.printf("[%s] session id: %s\n", DEBUG_TAG, session_id);
+        DEBUG_I.printf("[%s] %s: session id: %s\n", DEBUG_TAG, message_type, session_id);
         // Copies session_id to global var
         twitch_session_id = session_id;
+        DEBUG_I.printf("[%s] Transitioning to Twitch_EventSub_Init state\n", DEBUG_TAG);
         state = Twitch_EventSub_Init;
         retries = 0;
         tw_eventsub_start = 0;
@@ -369,31 +412,32 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
     }
     break;
     case WStype_BIN:
-      S.printf("[WSc] get binary length: %u\n", length);
+      DEBUG_W.printf("[WSc] get binary length: %u\n", length);
     case WStype_ERROR:      
     case WStype_FRAGMENT_TEXT_START:
     case WStype_FRAGMENT_BIN_START:
     case WStype_FRAGMENT:
     case WStype_FRAGMENT_FIN:
-      S.printf("[WSc] recieved unsopported type: %d\n", type);
+      DEBUG_W.printf("[WSc] recieved unsopported type: %d\n", type);
       break;
   }
 }
 
 bool sendPOSTRequest(HTTPClient& http_client, const char* type, const char* version, const char* channel_id){
   // start connection and send HTTP header
-  S.printf("[HTTP] POST request: %s, %s\n", type, channel_id);
+  DEBUG_I.printf("[HTTP] POST request: %s, %s\n", type, channel_id);
   int httpCode = http_client.POST(String("{\"type\": \"") + type + "\",\"version\": \"" + version + "\",\"condition\": {\"broadcaster_user_id\": \"" + channel_id + "\"},\"transport\": {\"method\": \"websocket\",\"session_id\": \"" + twitch_session_id + "\"}}");
+    
+  String payload=http_client.getString();
+  DEBUG_I.println("[HTTP] response: ");
+  DEBUG_I.println(payload);
 
   if (httpCode != HTTP_CODE_ACCEPTED) {
-    S.printf(
+    DEBUG_W.printf(
       "[HTTP] POST... failed, error: %s\n",
       (httpCode<=0)?
         http_client.errorToString(httpCode).c_str():
         String(httpCode).c_str());
-    
-    String payload=http_client.getString();
-    S.println(payload);
     
     return false;
   }
@@ -419,25 +463,18 @@ bool sendPOSTRequest(HTTPClient& http_client, const char* type, const char* vers
     return false;
   }
   */
-  String payload=http_client.getString();
-  S.println(payload);
   return true;
 }
 
 bool twitchEventSub(){
 
   HTTPClient http;
-  //commonHttpInit(http);
-  //http.useHTTP10(true);
   http.begin("https://api.twitch.tv/helix/eventsub/subscriptions");
-  //http.setAuthorizationType("Bearer");
-  //http.setAuthorization(TWITCH_TOKEN);
-  //http.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
   commonHttpInit(http);
   http.addHeader("Content-Type", "application/json");
   
+  // TODO: do not block main loop for this long
   for(uint8_t i=0;i<channel_ids.size();i++){
-    // TODO
     if(!update_subbed[i]) update_subbed[i]  = sendPOSTRequest(http, "channel.update", "2", channel_ids[i]);
     if(!online_subbed[i]) online_subbed[i]  = sendPOSTRequest(http, "stream.online", "1", channel_ids[i]);
     if(!offline_subbed[i]) offline_subbed[i]= sendPOSTRequest(http, "stream.offline", "1", channel_ids[i]);
@@ -457,8 +494,9 @@ bool twitchEventSub(){
         std::begin(offline_subbed), std::end(offline_subbed), 
         [](bool i){return i;})
       ) {
+    DEBUG_W.printf("[%s] Failed to sub to all events.\n", DEBUG_TAG);  
     return false;
   }
-  S.println("All EventSubs successfull\n");
+  DEBUG_I.printf("[%s] Successfully subscribed to all events.\n", DEBUG_TAG);
   return true;
 }
