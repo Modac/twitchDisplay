@@ -23,6 +23,8 @@
 static const char DEBUG_TAG[] = "TwitchDisplay";
 // inspiration from https://forum.arduino.cc/t/single-line-define-to-disable-code/636044/5
 
+//#define TEST_SERVER
+
 #define SERIAL_PORT Serial
 #define USE_SERIAL true
 #define DEBUG_ERROR true
@@ -53,13 +55,14 @@ void updateLiveChannels();
 // pietsmiet, bonjwa, gronkh
 //std::array<const char*, 3> channel_ids = {"21991090", "73437396", "12875057"};
 // pietsmiet, bonjwa, gronkhtv
-std::array<const char*, 3> channel_ids = {"21991090", "73437396", "106159308"};
+std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
+const uint16_t* channel_pics[3] = { epd_bitmap_pietsmiet, epd_bitmap_bonjwa, epd_bitmap_gronkh};
 //bool is_live[channel_ids.size()] = {false};
 std::vector<std::string> live_channel_vec;
 
-bool update_subbed[channel_ids.size()] = {false};
-bool online_subbed[channel_ids.size()] = {false};
-bool offline_subbed[channel_ids.size()] = {false};
+bool update_subbed[std::tuple_size<decltype(channel_ids)>::value] = {false};
+bool online_subbed[std::tuple_size<decltype(channel_ids)>::value] = {false};
+bool offline_subbed[std::tuple_size<decltype(channel_ids)>::value] = {false};
 
 void setup(void) {
   live_channel_vec.reserve(channel_ids.size());
@@ -105,7 +108,7 @@ void setup(void) {
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
 
-GFXcanvas16 canvas(64, 64); // 16-bit, 320x170 pixels
+GFXcanvas16 pic_canvas(64, 64); // 16-bit, 320x170 pixels
 GFXcanvas16 text_canvas(298+(6*8), 64); 
 
 enum State {
@@ -143,7 +146,11 @@ void loop(){
 
   if(state == Start){
     DEBUG_I.printf("[%s] Start: WebSocket begin SSL...\n", DEBUG_TAG);
+#ifdef TEST_SERVER
+    webSocket.begin("192.168.6.61", 8080, "/ws?keepalive_timeout_seconds=" STR(KEEPALIVE_TIMEOUT_S));
+#else
     webSocket.beginSSL("eventsub.wss.twitch.tv", 443, "/ws?keepalive_timeout_seconds=" STR(KEEPALIVE_TIMEOUT_S));
+#endif
     DEBUG_I.printf("[%s] Start: Transitioning to WS_Init state...\n", DEBUG_TAG);
     state = WS_Init;
     ws_init_start = millis();
@@ -201,7 +208,9 @@ void loop(){
   if(state == Idle){
     if (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL){
       DEBUG_I.printf("[%s] Idle: Updating live channels...\n", DEBUG_TAG);
+#ifndef TEST_SERVER
       updateLiveChannels();
+#endif
       tw_last_update_start = millis();
       tw_update_now = false;
     }
@@ -230,11 +239,47 @@ void commonHttpInit(HTTPClient& http_client){
   http_client.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
 }
 
+void drawLiveChannelPic(const char* id, uint8_t pic_slot_index, decltype(channel_ids)::iterator it){
+  
+  DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, id, pic_slot_index);
+  // Channel id not found
+  if (it == std::end(channel_ids)) {
+    pic_canvas.fillScreen(ST77XX_BLACK);
+    pic_canvas.setCursor(0,0);
+    pic_canvas.setTextWrap(true);
+    pic_canvas.setTextColor(ST77XX_RED);
+    pic_canvas.setTextSize(2);
+    pic_canvas.println("?????");
+    pic_canvas.println(id);
+    pic_canvas.println("?????");
+  } else {
+    auto channel_index = std::distance(std::begin(channel_ids), it);
+    pic_canvas.drawRGBBitmap(0, 0, channel_pics[channel_index], pic_canvas.width(), pic_canvas.height());
+  }
+
+  // TODO: also poulate second pic line
+  tft.drawRGBBitmap(11+((64+14)*pic_slot_index), 14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+  
+}
+
+void redrawLiveChannelPics(){
+  tft.fillScreen(ST77XX_BLACK);
+  
+  for (std::size_t i = 0; i < live_channel_vec.size(); i++) {
+    auto it = std::find(std::begin(channel_ids), std::end(channel_ids), live_channel_vec[i]);
+    drawLiveChannelPic(live_channel_vec[i].c_str(), i, it);
+  }
+}
+
 void setIDLiveStatus(const char* id, bool now_live){
   if(now_live){
     if (std::find(live_channel_vec.begin(), live_channel_vec.end(), id) == live_channel_vec.end()) {
-      DEBUG_I.printf("[%s] Adding %s to live channels\n", DEBUG_TAG, id);
+      DEBUG_I.printf("[%s] Adding %s to live channels...\n", DEBUG_TAG, id);
+      uint8_t pic_slot_index = live_channel_vec.size();
       live_channel_vec.push_back(id);
+      DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_channel_vec.size());
+      auto it = std::find(std::begin(channel_ids), std::end(channel_ids), id);
+      drawLiveChannelPic(id, pic_slot_index, it);
     } else {
       DEBUG_I.printf("[%s] Not adding %s to live channels (already in vector)\n", DEBUG_TAG, id);
     }
@@ -243,6 +288,8 @@ void setIDLiveStatus(const char* id, bool now_live){
     live_channel_vec.erase(
       std::remove(live_channel_vec.begin(), live_channel_vec.end(), id),
       live_channel_vec.end());
+    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_channel_vec.size());
+    redrawLiveChannelPics();
   }
   //is_live[i] = now_live;
 }
@@ -253,7 +300,7 @@ void updateLiveChannels(){
   String url = String("https://api.twitch.tv/helix/streams?");
   for (const auto& id : channel_ids) {
     url += "user_id=";
-    url += id;
+    url += id.c_str();
     url += "&"; 
   }
 
@@ -289,6 +336,7 @@ void updateLiveChannels(){
   //memset(is_live, false, sizeof is_live);
   DEBUG_I.printf("[%s] Rebuilding live channels vector...\n", DEBUG_TAG);
   live_channel_vec.clear();
+  tft.fillScreen(ST77XX_BLACK);
 
   for (JsonObject channel : doc["data"].as<JsonArray>()) {
     const char* name = channel["user_name"];
@@ -315,7 +363,7 @@ void processTwitchNotification(const JsonDocument& local_doc){
       DEBUG_W.printf("[JSON] id or name not available\n", DEBUG_TAG);
       return;
     }
-    DEBUG_I.printf("[%s] Now live: %s", DEBUG_TAG, name);
+    DEBUG_I.printf("[%s] Now live: %s\n", DEBUG_TAG, name);
     setIDLiveStatus(id, true);
   }
   else if(strcmp(subscription_type,"stream.offline")==0){
@@ -325,7 +373,7 @@ void processTwitchNotification(const JsonDocument& local_doc){
       DEBUG_W.printf("[JSON] id or name not available\n", DEBUG_TAG);
       return;
     }
-    DEBUG_I.printf("[%s] Now offline: %s", DEBUG_TAG, name);
+    DEBUG_I.printf("[%s] Now offline: %s\n", DEBUG_TAG, name);
     setIDLiveStatus(id, false);
   }
   else if(strcmp(subscription_type,"channel.update")==0){
@@ -337,8 +385,8 @@ void processTwitchNotification(const JsonDocument& local_doc){
       DEBUG_W.printf("[JSON] id or name or title or category_name not available\n", DEBUG_TAG);
       return;
     }
-    DEBUG_I.printf("[%s] Channel %s updated title or category: %s | %s", DEBUG_TAG, name, title, category_name);
-    // TODO
+    DEBUG_I.printf("[%s] Channel %s updated title or category: %s | %s\n", DEBUG_TAG, name, title, category_name);
+    // TODO: add change to draw queue and draw scrolling text
   }
 }
 
@@ -346,7 +394,7 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
   
   switch(type) {
     case WStype_DISCONNECTED:
-      DEBUG_W.print("[WSc] Disconnected!\n");
+      DEBUG_W.print("[WSc] Disconnected!\n"); 
       DEBUG_I.printf("[%s] Resetting everything and transition to WS_WaitForReconnect state...\n", DEBUG_TAG);
       twitch_session_id.clear();
       memset(update_subbed, false, sizeof update_subbed);
@@ -363,7 +411,7 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
     case WStype_TEXT: {
       DEBUG_I.print("[WSc] got text\n");
       
-      DEBUG_I.print("[JSON] Deserialize message!\n");
+      DEBUG_I.print("[JSON] Deserialize message...\n");
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, payload);
       if (error) {
@@ -423,11 +471,19 @@ void webSocketEvent(uint8_t index, WStype_t type, uint8_t * payload, size_t leng
   }
 }
 
+#ifdef TEST_SERVER
+// No condition for test server
+bool sendPOSTRequest(HTTPClient& http_client, const char* type, const char* version){
+  // start connection and send HTTP header
+  DEBUG_I.printf("[HTTP] POST request: %s\n", type);
+  int httpCode = http_client.POST(String("{\"type\": \"") + type + "\",\"version\": \"" + version + "\",\"transport\": {\"method\": \"websocket\",\"session_id\": \"" + twitch_session_id + "\"}}");
+#else
 bool sendPOSTRequest(HTTPClient& http_client, const char* type, const char* version, const char* channel_id){
   // start connection and send HTTP header
   DEBUG_I.printf("[HTTP] POST request: %s, %s\n", type, channel_id);
   int httpCode = http_client.POST(String("{\"type\": \"") + type + "\",\"version\": \"" + version + "\",\"condition\": {\"broadcaster_user_id\": \"" + channel_id + "\"},\"transport\": {\"method\": \"websocket\",\"session_id\": \"" + twitch_session_id + "\"}}");
-    
+#endif
+
   String payload=http_client.getString();
   DEBUG_I.println("[HTTP] response: ");
   DEBUG_I.println(payload);
@@ -466,6 +522,33 @@ bool sendPOSTRequest(HTTPClient& http_client, const char* type, const char* vers
   return true;
 }
 
+#ifdef TEST_SERVER
+bool twitchEventSub(){
+
+  HTTPClient http;
+  http.begin("http://192.168.6.61:8080/eventsub/subscriptions");
+  commonHttpInit(http);
+  http.addHeader("Content-Type", "application/json");
+  
+  if(!update_subbed[0]) update_subbed[0]  = sendPOSTRequest(http, "channel.update", "2");
+  if(!online_subbed[0]) online_subbed[0]  = sendPOSTRequest(http, "stream.online", "1");
+  if(!offline_subbed[0]) offline_subbed[0]= sendPOSTRequest(http, "stream.offline", "1");
+
+  http.end();
+
+  if (!update_subbed[0]
+      ||
+      !online_subbed[0]
+      ||
+      !offline_subbed[0]
+      ) {
+    DEBUG_W.printf("[%s] Failed to sub to all events.\n", DEBUG_TAG);  
+    return false;
+  }
+  DEBUG_I.printf("[%s] Successfully subscribed to all events.\n", DEBUG_TAG);
+  return true;
+}
+#else
 bool twitchEventSub(){
 
   HTTPClient http;
@@ -475,9 +558,9 @@ bool twitchEventSub(){
   
   // TODO: do not block main loop for this long
   for(uint8_t i=0;i<channel_ids.size();i++){
-    if(!update_subbed[i]) update_subbed[i]  = sendPOSTRequest(http, "channel.update", "2", channel_ids[i]);
-    if(!online_subbed[i]) online_subbed[i]  = sendPOSTRequest(http, "stream.online", "1", channel_ids[i]);
-    if(!offline_subbed[i]) offline_subbed[i]= sendPOSTRequest(http, "stream.offline", "1", channel_ids[i]);
+    if(!update_subbed[i]) update_subbed[i]  = sendPOSTRequest(http, "channel.update", "2", channel_ids[i].c_str());
+    if(!online_subbed[i]) online_subbed[i]  = sendPOSTRequest(http, "stream.online", "1", channel_ids[i].c_str());
+    if(!offline_subbed[i]) offline_subbed[i]= sendPOSTRequest(http, "stream.offline", "1", channel_ids[i].c_str());
   }
 
   http.end();
@@ -500,3 +583,4 @@ bool twitchEventSub(){
   DEBUG_I.printf("[%s] Successfully subscribed to all events.\n", DEBUG_TAG);
   return true;
 }
+#endif
