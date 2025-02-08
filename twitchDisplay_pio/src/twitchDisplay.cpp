@@ -82,7 +82,7 @@ void setup(void) {
   digitalWrite(TFT_BK, HIGH);
 
   tft.init(170, 320);           // Init ST7789 170x320
-  tft.setRotation(3);
+  tft.setRotation(1);
   tft.setSPISpeed(80000000);
   
   tft.fillScreen(ST77XX_BLACK);
