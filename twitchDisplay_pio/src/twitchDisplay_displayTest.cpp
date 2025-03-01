@@ -214,6 +214,7 @@ void loop() {
   
   //tft.invertDisplay(true);
   if(o_X==0){
+  canvas.fillRect(11+64+14+64+14+64+14, 14, 64, 64, ST77XX_BLACK);
   canvas.fillRect(11+64+14+64+14, 14, 64, 64, ST77XX_BLACK);
   canvas.fillRect(11+64+14, 14, 64, 64, ST77XX_BLACK);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
@@ -221,6 +222,10 @@ void loop() {
   delay(20);
   //tft.invertDisplay(false);
   if(o_X==24){
+  canvas.setCursor(11+64+14+64+14+64+14 +4, 14 +14);
+  canvas.setTextSize(5);
+  canvas.print("+1");
+  //canvas.drawRect(11+64+14+64+14+64+14,14,64,64,ST77XX_GREEN);
   canvas.drawRGBBitmap(11+64+14+64+14, 14, epd_bitmap_gronkh, 64, 64);
   canvas.drawRGBBitmap(11+64+14, 14, epd_bitmap_bonjwa, 64, 64);
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), canvas.width(), canvas.height());
