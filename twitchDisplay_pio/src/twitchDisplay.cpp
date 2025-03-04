@@ -7,14 +7,19 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <set>
+#include <ArduinoOTA.h>
 
 #include "pics.h"
 #include "secrets.h"
+
+#include "LowPass.h"
+#include "MovingAverage.h"
 
 // https://stackoverflow.com/a/5459929
 #define STR_HELPER(x) #x
@@ -45,14 +50,23 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 WiFiMulti wifiMulti;
+WiFiUDP Udp;
+
+// Filter instance
+LowPass<2> lp(0.1,1e3,true);
+MovingAverage<100> ma;
+uint16_t ldr;
+uint16_t ldr_f;
+uint16_t ldr_f2;
 
 void updateLiveChannels();
+void setupOTA();
 
-// pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
-std::array<std::string, 9> channel_ids = {"21991090", "73437396", "1024088182", "12875057", "16064695", "55898523", "38770961", "172376071", "549536744"};
+// lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
+std::array<std::string, 10> channel_ids = {"761017145", "21991090", "73437396", "1024088182", "12875057", "16064695", "55898523", "38770961", "172376071", "549536744"};
 // pietsmiet, bonjwa, gronkhtv
 //std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
-const uint16_t* channel_pics[9] = {
+const uint16_t* channel_pics[10] = { epd_bitmap_lidi,
   epd_bitmap_pietsmiet, epd_bitmap_bonjwa, epd_bitmap_bonjwachill,
   epd_bitmap_gronkh, epd_bitmap_dhalucard, epd_bitmap_trilluxe,
   epd_bitmap_dracon, epd_bitmap_maxim, epd_bitmap_finanzfluss};
@@ -92,6 +106,8 @@ void setup(void) {
 
   DEBUG_I.printf("[%s] WIFI connected.\n", DEBUG_TAG);
 
+  setupOTA();
+
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
 
@@ -111,7 +127,16 @@ unsigned long tw_last_update_start = 0;
 bool tw_update_now = true;
 
 void loop(){
+  
+  ArduinoOTA.handle();
   //S.printf("[%s] Looping...\n", DEBUG_TAG);
+  
+  ldr = analogRead(A3);
+  ldr_f = lp.filt(ldr);
+  ldr_f2 = ma.compute(ldr);
+  // 1000 = minimum adc value when brightest
+  // 10 = minimum of backligh pwm value when darkest
+  analogWrite(TFT_BK, constrain(map(ldr_f2, 1000, 4095, 255, 10), 10, 255));
 
   if(state == Idle){
     if (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL){
@@ -129,6 +154,18 @@ void loop(){
     delay(1000);
     ESP.restart();
   }
+   
+  Udp.beginPacket("192.168.6.61", 47269);
+  // Just test touch pin - Touch0 is T0 which is on GPIO 4.
+  Udp.print("ldr:");
+  Udp.println(ldr);
+  Udp.print("ldr_f:");
+  Udp.println(ldr_f);
+  Udp.print("ldr_f2:");
+  Udp.println(ldr_f2);
+  Udp.endPacket();
+  delay(10);
+  
 }
 
 void commonHttpInit(HTTPClient& http_client){
@@ -255,11 +292,63 @@ void updateLiveChannels(){
     const char* id = channel["user_id"];
     // TODO: Error checking?
     DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
-    setIDLiveStatus(id, true);
+    //setIDLiveStatus(id, true);
+    live_channel_vec.push_back(id);
   }
   /*
   for (const auto& id : channel_ids) {
     setIDLiveStatus(id.c_str(), true);
   }
   */
+  
+}
+
+void setupOTA(){
+  // Port defaults to 3232
+  // ArduinoOTA.setPort(3232);
+
+  // Hostname defaults to esp3232-[MAC]
+  ArduinoOTA.setHostname("twitchdisplay");
+
+  // No authentication by default
+  // ArduinoOTA.setPassword("admin");
+
+  // Password can be set with it's md5 value as well
+  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+
+  ArduinoOTA
+    .onStart([]() {
+      String type;
+      if (ArduinoOTA.getCommand() == U_FLASH) {
+        type = "sketch";
+      } else {  // U_SPIFFS
+        type = "filesystem";
+      }
+
+      // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+      DEBUG_I.println("Start updating " + type);
+    })
+    .onEnd([]() {
+      DEBUG_I.println("\nEnd");
+    })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      DEBUG_I.printf("Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      DEBUG_E.printf("Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) {
+        DEBUG_E.println("Auth Failed");
+      } else if (error == OTA_BEGIN_ERROR) {
+        DEBUG_E.println("Begin Failed");
+      } else if (error == OTA_CONNECT_ERROR) {
+        DEBUG_E.println("Connect Failed");
+      } else if (error == OTA_RECEIVE_ERROR) {
+        DEBUG_E.println("Receive Failed");
+      } else if (error == OTA_END_ERROR) {
+        DEBUG_E.println("End Failed");
+      }
+    });
+
+  ArduinoOTA.begin();
 }
