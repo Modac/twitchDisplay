@@ -20,6 +20,7 @@
 
 #include "LowPass.h"
 #include "MovingAverage.h"
+#include <deque>
 
 // https://stackoverflow.com/a/5459929
 #define STR_HELPER(x) #x
@@ -64,20 +65,42 @@ uint16_t ldr_f2;
 void updateLiveChannels();
 void setupOTA();
 
+struct channelInfo {
+  std::string id;
+  bool isLive;
+  std::string streamTitle;
+  int8_t slotNum;
+  const uint16_t* pic;
+};
+
 // lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
-std::array<std::string, 10> channel_ids = {"761017145", "21991090", "73437396", "1024088182", "12875057", "16064695", "55898523", "38770961", "172376071", "549536744"};
+std::array<channelInfo, 10> channels = {{
+  {"761017145", false, "", -1, epd_bitmap_lidi},
+  {"21991090", false, "", -1, epd_bitmap_pietsmiet},
+  {"73437396", false, "", -1, epd_bitmap_bonjwa},
+  {"1024088182", false, "", -1, epd_bitmap_bonjwachill},
+  {"12875057", false, "", -1, epd_bitmap_gronkh},
+//  {"106159308", false, "", -1, epd_bitmap_gronkh}, gronkhtv
+  {"16064695", false, "", -1, epd_bitmap_dhalucard},
+  {"55898523", false, "", -1, epd_bitmap_trilluxe},
+  {"38770961", false, "", -1, epd_bitmap_dracon},
+  {"172376071", false, "", -1, epd_bitmap_maxim},
+  {"549536744", false, "", -1, epd_bitmap_finanzfluss}
+}};
+
+uint16_t live_num = 0;
+
+struct titleQueueItem {
+  channelInfo& channel;
+  std::string newTitle;
+};
+
+std::deque<channelInfo*> titleChangeQueue;
+
 // pietsmiet, bonjwa, gronkhtv
 //std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
-const uint16_t* channel_pics[10] = { epd_bitmap_lidi,
-  epd_bitmap_pietsmiet, epd_bitmap_bonjwa, epd_bitmap_bonjwachill,
-  epd_bitmap_gronkh, epd_bitmap_dhalucard, epd_bitmap_trilluxe,
-  epd_bitmap_dracon, epd_bitmap_maxim, epd_bitmap_finanzfluss};
-//bool is_live[channel_ids.size()] = {false};
-// todo: maybe an std::array is enough (maybe have bool)
-std::vector<std::string> live_channel_vec;
 
 void setup(void) {
-  live_channel_vec.reserve(channel_ids.size());
 
 #if USE_SERIAL == true || DEBUG_ERROR == true || DEBUG_WARNING == true || DEBUG_INFO == true || DEBUG_NOTICE == true
   SERIAL_PORT.begin(115200);
@@ -180,23 +203,12 @@ void commonHttpInit(HTTPClient& http_client){
   http_client.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
 }
 
-void drawLiveChannelPic(const char* id, uint8_t pic_slot_index, decltype(channel_ids)::iterator it){
+void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
+  channel.slotNum = pic_slot_index;
   if(pic_slot_index<8){
-    DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, id, pic_slot_index);
-    // Channel id not found
-    if (it == std::end(channel_ids)) {
-      pic_canvas.fillScreen(ST77XX_BLACK);
-      pic_canvas.setCursor(0,0);
-      pic_canvas.setTextWrap(true);
-      pic_canvas.setTextColor(ST77XX_RED);
-      pic_canvas.setTextSize(2);
-      pic_canvas.println("?????");
-      pic_canvas.println(id);
-      pic_canvas.println("?????");
-    } else {
-      auto channel_index = std::distance(std::begin(channel_ids), it);
-      pic_canvas.drawRGBBitmap(0, 0, channel_pics[channel_index], pic_canvas.width(), pic_canvas.height());
-    }
+    DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id, pic_slot_index);
+    
+    pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
 
     if(pic_slot_index<4){
       tft.drawRGBBitmap(11+((64+14)*pic_slot_index), 14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
@@ -215,10 +227,11 @@ void drawLiveChannelPic(const char* id, uint8_t pic_slot_index, decltype(channel
 void redrawLiveChannelPics(){
   //tft.fillScreen(ST77XX_BLACK);
   
-  std::size_t i;
-  for (i = 0; i < live_channel_vec.size(); i++) {
-    auto it = std::find(std::begin(channel_ids), std::end(channel_ids), live_channel_vec[i]);
-    drawLiveChannelPic(live_channel_vec[i].c_str(), i, it);
+  std::size_t i=0;
+  for (channelInfo& channel : channels) {
+    if(channel.isLive){
+      drawLiveChannelPic(channel, i++);
+    }
   }
   // block out remaining pic slots
   for (;i < MAX_NUM_PICS; i++){
@@ -232,37 +245,42 @@ void redrawLiveChannelPics(){
   }
 }
 
-void setIDLiveStatus(const char* id, bool now_live){
-  if(now_live){
-    if (std::find(live_channel_vec.begin(), live_channel_vec.end(), id) == live_channel_vec.end()) {
-      DEBUG_I.printf("[%s] Adding %s to live channels...\n", DEBUG_TAG, id);
-      uint8_t pic_slot_index = live_channel_vec.size();
-      live_channel_vec.push_back(id);
-      DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_channel_vec.size());
-      auto it = std::find(std::begin(channel_ids), std::end(channel_ids), id);
-      drawLiveChannelPic(id, pic_slot_index, it);
-    } else {
-      DEBUG_I.printf("[%s] Not adding %s to live channels (already in vector)\n", DEBUG_TAG, id);
-    }
-  } else {
-    DEBUG_I.printf("[%s] Removing %s from live channels\n", DEBUG_TAG, id);
-    live_channel_vec.erase(
-      std::remove(live_channel_vec.begin(), live_channel_vec.end(), id),
-      live_channel_vec.end());
-    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_channel_vec.size());
-    redrawLiveChannelPics();
+channelInfo* setIDLiveStatus(const char* id, bool now_live, bool draw_immediat=true){
+  // custom find_if to search by id inside of struct
+  channelInfo* channel = std::find_if(channels.begin(), channels.end(), [&](const channelInfo& x){return x.id == id;});
+  if(channel == channels.end()) {
+    DEBUG_I.printf("[%s] Cannot set live status of unknown channel id %s.", DEBUG_TAG, id);
+    return channel;
   }
-  //is_live[i] = now_live;
+  if(now_live){
+    if (channel->isLive) {
+      DEBUG_I.printf("[%s] Channel %s already live.\n", DEBUG_TAG, id);
+      return channel;
+    }
+    DEBUG_I.printf("[%s] Setting channel %s to live...\n", DEBUG_TAG, id);
+    channel->isLive = true;
+    live_num++;
+    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_num);
+    if(draw_immediat) drawLiveChannelPic(*channel, live_num-1);
+  } else {
+    DEBUG_I.printf("[%s] Unsetting channel %s live status\n", DEBUG_TAG, id);
+    channel->isLive = false;
+    channel->slotNum = -1;
+    live_num--;
+    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_num);
+    if(draw_immediat) redrawLiveChannelPics();
+  }
+  return channel;
 }
 
 void updateLiveChannels(){
   HTTPClient http;
   // Could maybe be done as constexpr??
   String url = String("https://api.twitch.tv/helix/streams?");
-  for (const auto& id : channel_ids) {
+  for (auto& channel : channels) {
     url += "user_id=";
-    url += id.c_str();
-    url += "&"; 
+    url += channel.id.c_str();
+    url += "&";
   }
 
   DEBUG_I.printf("[%s] Update live channels with url: %s\n", DEBUG_TAG, url.c_str());  
@@ -295,18 +313,30 @@ void updateLiveChannels(){
 
   // Reset is_live array
   //memset(is_live, false, sizeof is_live);
-  DEBUG_I.printf("[%s] Rebuilding live channels vector...\n", DEBUG_TAG);
-  live_channel_vec.clear();
+  DEBUG_I.printf("[%s] Resetting all channels live status...\n", DEBUG_TAG);
+  for (auto &&c : channels) {
+    c.isLive = false;
+    c.slotNum = -1;
+  }
+  live_num = 0;
+  
   //tft.fillScreen(ST77XX_BLACK);
 
   
   for (JsonObject channel : doc["data"].as<JsonArray>()) {
     const char* name = channel["user_name"];
     const char* id = channel["user_id"];
+    std::string title = channel["title"];
+    title += " | ";
+    title += channel["game_name"].as<std::string>();
     // TODO: Error checking?
     DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
-    //setIDLiveStatus(id, true);
-    live_channel_vec.push_back(id);
+    channelInfo* ch = setIDLiveStatus(id, true, false);
+    ch->streamTitle = title;
+    // queue channel for title display if not already in queue
+    if (std::find_if(titleChangeQueue.begin(), titleChangeQueue.end(), [ch](const channelInfo* x){return x == ch;}) == titleChangeQueue.end()) {
+      titleChangeQueue.push_back(ch);
+    }
   }
 
   redrawLiveChannelPics();
