@@ -46,6 +46,8 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #define TFT_DC         1
 #define TFT_BK         0
 
+#define MAX_NUM_PICS 8
+
 // Use hardware spi (for esp32-c3 super mini this is SPI0/1 at pins 4-7)
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
@@ -211,11 +213,22 @@ void drawLiveChannelPic(const char* id, uint8_t pic_slot_index, decltype(channel
 }
 
 void redrawLiveChannelPics(){
-  tft.fillScreen(ST77XX_BLACK);
+  //tft.fillScreen(ST77XX_BLACK);
   
-  for (std::size_t i = 0; i < live_channel_vec.size(); i++) {
+  std::size_t i;
+  for (i = 0; i < live_channel_vec.size(); i++) {
     auto it = std::find(std::begin(channel_ids), std::end(channel_ids), live_channel_vec[i]);
     drawLiveChannelPic(live_channel_vec[i].c_str(), i, it);
+  }
+  // block out remaining pic slots
+  for (;i < MAX_NUM_PICS; i++){
+    // copied from drawLiveChannelPic()
+    pic_canvas.fillScreen(ST77XX_BLACK);
+    if(i<4){
+      tft.drawRGBBitmap(11+((64+14)*i), 14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    } else if(i<8){
+      tft.drawRGBBitmap(11+((64+14)*(i-4)), 14+64+14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    }
   }
 }
 
@@ -284,7 +297,7 @@ void updateLiveChannels(){
   //memset(is_live, false, sizeof is_live);
   DEBUG_I.printf("[%s] Rebuilding live channels vector...\n", DEBUG_TAG);
   live_channel_vec.clear();
-  tft.fillScreen(ST77XX_BLACK);
+  //tft.fillScreen(ST77XX_BLACK);
 
   
   for (JsonObject channel : doc["data"].as<JsonArray>()) {
@@ -295,6 +308,8 @@ void updateLiveChannels(){
     //setIDLiveStatus(id, true);
     live_channel_vec.push_back(id);
   }
+
+  redrawLiveChannelPics();
   /*
   for (const auto& id : channel_ids) {
     setIDLiveStatus(id.c_str(), true);
