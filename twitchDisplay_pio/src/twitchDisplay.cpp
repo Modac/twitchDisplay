@@ -100,6 +100,9 @@ std::deque<channelInfo*> titleChangeQueue;
 // pietsmiet, bonjwa, gronkhtv
 //std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
 
+GFXcanvas16 pic_canvas(64, 64); // 16-bit, 320x170 pixels
+GFXcanvas16 text_canvas(298+(6*8), 64); 
+
 void setup(void) {
 
 #if USE_SERIAL == true || DEBUG_ERROR == true || DEBUG_WARNING == true || DEBUG_INFO == true || DEBUG_NOTICE == true
@@ -121,6 +124,12 @@ void setup(void) {
   tft.setSPISpeed(80000000);
   
   tft.fillScreen(ST77XX_BLACK);
+
+  text_canvas.setCursor(0,0);
+  text_canvas.setTextWrap(false);
+  text_canvas.setTextColor(ST77XX_CYAN);
+  text_canvas.setTextSize(8);
+
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
 
   DEBUG_I.printf("[%s] Waiting for WIFI connection...\n", DEBUG_TAG);
@@ -136,8 +145,16 @@ void setup(void) {
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
 
-GFXcanvas16 pic_canvas(64, 64); // 16-bit, 320x170 pixels
-GFXcanvas16 text_canvas(298+(6*8), 64); 
+void drawRGBBitmapSectionFast(int16_t x, int16_t y, uint16_t *bitmap,
+                                int16_t o_x, int16_t o_y, int16_t w, int16_t h, int16_t b_w) {
+  tft.startWrite();
+  tft.setAddrWindow(x, y, w, h);
+  y += o_y;
+  for (int16_t j = o_y; j < (o_y+h); j++, y++) {
+    tft.writePixels(&bitmap[j * b_w + o_x], w);
+  }
+  tft.endWrite();
+}
 
 enum State {
   Idle,
@@ -150,6 +167,19 @@ enum State {
 #define TW_UPDATE_INTERVAL (30*1000)
 unsigned long tw_last_update_start = 0; 
 bool tw_update_now = true;
+
+#define MAX_TITLE_REPEAT 2
+
+struct {
+  channelInfo* channel;
+  std::string displayTitle;
+  uint16_t textOffset;
+  uint8_t repeats;
+} channelTitleInfo;
+
+bool isTitleDisplaying = false;
+
+uint8_t o_X = 0;
 
 void loop(){
   
@@ -171,6 +201,35 @@ void loop(){
 #endif
       tw_last_update_start = millis();
       tw_update_now = false;
+    }
+    if(!isTitleDisplaying && !titleChangeQueue.empty()) {
+      channelTitleInfo.channel = titleChangeQueue.front();
+      titleChangeQueue.pop_front();
+      channelTitleInfo.displayTitle = channelTitleInfo.channel->streamTitle;
+      channelTitleInfo.textOffset = 0;
+      channelTitleInfo.repeats = 0;
+      isTitleDisplaying = true;
+    }
+    // TODO: cleanup text when done
+    if(isTitleDisplaying){
+      if(!o_X){
+        text_canvas.fillScreen(ST77XX_BLACK);
+        text_canvas.setCursor(0,0);
+        text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
+        channelTitleInfo.textOffset++;
+        channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
+        if (channelTitleInfo.textOffset==0) {
+          if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
+            isTitleDisplaying=false;
+          }
+        }
+        
+      }
+      tft.fillRect(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), 298, 64, ST77XX_BLACK);
+      drawRGBBitmapSectionFast(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
+      //enterNormalMode();
+      o_X = (o_X+6)%(6*8);
+
     }
   }
 
@@ -326,16 +385,20 @@ void updateLiveChannels(){
   for (JsonObject channel : doc["data"].as<JsonArray>()) {
     const char* name = channel["user_name"];
     const char* id = channel["user_id"];
-    std::string title = channel["title"];
+    std::string title = "    ";
+    title += channel["title"].as<std::string>();
     title += " | ";
     title += channel["game_name"].as<std::string>();
+    title += "   ";
     // TODO: Error checking?
     DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
     channelInfo* ch = setIDLiveStatus(id, true, false);
-    ch->streamTitle = title;
-    // queue channel for title display if not already in queue
-    if (std::find_if(titleChangeQueue.begin(), titleChangeQueue.end(), [ch](const channelInfo* x){return x == ch;}) == titleChangeQueue.end()) {
-      titleChangeQueue.push_back(ch);
+    if(ch->streamTitle != title) {
+      ch->streamTitle = title;
+      // queue channel for title display if not already in queue
+      if (std::find_if(titleChangeQueue.begin(), titleChangeQueue.end(), [ch](const channelInfo* x){return x == ch;}) == titleChangeQueue.end()) {
+        titleChangeQueue.push_back(ch);
+      }
     }
   }
 
