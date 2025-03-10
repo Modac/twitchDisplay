@@ -1,5 +1,7 @@
 // TODO: add filters for json deserialization
 // TODO: add title display
+// TODO: add unicode support (e.g. with https://github.com/takkaO/OpenFontRender/tree/master and Noto Sans + Noto Emoji, but together at least 1,5MB)
+// TODO: reduce scrolling text flicker by flipping the MV flag such that the pixels can be transfered column by column and not row by row
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>    // Core graphics library
@@ -62,6 +64,7 @@ uint16_t ldr;
 uint16_t ldr_f;
 uint16_t ldr_f2;
 
+void redrawLiveChannelPics();
 void updateLiveChannels();
 void setupOTA();
 
@@ -156,6 +159,31 @@ void drawRGBBitmapSectionFast(int16_t x, int16_t y, uint16_t *bitmap,
   tft.endWrite();
 }
 
+/**************************************************************************/
+/*!
+   @brief   Draw a rectangle with no fill color
+    @param    x   Top left corner x coordinate
+    @param    y   Top left corner y coordinate
+    @param    w   Width in pixels
+    @param    h   Height in pixels
+    @param    t   Thickness of outer line
+    @param    color 16-bit 5-6-5 Color to draw with
+*/
+/**************************************************************************/
+void drawThickRect(int16_t x, int16_t y, int16_t w, int16_t h,
+  int16_t t, uint16_t color){
+  if(t==0) return;
+  if(t<0) {
+    t=-t;
+    x-=t; y-=t;
+    w=w+t+t; h=h+t+t;
+  }
+  tft.fillRect(x, y, w, t, color);
+  tft.fillRect(x, y, t, h, color);
+  tft.fillRect(x+w-1, y, -t, h, color);
+  tft.fillRect(x+w-1, y+h-1, -w, -t, color);
+}
+
 enum State {
   Idle,
   Error
@@ -208,27 +236,41 @@ void loop(){
       channelTitleInfo.displayTitle = channelTitleInfo.channel->streamTitle;
       channelTitleInfo.textOffset = 0;
       channelTitleInfo.repeats = 0;
+      o_X = 0;
       isTitleDisplaying = true;
     }
     // TODO: cleanup text when done
     if(isTitleDisplaying){
+      int8_t slot_num = channelTitleInfo.channel->slotNum;
+      uint16_t x, y;
+      if (slot_num>7) slot_num = 7;
+      if (slot_num<4) {
+        x = 11+((64+14)*slot_num);
+        y = 14;
+      } else {
+        x = 11+((64+14)*(slot_num-4));
+        y =14+64+14;
+      }
+      drawThickRect(x, y, 64, 64, -7, ST77XX_GREEN);
+      
       if(!o_X){
         text_canvas.fillScreen(ST77XX_BLACK);
         text_canvas.setCursor(0,0);
         text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
         channelTitleInfo.textOffset++;
         channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
-        if (channelTitleInfo.textOffset==0) {
-          if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
-            isTitleDisplaying=false;
-          }
-        }
-        
       }
       tft.fillRect(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), 298, 64, ST77XX_BLACK);
       drawRGBBitmapSectionFast(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
       //enterNormalMode();
       o_X = (o_X+6)%(6*8);
+
+      if (!o_X && channelTitleInfo.textOffset==0) {
+        if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
+          isTitleDisplaying=false;
+          redrawLiveChannelPics();
+        }
+      }
 
     }
   }
@@ -264,23 +306,33 @@ void commonHttpInit(HTTPClient& http_client){
 
 void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
+  uint16_t x, y;
   if(pic_slot_index<8){
     DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id, pic_slot_index);
     
     pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
 
     if(pic_slot_index<4){
-      tft.drawRGBBitmap(11+((64+14)*pic_slot_index), 14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+      x = 11+((64+14)*pic_slot_index);
+      y = 14;
+      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
     } else if(pic_slot_index<8){
-      tft.drawRGBBitmap(11+((64+14)*(pic_slot_index-4)), 14+64+14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+      x = 11+((64+14)*(pic_slot_index-4));
+      y = 14+64+14;
+      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    } else {
+      return; // should not be reached
     }
   } else {
     pic_canvas.fillScreen(ST77XX_BLACK);
     pic_canvas.setCursor(4, 14);
     pic_canvas.setTextSize(5);
     pic_canvas.printf("+%d", pic_slot_index-6);
-    tft.drawRGBBitmap(11+((64+14)*(3)), 14+64+14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    x = 11+((64+14)*(3));
+    y = 14+64+14;
+    tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
   }
+  drawThickRect(x, y, 64, 64, -7, ST77XX_BLACK);
 }
 
 void redrawLiveChannelPics(){
@@ -292,15 +344,21 @@ void redrawLiveChannelPics(){
       drawLiveChannelPic(channel, i++);
     }
   }
-  // block out remaining pic slots
+  // black out remaining pic slots
   for (;i < MAX_NUM_PICS; i++){
     // copied from drawLiveChannelPic()
+    uint16_t x, y;
     pic_canvas.fillScreen(ST77XX_BLACK);
     if(i<4){
-      tft.drawRGBBitmap(11+((64+14)*i), 14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-    } else if(i<8){
-      tft.drawRGBBitmap(11+((64+14)*(i-4)), 14+64+14, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+      x = 11+((64+14)*i);
+      y = 14;
+      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    } else {
+      x = 11+((64+14)*(i-4));
+      y = 14+64+14;
+      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
     }
+    drawThickRect(x, y, 64, 64, -7, ST77XX_BLACK);
   }
 }
 
