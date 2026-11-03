@@ -20,7 +20,12 @@
 #include "LowPass.h"
 
 #include "pics.h"
+#if __has_include("secrets.h")
 #include "secrets.h"
+#endif
+#if !defined(WIFI_SSID) || !defined(WIFI_PW)
+#error "This test sketch needs WIFI_SSID and WIFI_PW in include/secrets.h (see include/secrets.h.example)"
+#endif
 
 // https://stackoverflow.com/a/5459929
 #define STR_HELPER(x) #x
@@ -71,7 +76,7 @@ void setup(void) {
   DEBUG_I.printf("[%s] Starting...\n", DEBUG_TAG);
 
   DEBUG_I.printf("[%s] Connecting to WIFI...\n", DEBUG_TAG);
-  wifiMulti.addAP("::1", WIFI_PW);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PW);
 
   DEBUG_I.printf("[%s] Initializing display...\n", DEBUG_TAG);
   pinMode(TFT_BK, OUTPUT);

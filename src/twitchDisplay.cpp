@@ -7,7 +7,6 @@
 #include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
 #include <SPI.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -18,13 +17,18 @@
 #include <ESPmDNS.h>
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
+#include <Preferences.h>
+#include <DNSServer.h>
 
 #include <deque>
 #include <string>
 #include <vector>
 
 #include "pics.h"
+// optional: default settings for the first boot (see include/secrets.h.example)
+#if __has_include("secrets.h")
 #include "secrets.h"
+#endif
 
 #include "MovingAverage.h"
 #include "web_pages.h"
@@ -40,18 +44,39 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #define DEBUG_W if(DEBUG_WARNING)SERIAL_PORT
 #define DEBUG_I if(DEBUG_INFO)SERIAL_PORT
 
-// Twitch credentials (see include/secrets.h.example)
+// Settings are stored on the device (Settings page / setup mode). Values from
+// include/secrets.h are only used for settings that were never saved.
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PW
+#define WIFI_PW ""
+#endif
 #ifndef TWITCH_CLIENT_ID
-#define TWITCH_CLIENT_ID "gp762nuuoqcoxypju8c569th9wz7q5"
+#define TWITCH_CLIENT_ID ""
 #endif
-#if !defined(TWITCH_TOKEN) && !defined(TWITCH_CLIENT_SECRET)
-#error "include/secrets.h must define TWITCH_TOKEN and/or TWITCH_CLIENT_SECRET"
+#ifndef TWITCH_CLIENT_SECRET
+#define TWITCH_CLIENT_SECRET ""
 #endif
-
-// Web interface (status page, firmware upload) and ArduinoOTA
+#ifndef TWITCH_TOKEN
+#define TWITCH_TOKEN ""
+#endif
 #ifndef WEB_PASSWORD
-#error "include/secrets.h must define WEB_PASSWORD (login for the web interface and ArduinoOTA)"
+#define WEB_PASSWORD ""
 #endif
+// Client ID sent with a token when no client ID is set
+#define DEFAULT_CLIENT_ID "gp762nuuoqcoxypju8c569th9wz7q5"
+#define PREFS_NAMESPACE   "config"
+
+// Setup mode: own WiFi hotspot with the Settings page
+#define SETUP_AP_SSID        "TwitchDisplay-Setup"
+#define WIFI_CONNECT_TIMEOUT (2*60*1000)  // at boot: open the setup hotspot if WiFi is not reachable for this long
+#define SETUP_RETRY_TIMEOUT  (10*60*1000) // ...and restart to try WiFi again after this long without a hotspot client
+#define SETUP_BUTTON_PIN     9            // BOOT button (GPIO9, low when pressed)
+#define BOOT_HOLD_TIME       5000         // hold BOOT this long while running to restart into setup mode
+#define SETUP_REQUEST_MAGIC  0x53455455   // "SETU" in RTC memory: survives the restart into setup mode
+
+// Web interface (status page, firmware upload, settings) and ArduinoOTA
 #define WEB_USER          "admin"
 #define WEB_REALM         "twitchDisplay"
 #define HOSTNAME          "twitchdisplay"
@@ -132,7 +157,35 @@ void slotXY(int8_t slot, uint16_t& x, uint16_t& y){
 // Use hardware spi (for esp32-c3 super mini this is SPI0/1 at pins 4-7)
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-WiFiMulti wifiMulti;
+// Settings, loaded once at boot; saving them restarts the display
+struct Config {
+  String wifiSsid;
+  String wifiPassword;
+  String clientId;
+  String clientSecret;
+  String token;
+  String webPassword;
+
+  const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
+  bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
+} config;
+
+void loadConfig(){
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, true); // fails harmlessly if nothing was saved yet: defaults are returned
+  config.wifiSsid     = prefs.getString("ssid", WIFI_SSID);
+  config.wifiPassword = prefs.getString("wifipw", WIFI_PW);
+  config.clientId     = prefs.getString("clientid", TWITCH_CLIENT_ID);
+  config.clientSecret = prefs.getString("secret", TWITCH_CLIENT_SECRET);
+  config.token        = prefs.getString("token", TWITCH_TOKEN);
+  config.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
+  prefs.end();
+}
+
+// Set before ESP.restart() to come back in setup mode
+RTC_NOINIT_ATTR uint32_t setupRequested;
+
+bool setupMode = false;
 #ifdef DEBUG_UDP_LDR
 WiFiUDP Udp;
 #endif
@@ -141,11 +194,7 @@ WiFiUDP Udp;
 // root certificates built into the ESP32 core
 WiFiClientSecure tlsClient;
 
-#ifdef TWITCH_TOKEN
-String twitchToken = TWITCH_TOKEN;
-#else
-String twitchToken; // fetched with the client secret on the first update
-#endif
+String twitchToken; // config.token, or fetched with the client secret
 
 MovingAverage<100> ldrAverage;
 uint16_t ldr;     // last raw LDR reading
@@ -154,6 +203,9 @@ uint16_t ldr_avg; // averaged LDR reading used for the backlight
 void redrawLiveChannelPics(int8_t row = -1);
 void setupOTA();
 void setupWeb();
+void startSetupMode(const char* reason, bool retryLater);
+bool connectWiFi();
+void drawMessageScreen(const char* title, uint16_t color, const char* message);
 void networkTask(void*);
 
 struct channelInfo {
@@ -185,7 +237,7 @@ uint16_t live_num = 0;
 
 std::deque<channelInfo*> titleChangeQueue;
 
-enum class FetchResult { Ok, Unauthorized, Failed };
+enum class FetchResult { Ok, Unauthorized, Failed, NoCredentials };
 
 struct StreamInfo {
   std::string id;
@@ -235,10 +287,7 @@ void setup(void) {
   SERIAL_PORT.begin(115200);
   DEBUG_I.printf("[%s] Starting...\n", DEBUG_TAG);
 
-  DEBUG_I.printf("[%s] Connecting to WIFI...\n", DEBUG_TAG);
-  WiFi.setHostname(HOSTNAME); // name in the router (twitchdisplay.fritz.box)
-  wifiMulti.addAP("::1", WIFI_PW);
-
+  pinMode(SETUP_BUTTON_PIN, INPUT_PULLUP);
 
   DEBUG_I.printf("[%s] Initializing display...\n", DEBUG_TAG);
   pinMode(TFT_BK, OUTPUT);
@@ -258,13 +307,27 @@ void setup(void) {
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
 
-  DEBUG_I.printf("[%s] Waiting for WIFI connection...\n", DEBUG_TAG);
-  // wait for WiFi connection
-  while((wifiMulti.run() != WL_CONNECTED)){
-    delay(10);
-  }
+  loadConfig();
+  twitchToken = config.token;
 
-  DEBUG_I.printf("[%s] WIFI connected.\n", DEBUG_TAG);
+  if(setupRequested == SETUP_REQUEST_MAGIC){
+    setupRequested = 0;
+    startSetupMode("Requested with the BOOT button.", false);
+    return;
+  }
+  if(config.wifiSsid.isEmpty()){
+    startSetupMode("No WiFi network configured.", false);
+    return;
+  }
+  if(config.webPassword.isEmpty()){
+    startSetupMode("No web password configured.", false);
+    return;
+  }
+  if(!connectWiFi()){
+    startSetupMode("WiFi network not reachable.", true);
+    return;
+  }
+  tft.fillScreen(ST77XX_BLACK);
 
   tlsClient.useBuiltinCACertBundle();
 
@@ -407,9 +470,17 @@ void applyLiveUpdate(const LiveUpdate& update);
 void restoreDisplay();
 void confirmFirmwareWhenStable(bool wifiConnected);
 
+void setupModeLoop();
+void checkBootButton();
+
 void loop(){
+  if(setupMode){
+    setupModeLoop();
+    return;
+  }
   ArduinoOTA.handle();
   server.handleClient();
+  checkBootButton();
 
   if(rebootAt && millis() >= rebootAt){
     DEBUG_I.printf("[%s] Restarting...\n", DEBUG_TAG);
@@ -543,10 +614,19 @@ void commonHttpInit(HTTPClient& http_client){
   // add headers
   http_client.setAuthorizationType("Bearer");
   http_client.setAuthorization(twitchToken.c_str());
-  http_client.addHeader("Client-Id", TWITCH_CLIENT_ID);
+  http_client.addHeader("Client-Id", config.effectiveClientId());
 }
 
-#ifdef TWITCH_CLIENT_SECRET
+String urlEncode(const String& in){
+  String out;
+  const char* hex = "0123456789ABCDEF";
+  for(char c : in){
+    if(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') out += c;
+    else { out += '%'; out += hex[(c >> 4) & 0xF]; out += hex[c & 0xF]; }
+  }
+  return out;
+}
+
 // Gets a new app access token (client credentials flow) into twitchToken
 bool requestAppToken(){
   DEBUG_I.printf("[%s] Requesting new app access token...\n", DEBUG_TAG);
@@ -554,7 +634,8 @@ bool requestAppToken(){
   http.useHTTP10(true);
   http.begin(tlsClient, "https://id.twitch.tv/oauth2/token");
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int httpCode = http.POST("client_id=" TWITCH_CLIENT_ID "&client_secret=" TWITCH_CLIENT_SECRET "&grant_type=client_credentials");
+  String body = "client_id=" + urlEncode(config.effectiveClientId()) + "&client_secret=" + urlEncode(config.clientSecret) + "&grant_type=client_credentials";
+  int httpCode = http.POST(body.c_str());
   if(httpCode != HTTP_CODE_OK){
     DEBUG_W.printf("[HTTP] Token request failed, error: %s\n",
       (httpCode<=0) ? http.errorToString(httpCode).c_str() : String(httpCode).c_str());
@@ -575,7 +656,6 @@ bool requestAppToken(){
   DEBUG_I.printf("[%s] Got new app access token.\n", DEBUG_TAG);
   return true;
 }
-#endif
 
 // Requests the streams of all channels and fills update.streams
 FetchResult fetchLiveChannels(LiveUpdate& update){
@@ -647,17 +727,18 @@ void runNetworkUpdate(){
   if (otaActive) return;                      // firmware upload in progress
 
   LiveUpdate* update = new LiveUpdate();
-#ifdef TWITCH_CLIENT_SECRET
-  if (twitchToken.isEmpty()) requestAppToken();
-#endif
-  update->result = fetchLiveChannels(*update);
-#ifdef TWITCH_CLIENT_SECRET
-  if (update->result == FetchResult::Unauthorized && requestAppToken()) {
-    // token expired or revoked: retry once with the new one
-    update->streams.clear();
+  bool canRenewToken = config.clientSecret.length() > 0;
+  if (!config.hasTwitchCredentials()) {
+    update->result = FetchResult::NoCredentials;
+  } else {
+    if (canRenewToken && twitchToken.isEmpty()) requestAppToken();
     update->result = fetchLiveChannels(*update);
+    if (canRenewToken && update->result == FetchResult::Unauthorized && requestAppToken()) {
+      // token expired or revoked: retry once with the new one
+      update->streams.clear();
+      update->result = fetchLiveChannels(*update);
+    }
   }
-#endif
   if (xQueueSend(updateQueue, &update, portMAX_DELAY) != pdTRUE) delete update;
 }
 
@@ -739,7 +820,7 @@ void applyLiveUpdate(const LiveUpdate& update){
   lastFetchMillis = millis();
   if (update.result != FetchResult::Ok) {
     // keep showing the last known state
-    setStatus(update.result == FetchResult::Unauthorized ? STATUS_AUTH : STATUS_API);
+    setStatus(update.result == FetchResult::Failed ? STATUS_API : STATUS_AUTH);
     return;
   }
   setStatus(STATUS_OK);
@@ -803,7 +884,7 @@ void setupOTA(){
   ArduinoOTA.setHostname(HOSTNAME); // also starts mDNS: twitchdisplay.local
 
   // Same password as the web interface; pio passes it via upload_flags
-  ArduinoOTA.setPassword(WEB_PASSWORD);
+  ArduinoOTA.setPassword(config.webPassword.c_str());
 
   ArduinoOTA
     .onStart([]() {
@@ -903,7 +984,8 @@ size_t maxFirmwareSize(){
   return next ? next->size : 0;
 }
 
-void drawUpdateScreen(const char* title, uint16_t color, const char* message){
+// Full screen message (firmware update, WiFi connection, setup mode)
+void drawMessageScreen(const char* title, uint16_t color, const char* message){
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(true);
   tft.setTextSize(3);
@@ -944,7 +1026,7 @@ void handleUploadChunk(){
   HTTPUpload& up = server.upload();
   switch(up.status){
     case UPLOAD_FILE_START:
-      upload.authorized = server.authenticate(WEB_USER, WEB_PASSWORD);
+      upload.authorized = setupMode || server.authenticate(WEB_USER, config.webPassword.c_str()); // setup mode: hotspot password protects
       upload.headerChecked = false;
       upload.error = "";
       upload.lastPercent = -1;
@@ -952,7 +1034,7 @@ void handleUploadChunk(){
       DEBUG_I.printf("[OTA] Upload of %s started.\n", up.filename.c_str());
       otaActive = true;
       restoreDisplayAt = 0;
-      drawUpdateScreen("Firmware update", ST77XX_CYAN, nullptr);
+      drawMessageScreen("Firmware update", ST77XX_CYAN, nullptr);
       drawUpdateProgress(0);
       if(!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) failUpload(Update.errorString());
       break;
@@ -1008,19 +1090,19 @@ void sendJson(int code, bool ok, const String& message){
 
 // Called by the web server after the whole upload has been received
 void handleUploadDone(){
-  if(!upload.authorized || !server.authenticate(WEB_USER, WEB_PASSWORD)){
+  if(!upload.authorized || !(setupMode || server.authenticate(WEB_USER, config.webPassword.c_str()))){
     return server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
   }
   if(upload.error.length() == 0 && !upload.headerChecked) failUpload("No file received.");
   if(upload.error.length()){
     otaActive = false;
-    drawUpdateScreen("Update failed", ST77XX_RED, upload.error.c_str());
+    drawMessageScreen("Update failed", ST77XX_RED, upload.error.c_str());
     restoreDisplayAt = millis() + 5000;
     sendJson(400, false, "Update failed: " + upload.error);
     return;
   }
   drawUpdateProgress(100);
-  drawUpdateScreen("Update done", ST77XX_GREEN, "Restarting...");
+  drawMessageScreen("Update done", ST77XX_GREEN, "Restarting...");
   sendJson(200, true, "Update successful, the display restarts now.");
   rebootAt = millis() + 1000; // give the response time to reach the browser
 }
@@ -1051,13 +1133,15 @@ String formatDuration(unsigned long seconds){
 void sendPage(const char* title, const String& body){
   String page = WEB_PAGE_HEAD;
   page.replace("%TITLE%", title);
+  page.replace("%NAV%", setupMode ? "<a href=\"/settings\">Settings</a><a href=\"/update\">Update</a>"
+                                  : "<a href=\"/\">Status</a><a href=\"/update\">Update</a><a href=\"/settings\">Settings</a>");
   page += body;
   page += WEB_PAGE_FOOT;
   server.send(200, "text/html; charset=utf-8", page);
 }
 
 bool checkAuth(){
-  if(server.authenticate(WEB_USER, WEB_PASSWORD)) return true;
+  if(server.authenticate(WEB_USER, config.webPassword.c_str())) return true;
   server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
   return false;
 }
@@ -1085,6 +1169,7 @@ void handleStatus(){
     case FetchResult::Ok:           b += "<span class=\"ok\">OK</span>"; break;
     case FetchResult::Unauthorized: b += "<span class=\"err\">Token rejected (expired or invalid)</span>"; break;
     case FetchResult::Failed:       b += "<span class=\"err\">Request failed</span>"; break;
+    case FetchResult::NoCredentials: b += "<span class=\"err\">No Twitch credentials, see <a href=\"/settings\">Settings</a></span>"; break;
   }
   b += "</td></tr></table></div>";
 
@@ -1103,7 +1188,7 @@ void handleStatus(){
 }
 
 void handleUpdatePage(){
-  if(!checkAuth()) return;
+  if(!setupMode && !checkAuth()) return;
   String body = WEB_UPDATE_BODY;
   body.replace("%MAXSIZE%", String((unsigned)maxFirmwareSize()));
   sendPage("Update", body);
@@ -1115,15 +1200,315 @@ void handleReboot(){
   rebootAt = millis() + 1000;
 }
 
+void handleSettingsPage();
+void handleSettingsSave();
+void handleReset();
+
 void setupWeb(){
   server.on("/", HTTP_GET, handleStatus);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
   server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/settings", HTTP_GET, handleSettingsPage);
+  server.on("/settings", HTTP_POST, handleSettingsSave);
+  server.on("/reset", HTTP_POST, handleReset);
   // answered without a login challenge: every challenge creates a new digest
   // nonce, which would invalidate the browser's current login
   server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); });
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   server.begin();
   MDNS.addService("http", "tcp", 80);
+}
+
+
+// ---------- Setup mode state
+
+DNSServer dnsServer;
+const char* setupModeReason = "";
+bool setupRetryLater = false;        // restart to retry WiFi after SETUP_RETRY_TIMEOUT
+unsigned long setupModeSince = 0;
+String setupApPassword;
+std::vector<String> scannedNetworks; // networks found when setup mode started
+
+// ---------- Settings
+
+bool isTwitchValue(const String& v){
+  for(char c : v) if(!isalnum((unsigned char)c)) return false;
+  return v.length() <= 128;
+}
+
+// Checks the submitted settings. Returns nullptr if they can be saved.
+const char* validateSettings(const String& ssid, const String& wifiPassword, const String& clientId,
+                             const String& clientSecret, const String& token,
+                             const String& webPassword, const String& webPassword2, bool webPasswordSet){
+  if(ssid.isEmpty()) return "Enter the name of your WiFi network.";
+  if(ssid.length() > 32) return "The WiFi network name is too long (max. 32 bytes).";
+  if(wifiPassword.length() && (wifiPassword.length() < 8 || wifiPassword.length() > 63)) return "The WiFi password must have 8 to 63 characters.";
+  if(!isTwitchValue(clientId) || !isTwitchValue(clientSecret) || !isTwitchValue(token)) return "Twitch client ID, secret and token may only contain letters and digits.";
+  if(webPassword != webPassword2) return "The two web passwords do not match.";
+  if(webPassword.length() && webPassword.length() < 8) return "The web password must have at least 8 characters.";
+  if(!webPasswordSet && webPassword.isEmpty()) return "Choose a password for the web interface.";
+  return nullptr;
+}
+
+String escapeString(const String& s){
+  return htmlEscape(std::string(s.c_str()));
+}
+
+// After a failed save show what was entered, otherwise the stored value
+String inputValue(const char* name, const String& current){
+  return escapeString(server.hasArg(name) ? server.arg(name) : current);
+}
+
+// Password field that never shows the stored value
+String secretField(const char* label, const char* name, bool isSet, const char* hint, bool clearable){
+  String f = String("<label>") + label + "<input type=\"password\" name=\"" + name + "\" autocomplete=\"new-password\" placeholder=\""
+           + (isSet ? "stored - leave empty to keep" : "not set") + "\"></label>";
+  if(hint) f += String("<p class=\"hint\">") + hint + "</p>";
+  if(isSet && clearable) f += String("<label class=\"check\"><input type=\"checkbox\" name=\"") + name + "_clear\">Remove stored value</label>";
+  return f;
+}
+
+void sendSettingsPage(const String& message, bool isError){
+  String b;
+  b.reserve(4096);
+  if(setupMode){
+    b += "<div class=\"card\"><h2>Setup mode</h2><p>" + escapeString(setupModeReason) + "</p>"
+         "<p class=\"muted\">Enter your WiFi network and a password for the web interface. "
+         "The display restarts and connects to your WiFi.</p></div>";
+  }
+  b += "<div class=\"card\"><h2>Settings</h2>";
+  if(message.length()) b += String("<p class=\"") + (isError ? "err" : "ok") + "\">" + escapeString(message) + "</p>";
+  b += "<form method=\"post\" action=\"/settings\">";
+
+  b += "<h3>WiFi</h3>";
+  b += "<label>Network<input type=\"text\" name=\"ssid\" list=\"nets\" maxlength=\"32\" required value=\"" + inputValue("ssid", config.wifiSsid) + "\"></label>";
+  if(scannedNetworks.size()){
+    b += "<datalist id=\"nets\">";
+    for(const String& n : scannedNetworks) b += "<option value=\"" + escapeString(n) + "\">";
+    b += "</datalist>";
+  }
+  b += secretField("Password", "wifipw", config.wifiPassword.length() > 0, nullptr, true);
+
+  b += "<h3>Twitch</h3>";
+  b += "<p class=\"hint\">Create an application at <a href=\"https://dev.twitch.tv/console\" target=\"_blank\">dev.twitch.tv/console</a> "
+       "and enter its client ID and secret. The display then gets and renews its access token itself.</p>";
+  b += "<label>Client ID<input type=\"text\" name=\"clientid\" maxlength=\"128\" autocomplete=\"off\" value=\"" + inputValue("clientid", config.clientId) + "\"></label>";
+  b += secretField("Client secret", "secret", config.clientSecret.length() > 0, nullptr, true);
+  b += secretField("Access token (optional)", "token", config.token.length() > 0, "Only needed without a client secret. It expires and is not renewed.", true);
+
+  b += "<h3>Web interface</h3>";
+  b += "<p class=\"hint\">Login user is <b>admin</b>. The password is also used for uploads from PlatformIO.</p>";
+  b += secretField("New password", "webpw", config.webPassword.length() > 0, nullptr, false);
+  b += "<label>Repeat new password<input type=\"password\" name=\"webpw2\" autocomplete=\"new-password\"></label>";
+
+  b += "<p><button>Save and restart</button></p></form></div>";
+
+  b += "<div class=\"card\"><h2>Reset</h2><p class=\"muted\">Removes all settings stored on the display. "
+       "Values built into the firmware (include/secrets.h) are used again; without them the display starts in setup mode.</p>"
+       "<form method=\"post\" action=\"/reset\" onsubmit=\"return confirm('Remove all settings?')\">"
+       "<p><button class=\"danger\">Reset settings</button></p></form></div>";
+  sendPage("Settings", b);
+}
+
+void handleSettingsPage(){
+  if(!setupMode && !checkAuth()) return;
+  sendSettingsPage("", false);
+}
+
+void handleSettingsSave(){
+  if(!setupMode && !checkAuth()) return;
+  String ssid = server.arg("ssid");           ssid.trim();
+  String wifiPassword = server.arg("wifipw");
+  String clientId = server.arg("clientid");   clientId.trim();
+  String clientSecret = server.arg("secret"); clientSecret.trim();
+  String token = server.arg("token");         token.trim();
+  if(token.startsWith("oauth:")) token = token.substring(6);
+  String webPassword = server.arg("webpw");
+  String webPassword2 = server.arg("webpw2");
+
+  const char* err = validateSettings(ssid, wifiPassword, clientId, clientSecret, token, webPassword, webPassword2, config.webPassword.length() > 0);
+  if(err){
+    sendSettingsPage(err, true);
+    return;
+  }
+
+  // empty secret fields keep the stored value, "Remove" stores an empty one
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, false);
+  prefs.putString("ssid", ssid);
+  if(wifiPassword.length()) prefs.putString("wifipw", wifiPassword);
+  else if(server.hasArg("wifipw_clear")) prefs.putString("wifipw", "");
+  prefs.putString("clientid", clientId);
+  if(clientSecret.length()) prefs.putString("secret", clientSecret);
+  else if(server.hasArg("secret_clear")) prefs.putString("secret", "");
+  if(token.length()) prefs.putString("token", token);
+  else if(server.hasArg("token_clear")) prefs.putString("token", "");
+  if(webPassword.length()) prefs.putString("webpw", webPassword);
+  prefs.end();
+  DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
+
+  String b = "<div class=\"card\"><h2>Saved</h2><p class=\"ok\">The settings were saved. The display restarts now.</p>";
+  if(setupMode) b += "<p>Connect this device back to your normal WiFi and open <a href=\"http://" HOSTNAME ".fritz.box/\">http://" HOSTNAME ".fritz.box/</a> "
+                     "or <a href=\"http://" HOSTNAME ".local/\">http://" HOSTNAME ".local/</a> in about 30 seconds.</p>";
+  else b += "<p>Reload the <a href=\"/\">status page</a> in about 30 seconds.</p>";
+  b += "</div>";
+  sendPage("Saved", b);
+  drawMessageScreen("Settings saved", ST77XX_GREEN, "Restarting...");
+  rebootAt = millis() + 1500;
+}
+
+void handleReset(){
+  if(!setupMode && !checkAuth()) return;
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, false);
+  prefs.clear();
+  prefs.end();
+  DEBUG_I.printf("[%s] Settings reset, restarting.\n", DEBUG_TAG);
+  sendPage("Reset", "<div class=\"card\"><h2>Reset</h2><p class=\"ok\">All settings were removed. The display restarts now.</p></div>");
+  drawMessageScreen("Settings reset", ST77XX_YELLOW, "Restarting...");
+  rebootAt = millis() + 1500;
+}
+
+// ---------- WiFi connection and setup mode
+
+// Connects to the configured WiFi; false if it is not reachable within WIFI_CONNECT_TIMEOUT
+bool connectWiFi(){
+  DEBUG_I.printf("[%s] Connecting to WIFI %s...\n", DEBUG_TAG, config.wifiSsid.c_str());
+  drawMessageScreen("Connecting...", ST77XX_CYAN, config.wifiSsid.c_str());
+  WiFi.setHostname(HOSTNAME); // name in the router (twitchdisplay.fritz.box)
+  WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+  unsigned long start = millis();
+  while(WiFi.status() != WL_CONNECTED){
+    if(millis() - start >= WIFI_CONNECT_TIMEOUT){
+      DEBUG_W.printf("[%s] WIFI not reachable.\n", DEBUG_TAG);
+      return false;
+    }
+    delay(100);
+  }
+  DEBUG_I.printf("[%s] WIFI connected.\n", DEBUG_TAG);
+  return true;
+}
+
+String randomPassword(int len){
+  const char* chars = "abcdefghjkmnpqrstuvwxyz23456789"; // no 0/o, 1/l/i
+  String pw;
+  for(int i = 0; i < len; i++) pw += chars[esp_random() % strlen(chars)];
+  return pw;
+}
+
+void drawSetupScreen(){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextWrap(false);
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 8);
+  tft.print("Setup mode");
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 38);
+  tft.print(setupModeReason);
+  tft.setTextSize(2);
+  tft.setCursor(10, 58);
+  tft.print("1. Connect to WiFi");
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(34, 80);
+  tft.print(SETUP_AP_SSID);
+  tft.setCursor(34, 102);
+  tft.print(("Password: " + setupApPassword).c_str());
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(10, 130);
+  tft.print(("2. Open " + WiFi.softAPIP().toString()).c_str());
+}
+
+// Own WiFi hotspot with the Settings page; DNS answers every name with the
+// display's address so phones open the page by themselves (captive portal)
+void startSetupMode(const char* reason, bool retryLater){
+  setupMode = true;
+  setupModeReason = reason;
+  setupRetryLater = retryLater;
+  DEBUG_I.printf("[%s] Starting setup mode: %s\n", DEBUG_TAG, reason);
+  drawMessageScreen("Setup mode", ST77XX_CYAN, "Starting...");
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP_STA);
+  // networks for the list on the Settings page
+  int n = WiFi.scanNetworks();
+  for(int i = 0; i < n && scannedNetworks.size() < 20; i++){
+    String ssid = WiFi.SSID(i);
+    if(ssid.length() && std::find(scannedNetworks.begin(), scannedNetworks.end(), ssid) == scannedNetworks.end()){
+      scannedNetworks.push_back(ssid);
+    }
+  }
+  WiFi.scanDelete();
+
+  setupApPassword = randomPassword(8);
+  WiFi.softAP(SETUP_AP_SSID, setupApPassword.c_str());
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  server.on("/settings", HTTP_GET, handleSettingsPage);
+  server.on("/settings", HTTP_POST, handleSettingsSave);
+  server.on("/reset", HTTP_POST, handleReset);
+  // firmware upload also works here, so a firmware that can't connect to the
+  // WiFi can still be replaced through the hotspot
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
+  server.onNotFound([](){
+    server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/settings", true);
+    server.send(302, "text/plain", "");
+  });
+  server.begin();
+
+  drawSetupScreen();
+  setupModeSince = millis();
+
+  esp_task_wdt_config_t wdtConfig = { .timeout_ms = LOOP_WDT_TIMEOUT, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdtConfig);
+  enableLoopWDT();
+}
+
+void setupModeLoop(){
+  dnsServer.processNextRequest();
+  server.handleClient();
+  if(rebootAt && millis() >= rebootAt){
+    delay(100);
+    ESP.restart();
+  }
+  if(restoreDisplayAt && millis() >= restoreDisplayAt){
+    // failed firmware upload: back to the setup instructions
+    restoreDisplayAt = 0;
+    drawSetupScreen();
+  }
+  // running stable with the hotspot counts as working: a firmware update that
+  // ends up in setup mode (e.g. new settings needed) must not be rolled back
+  confirmFirmwareWhenStable(true);
+  // WiFi was only unreachable (e.g. router still starting): try again later,
+  // unless someone is using the hotspot
+  if(setupRetryLater && !rebootAt && millis() - setupModeSince >= SETUP_RETRY_TIMEOUT){
+    if(WiFi.softAPgetStationNum() == 0){
+      DEBUG_I.printf("[%s] Setup mode unused, restarting to try WIFI again.\n", DEBUG_TAG);
+      ESP.restart();
+    }
+    setupModeSince = millis() - SETUP_RETRY_TIMEOUT + 60000; // check again in a minute
+  }
+  delay(10);
+}
+
+// Holding BOOT for BOOT_HOLD_TIME restarts into setup mode
+void checkBootButton(){
+  static unsigned long pressedSince = 0;
+  if(digitalRead(SETUP_BUTTON_PIN) != LOW){
+    pressedSince = 0;
+    return;
+  }
+  if(!pressedSince){
+    pressedSince = millis();
+    if(!pressedSince) pressedSince = 1;
+  } else if(millis() - pressedSince >= BOOT_HOLD_TIME){
+    DEBUG_I.printf("[%s] BOOT button held, restarting into setup mode.\n", DEBUG_TAG);
+    drawMessageScreen("Setup mode", ST77XX_CYAN, "Restarting...");
+    setupRequested = SETUP_REQUEST_MAGIC;
+    delay(500);
+    ESP.restart();
+  }
 }

@@ -28,7 +28,7 @@ dimmed automatically via an LDR.
 |------|---------|
 | `src/twitchDisplay.cpp` | Main firmware |
 | `include/pics.h` | 64×64 RGB565 channel logos (made with [image2cpp](https://javl.github.io/image2cpp/)) |
-| `include/secrets.h.example` | Template for `include/secrets.h` |
+| `include/secrets.h.example` | Template for the optional `include/secrets.h` (default settings) |
 | `include/web_pages.h` | HTML of the web interface |
 | `tools/version.py` | Build script that puts the git version into the firmware |
 | `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
@@ -43,25 +43,45 @@ Each program has its own environment in `platformio.ini`:
 `twitchDisplay_displayTest` and `twitchDisplay_ldrTest` build the matching
 folder in `examples/` (via `build_src_filter`).
 
-## Secrets
+## Settings and setup mode
 
-Copy `include/secrets.h.example` to `include/secrets.h` (it is gitignored)
-and fill in your values:
+The display stores its settings (WiFi, Twitch credentials, web password) on
+the device. No secrets are compiled into the firmware, so the same
+`firmware.bin` works for everyone.
 
-```cpp
-#define WIFI_PW      "your-wifi-password"
+**First start:** without settings the display opens its own WiFi hotspot and
+shows its name and a random password:
 
-// login for the web interface (user "admin") and ArduinoOTA uploads
-#define WEB_PASSWORD "choose-a-password"
+1. Connect your phone to `TwitchDisplay-Setup` with the password shown on the
+   display. The settings page usually opens by itself; otherwise open
+   `http://192.168.4.1/`.
+2. Choose your WiFi network, enter its password and a password for the web
+   interface (at least 8 characters). Twitch credentials can be entered now or
+   later.
+3. Save. The display restarts and connects to your WiFi.
 
-// either a fixed access token ...
-#define TWITCH_TOKEN "your-twitch-access-token"
+**Changing settings later:** web interface -> **Settings**. Stored passwords
+and secrets are never shown; leave a field empty to keep the stored value.
 
-// ... or (recommended) your Twitch application's client ID and secret; the
-// display then gets and renews its own app access token
-#define TWITCH_CLIENT_ID     "your-client-id"
-#define TWITCH_CLIENT_SECRET "your-client-secret"
-```
+**Setup mode again:**
+- hold the **BOOT** button for 5 seconds while the display is running (not
+  while plugging it in: that starts the chip's USB download mode), or
+- the display opens the setup hotspot by itself if the WiFi is not reachable
+  for 2 minutes after starting. If nobody uses the hotspot, it restarts after
+  10 minutes and tries the WiFi again (e.g. after a power cut, when the router
+  takes longer to start).
+
+**Twitch credentials:** create an application at
+[dev.twitch.tv/console](https://dev.twitch.tv/console) and enter its client ID
+and client secret. The display gets and renews its own app access token. A
+fixed access token also works but expires and has to be replaced by hand.
+
+### Optional: defaults in the firmware
+
+`include/secrets.h` (copy `include/secrets.h.example`, gitignored) can provide
+default values that are used for settings never saved on the device. Only
+needed if you want a firmware that starts already configured; never publish a
+firmware built with it.
 
 ## Status dot
 
@@ -78,7 +98,7 @@ display keeps showing the last known live channels while it is visible.
 ## Web interface
 
 Open `http://twitchdisplay.fritz.box/` (or `http://twitchdisplay.local/`) and
-log in as `admin` with `WEB_PASSWORD`.
+log in as `admin` with your web password.
 
 - **Status**: live channels, last Twitch update, firmware version, uptime,
   WiFi, memory, restart button
@@ -86,6 +106,7 @@ log in as `admin` with `WEB_PASSWORD`.
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
+- **Settings**: WiFi, Twitch credentials, web password, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on
 probation" and only confirms itself after it has been online for 60 s. If it
@@ -105,7 +126,7 @@ The firmware file is `.pio/build/twitchDisplay/firmware.bin`; upload it on the
 web interface's Update page.
 
 Alternatively upload directly from PlatformIO over WiFi (ArduinoOTA). It uses
-the same password, taken from the environment variable
+the web password, taken from the environment variable
 `TWITCHDISPLAY_PASSWORD` so it never ends up in the repository:
 
 ```bash

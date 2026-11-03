@@ -9,7 +9,12 @@
  *    - Close message (handled by websockets lib)
  */
  
+#if __has_include("secrets.h")
 #include "secrets.h"
+#endif
+#if !defined(WIFI_SSID) || !defined(WIFI_PW) || !defined(TWITCH_TOKEN)
+#error "This test sketch needs WIFI_SSID, WIFI_PW and TWITCH_TOKEN in include/secrets.h (see include/secrets.h.example)"
+#endif
 
 #include <Arduino.h>
 #include <inttypes.h>
@@ -126,7 +131,7 @@ void setup() {
     delay(1000);
   }
 
-  wifiMulti.addAP("::1", WIFI_PW);
+  wifiMulti.addAP(WIFI_SSID, WIFI_PW);
   
   // wait for WiFi connection
   while((wifiMulti.run() != WL_CONNECTED)){
