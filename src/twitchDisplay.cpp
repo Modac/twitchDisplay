@@ -44,6 +44,32 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #define DEBUG_W if(DEBUG_WARNING)SERIAL_PORT
 #define DEBUG_I if(DEBUG_INFO)SERIAL_PORT
 
+// Twitch credentials (see include/secrets.h.example)
+#ifndef TWITCH_CLIENT_ID
+#define TWITCH_CLIENT_ID "gp762nuuoqcoxypju8c569th9wz7q5"
+#endif
+#if !defined(TWITCH_TOKEN) && !defined(TWITCH_CLIENT_SECRET)
+#error "include/secrets.h must define TWITCH_TOKEN and/or TWITCH_CLIENT_SECRET"
+#endif
+
+// Send the LDR values via UDP (e.g. for plotting). Off by default.
+//#define DEBUG_UDP_LDR
+#define DEBUG_UDP_HOST     "192.168.6.61"
+#define DEBUG_UDP_PORT     47269
+#define DEBUG_UDP_INTERVAL 100   // ms
+
+// Ask the WiFi driver to reconnect if the connection is lost for this long
+#define WIFI_RECONNECT_INTERVAL (30*1000)
+
+// Status dot in the bottom right corner below the grid
+#define STATUS_SIZE     5
+#define STATUS_X        (320-11-STATUS_SIZE)
+#define STATUS_Y        (170-STATUS_SIZE-1)
+#define STATUS_OK       ST77XX_BLACK    // everything fine: dot invisible
+#define STATUS_NO_WIFI  ST77XX_YELLOW   // WiFi disconnected
+#define STATUS_AUTH     ST77XX_MAGENTA  // Twitch token rejected (expired or invalid)
+#define STATUS_API      ST77XX_RED      // Twitch request failed for another reason
+
 #define TFT_CS         7
 #define TFT_RST       10 // Or set to -1 and connect to Arduino RESET pin
 #define TFT_DC         1
@@ -83,7 +109,19 @@ void slotXY(int8_t slot, uint16_t& x, uint16_t& y){
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 WiFiMulti wifiMulti;
+#ifdef DEBUG_UDP_LDR
 WiFiUDP Udp;
+#endif
+
+// TLS client for the Twitch API; verifies the server certificate against the
+// root certificates built into the ESP32 core
+WiFiClientSecure tlsClient;
+
+#ifdef TWITCH_TOKEN
+String twitchToken = TWITCH_TOKEN;
+#else
+String twitchToken; // fetched with the client secret on the first update
+#endif
 
 // Filter instance
 LowPass<2> lp(0.1,1e3,true);
@@ -171,6 +209,8 @@ void setup(void) {
   }
 
   DEBUG_I.printf("[%s] WIFI connected.\n", DEBUG_TAG);
+
+  tlsClient.useBuiltinCACertBundle();
 
   setupOTA();
 
@@ -262,6 +302,41 @@ void stopTitle(){
   redrawLiveChannelPics();
 }
 
+uint16_t statusColor = STATUS_OK;
+
+void setStatus(uint16_t color){
+  if(color == statusColor) return;
+  statusColor = color;
+  tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, color);
+}
+
+// Returns true while WiFi is connected. The ESP32 reconnects on its own;
+// this only shows the state, nudges the driver now and then and triggers
+// an update as soon as the connection is back.
+bool handleWiFi(){
+  static unsigned long lostSince = 0;
+  static unsigned long lastReconnect = 0;
+  if(WiFi.status() == WL_CONNECTED){
+    if(lostSince){
+      DEBUG_I.printf("[%s] WIFI reconnected after %lus.\n", DEBUG_TAG, (millis()-lostSince)/1000);
+      lostSince = 0;
+      tw_update_now = true;
+    }
+    return true;
+  }
+  if(!lostSince){
+    DEBUG_W.printf("[%s] WIFI connection lost.\n", DEBUG_TAG);
+    lostSince = lastReconnect = millis();
+    if(!lostSince) lostSince = lastReconnect = 1; // 0 means "connected"
+    setStatus(STATUS_NO_WIFI);
+  } else if(millis() - lastReconnect >= WIFI_RECONNECT_INTERVAL){
+    DEBUG_I.printf("[%s] WIFI still disconnected, reconnecting...\n", DEBUG_TAG);
+    WiFi.reconnect();
+    lastReconnect = millis();
+  }
+  return false;
+}
+
 void loop(){
   
   ArduinoOTA.handle();
@@ -274,8 +349,10 @@ void loop(){
   // 10 = minimum of backligh pwm value when darkest
   analogWrite(TFT_BK, constrain(map(ldr_f2, 1000, 4095, 255, 10), 10, 255));
 
+  bool wifiConnected = handleWiFi();
+
   if(state == Idle){
-    if (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL){
+    if (wifiConnected && (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL)){
       DEBUG_I.printf("[%s] Idle: Updating live channels...\n", DEBUG_TAG);
 #ifndef TEST_SERVER
       updateLiveChannels();
@@ -317,15 +394,20 @@ void loop(){
     ESP.restart();
   }
    
-  Udp.beginPacket("192.168.6.61", 47269);
-  // Just test touch pin - Touch0 is T0 which is on GPIO 4.
-  Udp.print("ldr:");
-  Udp.println(ldr);
-  Udp.print("ldr_f:");
-  Udp.println(ldr_f);
-  Udp.print("ldr_f2:");
-  Udp.println(ldr_f2);
-  Udp.endPacket();
+#ifdef DEBUG_UDP_LDR
+  static unsigned long lastUdp = 0;
+  if(wifiConnected && millis() - lastUdp >= DEBUG_UDP_INTERVAL){
+    lastUdp = millis();
+    Udp.beginPacket(DEBUG_UDP_HOST, DEBUG_UDP_PORT);
+    Udp.print("ldr:");
+    Udp.println(ldr);
+    Udp.print("ldr_f:");
+    Udp.println(ldr_f);
+    Udp.print("ldr_f2:");
+    Udp.println(ldr_f2);
+    Udp.endPacket();
+  }
+#endif
   delay(10);
   
 }
@@ -336,8 +418,93 @@ void commonHttpInit(HTTPClient& http_client){
   
   // add headers
   http_client.setAuthorizationType("Bearer");
-  http_client.setAuthorization(TWITCH_TOKEN);
-  http_client.addHeader("Client-Id", "gp762nuuoqcoxypju8c569th9wz7q5");
+  http_client.setAuthorization(twitchToken.c_str());
+  http_client.addHeader("Client-Id", TWITCH_CLIENT_ID);
+}
+
+#ifdef TWITCH_CLIENT_SECRET
+// Gets a new app access token (client credentials flow) into twitchToken
+bool requestAppToken(){
+  DEBUG_I.printf("[%s] Requesting new app access token...\n", DEBUG_TAG);
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.begin(tlsClient, "https://id.twitch.tv/oauth2/token");
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int httpCode = http.POST("client_id=" TWITCH_CLIENT_ID "&client_secret=" TWITCH_CLIENT_SECRET "&grant_type=client_credentials");
+  if(httpCode != HTTP_CODE_OK){
+    DEBUG_W.printf("[HTTP] Token request failed, error: %s\n",
+      (httpCode<=0) ? http.errorToString(httpCode).c_str() : String(httpCode).c_str());
+    http.end();
+    return false;
+  }
+  JsonDocument filter;
+  filter["access_token"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  const char* token = doc["access_token"];
+  if(err || token == nullptr){
+    DEBUG_W.printf("[%s] Token response invalid.\n", DEBUG_TAG);
+    return false;
+  }
+  twitchToken = token;
+  DEBUG_I.printf("[%s] Got new app access token.\n", DEBUG_TAG);
+  return true;
+}
+#endif
+
+enum class FetchResult { Ok, Unauthorized, Failed };
+
+// Requests the streams of all channels and parses the needed fields into doc
+FetchResult fetchLiveChannels(JsonDocument& doc){
+  // Could maybe be done as constexpr??
+  String url = String("https://api.twitch.tv/helix/streams?");
+  for (auto& channel : channels) {
+    url += "user_id=";
+    url += channel.id.c_str();
+    url += "&";
+  }
+
+  DEBUG_I.printf("[%s] Update live channels with url: %s\n", DEBUG_TAG, url.c_str());
+
+  HTTPClient http;
+  http.begin(tlsClient, url);
+  commonHttpInit(http);
+  DEBUG_I.print("[HTTP] GET...\n");
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    DEBUG_W.printf(
+      "[HTTP] GET failed, error: %s\n",
+      (httpCode<=0)?
+        http.errorToString(httpCode).c_str():
+        String(httpCode).c_str());
+    http.end();
+    return (httpCode == HTTP_CODE_UNAUTHORIZED) ? FetchResult::Unauthorized : FetchResult::Failed;
+  }
+
+  DEBUG_I.print("[JSON] Deserializing response...\n");
+
+  // only keep the fields that are used
+  JsonDocument filter;
+  JsonObject stream = filter["data"].add<JsonObject>();
+  stream["user_id"] = true;
+  stream["user_name"] = true;
+  stream["title"] = true;
+  stream["game_name"] = true;
+
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    DEBUG_W.print("[JSON] deserializeJson() failed with code ");
+    DEBUG_W.println(err.f_str());
+    return FetchResult::Failed;
+  }
+  if (!doc["data"].is<JsonArray>()) {
+    DEBUG_W.print("[JSON] Response has no data array.\n");
+    return FetchResult::Failed;
+  }
+  return FetchResult::Ok;
 }
 
 void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
@@ -428,42 +595,24 @@ channelInfo* setIDLiveStatus(const char* id, bool now_live, bool draw_immediat=t
 }
 
 void updateLiveChannels(){
-  HTTPClient http;
-  // Could maybe be done as constexpr??
-  String url = String("https://api.twitch.tv/helix/streams?");
-  for (auto& channel : channels) {
-    url += "user_id=";
-    url += channel.id.c_str();
-    url += "&";
-  }
-
-  DEBUG_I.printf("[%s] Update live channels with url: %s\n", DEBUG_TAG, url.c_str());  
-  
-  http.begin(url);  //HTTP
-  commonHttpInit(http);
-  // start connection and send HTTP header
-  DEBUG_I.print("[HTTP] GET...\n");
-  int httpCode = http.GET();
-  
-  
-  if (httpCode != HTTP_CODE_OK) {
-    DEBUG_W.printf(
-      "[HTTP] GET failed, error: %s\n",
-      (httpCode<=0)?
-        http.errorToString(httpCode).c_str():
-        String(httpCode).c_str());
-    return;
-  }
-
-  DEBUG_I.print("[JSON] Deserializing response...\n");
-
   JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  if (err) {
-    DEBUG_W.print("[JSON] deserializeJson() failed with code ");
-    DEBUG_W.println(err.f_str());
+#ifdef TWITCH_CLIENT_SECRET
+  if (twitchToken.isEmpty()) requestAppToken();
+#endif
+  FetchResult result = fetchLiveChannels(doc);
+#ifdef TWITCH_CLIENT_SECRET
+  if (result == FetchResult::Unauthorized && requestAppToken()) {
+    // token expired or revoked: retry once with the new one
+    doc.clear();
+    result = fetchLiveChannels(doc);
+  }
+#endif
+  if (result != FetchResult::Ok) {
+    // keep showing the last known state
+    setStatus(result == FetchResult::Unauthorized ? STATUS_AUTH : STATUS_API);
     return;
   }
+  setStatus(STATUS_OK);
 
   // Reset is_live array
   //memset(is_live, false, sizeof is_live);

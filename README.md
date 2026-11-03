@@ -48,8 +48,27 @@ and fill in your values:
 
 ```cpp
 #define WIFI_PW      "your-wifi-password"
+
+// either a fixed access token ...
 #define TWITCH_TOKEN "your-twitch-access-token"
+
+// ... or (recommended) your Twitch application's client ID and secret; the
+// display then gets and renews its own app access token
+#define TWITCH_CLIENT_ID     "your-client-id"
+#define TWITCH_CLIENT_SECRET "your-client-secret"
 ```
+
+## Status dot
+
+A small dot in the bottom right corner below the grid shows problems. The
+display keeps showing the last known live channels while it is visible.
+
+| Colour  | Meaning |
+|---------|---------|
+| none    | Everything works |
+| yellow  | WiFi disconnected |
+| magenta | Twitch rejected the token (expired or invalid) |
+| red     | Twitch request failed for another reason |
 
 ## Build and upload
 
