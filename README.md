@@ -7,7 +7,9 @@ firmware is on the `platform/platformio` branch.
 
 ## Hardware
 
-- Seeed XIAO ESP32-C3
+- Generic ESP32-C3 board (black AliExpress board, similar to the ESP32-C3
+  SuperMini). The configuration uses ESPHome's `seeed_xiao_esp32c3` board
+  definition, which works for this board as well.
 - 1.9" 170×320 ST7789V display
 
 | Function          | GPIO |
