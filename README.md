@@ -7,6 +7,11 @@ dimmed automatically via an LDR.
 
 ## Hardware
 
+- Generic ESP32-C3 board (black AliExpress board, similar to the ESP32-C3
+  SuperMini), 4 MB flash; built with the `esp32-c3-devkitm-1` board definition
+- 1.9" 170×320 ST7789 display
+- LDR on A3 for automatic backlight dimming
+
 | Function          | GPIO |
 |-------------------|------|
 | TFT SCK           | 4    |
