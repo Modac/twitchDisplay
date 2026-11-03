@@ -1,6 +1,5 @@
-// TODO: add filters for json deserialization
-// TODO: add title display
-// TODO: add unicode support (e.g. with https://github.com/takkaO/OpenFontRender/tree/master and Noto Sans + Noto Emoji, but together at least 1,5MB)
+// TODO: full unicode support (e.g. with https://github.com/takkaO/OpenFontRender/tree/master and Noto Sans + Noto Emoji, but together at least 1,5MB).
+//       For now titles are converted to the CP437 charset of the built-in font (umlauts and other Latin-1 letters work, emoji are dropped).
 // TODO: reduce scrolling text flicker by flipping the MV flag such that the pixels can be transfered column by column and not row by row
 
 #include <Arduino.h>
@@ -12,34 +11,25 @@
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
-#include <set>
 #include <ArduinoOTA.h>
+
+#include <deque>
+#include <string>
+#include <vector>
 
 #include "pics.h"
 #include "secrets.h"
 
-#include "LowPass.h"
 #include "MovingAverage.h"
-#include <deque>
 
-// https://stackoverflow.com/a/5459929
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
-
-// PROGMEM and F() are pointless in ESP32
 static const char DEBUG_TAG[] = "TwitchDisplay";
+
 // inspiration from https://forum.arduino.cc/t/single-line-define-to-disable-code/636044/5
-
-//#define TEST_SERVER
-
 #define SERIAL_PORT Serial
-#define USE_SERIAL true
 #define DEBUG_ERROR true
 #define DEBUG_WARNING true
 #define DEBUG_INFO true
-#define S if(USE_SERIAL)SERIAL_PORT
 #define DEBUG_E if(DEBUG_ERROR)SERIAL_PORT
 #define DEBUG_W if(DEBUG_WARNING)SERIAL_PORT
 #define DEBUG_I if(DEBUG_INFO)SERIAL_PORT
@@ -57,6 +47,17 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #define DEBUG_UDP_HOST     "192.168.6.61"
 #define DEBUG_UDP_PORT     47269
 #define DEBUG_UDP_INTERVAL 100   // ms
+
+// Twitch update interval and the background task that does the requests
+#define TW_UPDATE_INTERVAL (30*1000)
+#define NET_TASK_STACK     12288 // bytes, TLS needs a few KB
+#define NET_TASK_PRIORITY  0     // below loop() (1): drawing always wins, requests run while loop() sleeps
+
+// Light sensor: sampled every LDR_INTERVAL ms, averaged over 100 samples (2 s)
+#define LDR_PIN       A3
+#define LDR_INTERVAL  20
+#define LDR_BRIGHTEST 1000 // ADC value in bright light
+#define BK_MIN        10   // minimum backlight PWM value in the dark
 
 // Ask the WiFi driver to reconnect if the connection is lost for this long
 #define WIFI_RECONNECT_INTERVAL (30*1000)
@@ -123,16 +124,13 @@ String twitchToken = TWITCH_TOKEN;
 String twitchToken; // fetched with the client secret on the first update
 #endif
 
-// Filter instance
-LowPass<2> lp(0.1,1e3,true);
-MovingAverage<100> ma;
-uint16_t ldr;
-uint16_t ldr_f;
-uint16_t ldr_f2;
+MovingAverage<100> ldrAverage;
+uint16_t ldr;     // last raw LDR reading
+uint16_t ldr_avg; // averaged LDR reading used for the backlight
 
 void redrawLiveChannelPics(int8_t row = -1);
-void updateLiveChannels();
 void setupOTA();
+void networkTask(void*);
 
 struct channelInfo {
   std::string id;
@@ -159,15 +157,29 @@ std::array<channelInfo, 10> channels = {{
 
 uint16_t live_num = 0;
 
-struct titleQueueItem {
-  channelInfo& channel;
-  std::string newTitle;
-};
-
 std::deque<channelInfo*> titleChangeQueue;
 
-// pietsmiet, bonjwa, gronkhtv
-//std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
+enum class FetchResult { Ok, Unauthorized, Failed };
+
+struct StreamInfo {
+  std::string id;
+  std::string name;
+  std::string title;  // "    <title> | <game>   " in the display charset
+};
+
+// Result of one Twitch update, handed from the network task to loop()
+struct LiveUpdate {
+  FetchResult result;
+  std::vector<StreamInfo> streams;
+};
+
+TaskHandle_t netTask = nullptr;
+QueueHandle_t updateQueue = nullptr;
+
+// Wakes the network task for an update now instead of after TW_UPDATE_INTERVAL
+void requestUpdate(){
+  if(netTask) xTaskNotifyGive(netTask);
+}
 
 GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 // one character (6*8 px at text size 8) wider than the visible title so it can scroll smoothly
@@ -175,10 +187,7 @@ GFXcanvas16 text_canvas(TITLE_WIDTH+(6*8), PIC_SIZE);
 
 void setup(void) {
 
-#if USE_SERIAL == true || DEBUG_ERROR == true || DEBUG_WARNING == true || DEBUG_INFO == true || DEBUG_NOTICE == true
   SERIAL_PORT.begin(115200);
-#endif
-  //S.setDebugOutput(true);
   DEBUG_I.printf("[%s] Starting...\n", DEBUG_TAG);
 
   DEBUG_I.printf("[%s] Connecting to WIFI...\n", DEBUG_TAG);
@@ -199,6 +208,7 @@ void setup(void) {
   text_canvas.setTextWrap(false);
   text_canvas.setTextColor(ST77XX_CYAN);
   text_canvas.setTextSize(8);
+  text_canvas.cp437(true); // titles are converted to CP437, see toDisplayText()
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
 
@@ -213,6 +223,11 @@ void setup(void) {
   tlsClient.useBuiltinCACertBundle();
 
   setupOTA();
+
+  // Twitch requests run in their own task so they don't block scrolling;
+  // results come back to loop() through updateQueue
+  updateQueue = xQueueCreate(2, sizeof(LiveUpdate*));
+  xTaskCreate(networkTask, "network", NET_TASK_STACK, nullptr, NET_TASK_PRIORITY, &netTask);
 
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
@@ -251,18 +266,6 @@ void drawThickRect(int16_t x, int16_t y, int16_t w, int16_t h,
   tft.fillRect(x+w-1, y, -t, h, color);
   tft.fillRect(x+w-1, y+h-1, -w, -t, color);
 }
-
-enum State {
-  Idle,
-  Error
-} state = Idle;
-
-//#define MAX_RETRIES 10
-//uint8_t retries = 0;
-
-#define TW_UPDATE_INTERVAL (30*1000)
-unsigned long tw_last_update_start = 0; 
-bool tw_update_now = true;
 
 #define MAX_TITLE_REPEAT 2
 
@@ -320,7 +323,7 @@ bool handleWiFi(){
     if(lostSince){
       DEBUG_I.printf("[%s] WIFI reconnected after %lus.\n", DEBUG_TAG, (millis()-lostSince)/1000);
       lostSince = 0;
-      tw_update_now = true;
+      requestUpdate();
     }
     return true;
   }
@@ -337,63 +340,52 @@ bool handleWiFi(){
   return false;
 }
 
+void applyLiveUpdate(const LiveUpdate& update);
+
 void loop(){
-  
   ArduinoOTA.handle();
-  //S.printf("[%s] Looping...\n", DEBUG_TAG);
-  
-  ldr = analogRead(A3);
-  ldr_f = lp.filt(ldr);
-  ldr_f2 = ma.compute(ldr);
-  // 1000 = minimum adc value when brightest
-  // 10 = minimum of backligh pwm value when darkest
-  analogWrite(TFT_BK, constrain(map(ldr_f2, 1000, 4095, 255, 10), 10, 255));
+
+  static unsigned long lastLdr = 0;
+  if(millis() - lastLdr >= LDR_INTERVAL){
+    lastLdr = millis();
+    ldr = analogRead(LDR_PIN);
+    ldr_avg = ldrAverage.compute(ldr);
+    analogWrite(TFT_BK, constrain(map(ldr_avg, LDR_BRIGHTEST, 4095, 255, BK_MIN), BK_MIN, 255));
+  }
 
   bool wifiConnected = handleWiFi();
 
-  if(state == Idle){
-    if (wifiConnected && (tw_update_now || millis() - tw_last_update_start >= TW_UPDATE_INTERVAL)){
-      DEBUG_I.printf("[%s] Idle: Updating live channels...\n", DEBUG_TAG);
-#ifndef TEST_SERVER
-      updateLiveChannels();
-#endif
-      tw_last_update_start = millis();
-      tw_update_now = false;
-    }
-    while(!isTitleDisplaying && !titleChangeQueue.empty()) {
-      channelInfo* next = titleChangeQueue.front();
-      titleChangeQueue.pop_front();
-      // channel may have gone offline while it was queued
-      if(next->isLive) startTitle(next);
-    }
-    if(isTitleDisplaying){
-      if(!o_X){
-        text_canvas.fillScreen(ST77XX_BLACK);
-        text_canvas.setCursor(0,0);
-        text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
-        channelTitleInfo.textOffset++;
-        channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
-      }
-      // the title scrolls over the row that does not contain the channel's pic
-      drawRGBBitmapSectionFast(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, 0, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
-      //enterNormalMode();
-      o_X = (o_X+6)%(6*8);
+  LiveUpdate* update;
+  if(xQueueReceive(updateQueue, &update, 0) == pdTRUE){
+    applyLiveUpdate(*update);
+    delete update;
+  }
 
-      if (!o_X && channelTitleInfo.textOffset==0) {
-        if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
-          stopTitle();
-        }
-      }
+  while(!isTitleDisplaying && !titleChangeQueue.empty()) {
+    channelInfo* next = titleChangeQueue.front();
+    titleChangeQueue.pop_front();
+    // channel may have gone offline while it was queued
+    if(next->isLive) startTitle(next);
+  }
+  if(isTitleDisplaying){
+    if(!o_X){
+      text_canvas.fillScreen(ST77XX_BLACK);
+      text_canvas.setCursor(0,0);
+      text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
+      channelTitleInfo.textOffset++;
+      channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
+    }
+    // the title scrolls over the row that does not contain the channel's pic
+    drawRGBBitmapSectionFast(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, 0, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
+    o_X = (o_X+6)%(6*8);
 
+    if (!o_X && channelTitleInfo.textOffset==0) {
+      if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
+        stopTitle();
+      }
     }
   }
 
-  if(state == Error){
-    DEBUG_E.println("Unrecoverable error... restarting...");
-    delay(1000);
-    ESP.restart();
-  }
-   
 #ifdef DEBUG_UDP_LDR
   static unsigned long lastUdp = 0;
   if(wifiConnected && millis() - lastUdp >= DEBUG_UDP_INTERVAL){
@@ -401,16 +393,65 @@ void loop(){
     Udp.beginPacket(DEBUG_UDP_HOST, DEBUG_UDP_PORT);
     Udp.print("ldr:");
     Udp.println(ldr);
-    Udp.print("ldr_f:");
-    Udp.println(ldr_f);
-    Udp.print("ldr_f2:");
-    Udp.println(ldr_f2);
+    Udp.print("ldr_avg:");
+    Udp.println(ldr_avg);
     Udp.endPacket();
   }
+#else
+  (void)wifiConnected;
 #endif
   delay(10);
-  
 }
+
+// ---------- Text conversion
+
+// CP437 code (or ASCII fallback) for U+00A0..U+00FF, 0 = drop
+static const uint8_t latin1ToCp437[96] = {
+  ' ',  0xAD, 0x9B, 0x9C, '*',  0x9D, '|',  'S',  '"',  'c',  0xA6, 0xAE, 0xAA, 0,    'R',  '-',   // A0-AF
+  0xF8, 0xF1, 0xFD, '3',  '\'', 0xE6, 'P',  0xFA, ',',  '1',  0xA7, 0xAF, 0xAC, 0xAB, '3',  0xA8,  // B0-BF
+  'A',  'A',  'A',  'A',  0x8E, 0x8F, 0x92, 0x80, 'E',  0x90, 'E',  'E',  'I',  'I',  'I',  'I',   // C0-CF
+  'D',  0xA5, 'O',  'O',  'O',  'O',  0x99, 'x',  'O',  'U',  'U',  'U',  0x9A, 'Y',  'P',  0xE1,  // D0-DF
+  0x85, 0xA0, 0x83, 'a',  0x84, 0x86, 0x91, 0x87, 0x8A, 0x82, 0x88, 0x89, 0x8D, 0xA1, 0x8C, 0x8B,  // E0-EF
+  'd',  0xA4, 0x95, 0xA2, 0x93, 'o',  0x94, 0xF6, 'o',  0x97, 0xA3, 0x96, 0x81, 'y',  'p',  0x98   // F0-FF
+};
+
+// Converts UTF-8 text to the CP437 charset of the built-in GFX font.
+// Umlauts and other Latin-1 letters are kept, typographic quotes/dashes are
+// replaced, everything else without a glyph (e.g. emoji) is dropped.
+std::string toDisplayText(const char* utf8){
+  std::string out;
+  if(utf8 == nullptr) return out;
+  const uint8_t* p = (const uint8_t*)utf8;
+  while(*p){
+    uint32_t cp;
+    int len;
+    if(*p < 0x80)                { cp = *p;        len = 1; }
+    else if((*p & 0xE0) == 0xC0) { cp = *p & 0x1F; len = 2; }
+    else if((*p & 0xF0) == 0xE0) { cp = *p & 0x0F; len = 3; }
+    else if((*p & 0xF8) == 0xF0) { cp = *p & 0x07; len = 4; }
+    else { p++; continue; }      // invalid lead byte
+    int k = 1;
+    for(; k < len && (p[k] & 0xC0) == 0x80; k++) cp = (cp << 6) | (p[k] & 0x3F);
+    if(k < len){ p++; continue; } // truncated sequence
+    p += len;
+
+    if(cp < 0x20) out += ' ';                       // newlines, tabs
+    else if(cp < 0x7F) out += (char)cp;
+    else if(cp >= 0xA0 && cp <= 0xFF){ if(latin1ToCp437[cp-0xA0]) out += (char)latin1ToCp437[cp-0xA0]; }
+    else switch(cp){
+      case 0x2013: case 0x2014: out += '-';  break; // en/em dash
+      case 0x2018: case 0x2019: case 0x201A: out += '\''; break;
+      case 0x201C: case 0x201D: case 0x201E: out += '"';  break;
+      case 0x2022: out += (char)0xFA; break;        // bullet
+      case 0x2026: out += "..."; break;
+      case 0x20AC: out += "EUR"; break;
+      default: break;                               // no glyph: drop
+    }
+  }
+  return out;
+}
+
+// ---------- Twitch API (runs in the network task)
 
 void commonHttpInit(HTTPClient& http_client){
   DEBUG_I.print("[HTTP] Common init...\n");
@@ -453,10 +494,8 @@ bool requestAppToken(){
 }
 #endif
 
-enum class FetchResult { Ok, Unauthorized, Failed };
-
-// Requests the streams of all channels and parses the needed fields into doc
-FetchResult fetchLiveChannels(JsonDocument& doc){
+// Requests the streams of all channels and fills update.streams
+FetchResult fetchLiveChannels(LiveUpdate& update){
   // Could maybe be done as constexpr??
   String url = String("https://api.twitch.tv/helix/streams?");
   for (auto& channel : channels) {
@@ -493,6 +532,7 @@ FetchResult fetchLiveChannels(JsonDocument& doc){
   stream["title"] = true;
   stream["game_name"] = true;
 
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
   if (err) {
@@ -504,8 +544,48 @@ FetchResult fetchLiveChannels(JsonDocument& doc){
     DEBUG_W.print("[JSON] Response has no data array.\n");
     return FetchResult::Failed;
   }
+
+  for (JsonObject stream : doc["data"].as<JsonArray>()) {
+    const char* id = stream["user_id"];
+    if (id == nullptr) continue;
+    StreamInfo info;
+    info.id = id;
+    info.name = toDisplayText(stream["user_name"]);
+    info.title = "    " + toDisplayText(stream["title"]) + " | " + toDisplayText(stream["game_name"]) + "   ";
+    update.streams.push_back(std::move(info));
+  }
   return FetchResult::Ok;
 }
+
+// One update: fetch (renewing the token if needed) and hand the result to loop()
+void runNetworkUpdate(){
+  if (WiFi.status() != WL_CONNECTED) return; // handleWiFi() requests an update when it is back
+
+  LiveUpdate* update = new LiveUpdate();
+#ifdef TWITCH_CLIENT_SECRET
+  if (twitchToken.isEmpty()) requestAppToken();
+#endif
+  update->result = fetchLiveChannels(*update);
+#ifdef TWITCH_CLIENT_SECRET
+  if (update->result == FetchResult::Unauthorized && requestAppToken()) {
+    // token expired or revoked: retry once with the new one
+    update->streams.clear();
+    update->result = fetchLiveChannels(*update);
+  }
+#endif
+  if (xQueueSend(updateQueue, &update, portMAX_DELAY) != pdTRUE) delete update;
+}
+
+void networkTask(void*){
+  for(;;){
+    runNetworkUpdate();
+    // sleep until the next interval or until requestUpdate()
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TW_UPDATE_INTERVAL));
+  }
+}
+
+// ---------- Drawing and channel state (loop() only)
+
 
 void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
@@ -561,87 +641,39 @@ void redrawLiveChannelPics(int8_t row){
   }
 }
 
-// Returns nullptr if id is null or not in the channel list.
-channelInfo* setIDLiveStatus(const char* id, bool now_live, bool draw_immediat=true){
-  if(id == nullptr) {
-    DEBUG_W.printf("[%s] Cannot set live status of channel without id.\n", DEBUG_TAG);
-    return nullptr;
+channelInfo* findChannel(const std::string& id){
+  for (channelInfo& channel : channels) {
+    if (channel.id == id) return &channel;
   }
-  // custom find_if to search by id inside of struct
-  channelInfo* channel = std::find_if(channels.begin(), channels.end(), [&](const channelInfo& x){return x.id == id;});
-  if(channel == channels.end()) {
-    DEBUG_W.printf("[%s] Cannot set live status of unknown channel id %s.\n", DEBUG_TAG, id);
-    return nullptr;
-  }
-  if(now_live){
-    if (channel->isLive) {
-      DEBUG_I.printf("[%s] Channel %s already live.\n", DEBUG_TAG, id);
-      return channel;
-    }
-    DEBUG_I.printf("[%s] Setting channel %s to live...\n", DEBUG_TAG, id);
-    channel->isLive = true;
-    live_num++;
-    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_num);
-    if(draw_immediat) drawLiveChannelPic(*channel, live_num-1);
-  } else {
-    DEBUG_I.printf("[%s] Unsetting channel %s live status\n", DEBUG_TAG, id);
-    channel->isLive = false;
-    channel->slotNum = -1;
-    assignSlots();
-    DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_num);
-    if(draw_immediat) redrawLiveChannelPics();
-  }
-  return channel;
+  return nullptr;
 }
 
-void updateLiveChannels(){
-  JsonDocument doc;
-#ifdef TWITCH_CLIENT_SECRET
-  if (twitchToken.isEmpty()) requestAppToken();
-#endif
-  FetchResult result = fetchLiveChannels(doc);
-#ifdef TWITCH_CLIENT_SECRET
-  if (result == FetchResult::Unauthorized && requestAppToken()) {
-    // token expired or revoked: retry once with the new one
-    doc.clear();
-    result = fetchLiveChannels(doc);
-  }
-#endif
-  if (result != FetchResult::Ok) {
+// Applies a result of the network task to the channels and the display
+void applyLiveUpdate(const LiveUpdate& update){
+  if (update.result != FetchResult::Ok) {
     // keep showing the last known state
-    setStatus(result == FetchResult::Unauthorized ? STATUS_AUTH : STATUS_API);
+    setStatus(update.result == FetchResult::Unauthorized ? STATUS_AUTH : STATUS_API);
     return;
   }
   setStatus(STATUS_OK);
 
-  // Reset is_live array
-  //memset(is_live, false, sizeof is_live);
-  DEBUG_I.printf("[%s] Resetting all channels live status...\n", DEBUG_TAG);
   // slotNum is kept so assignSlots() can detect layout changes
   for (auto &&c : channels) {
     c.isLive = false;
   }
-  live_num = 0;
-  
-  //tft.fillScreen(ST77XX_BLACK);
 
-  
-  for (JsonObject channel : doc["data"].as<JsonArray>()) {
-    const char* name = channel["user_name"];
-    const char* id = channel["user_id"];
-    std::string title = "    ";
-    title += channel["title"].as<std::string>();
-    title += " | ";
-    title += channel["game_name"].as<std::string>();
-    title += "   ";
-    // TODO: Error checking?
-    DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
-    channelInfo* ch = setIDLiveStatus(id, true, false);
-    if(ch == nullptr) continue;
-    if(ch->streamTitle != title) {
-      ch->streamTitle = title;
+  for (const StreamInfo& stream : update.streams) {
+    channelInfo* ch = findChannel(stream.id);
+    if (ch == nullptr) {
+      DEBUG_W.printf("[%s] Unknown channel id %s.\n", DEBUG_TAG, stream.id.c_str());
+      continue;
+    }
+    DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, stream.name.c_str());
+    ch->isLive = true;
+    if (ch->streamTitle != stream.title) {
+      ch->streamTitle = stream.title;
       // queue channel for title display if not already in queue
-      if (std::find_if(titleChangeQueue.begin(), titleChangeQueue.end(), [ch](const channelInfo* x){return x == ch;}) == titleChangeQueue.end()) {
+      if (std::find(titleChangeQueue.begin(), titleChangeQueue.end(), ch) == titleChangeQueue.end()) {
         titleChangeQueue.push_back(ch);
       }
     }
@@ -672,12 +704,6 @@ void updateLiveChannels(){
   } else if(layoutChanged){
     redrawLiveChannelPics();
   }
-  /*
-  for (const auto& id : channel_ids) {
-    setIDLiveStatus(id.c_str(), true);
-  }
-  */
-  
 }
 
 void setupOTA(){
