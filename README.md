@@ -27,19 +27,24 @@ dimmed automatically via an LDR.
 | Path | Purpose |
 |------|---------|
 | `src/twitchDisplay.cpp` | Main firmware |
-| `src/twitchDisplay_apiTest.cpp` | Twitch Helix / EventSub websocket test |
-| `src/twitchDisplay_displayTest.cpp` | Display and smooth text-scrolling test |
-| `src/twitchDisplay_ldrTest.cpp` | LDR backlight dimming test |
-| `src/pics.h` | 64×64 RGB565 channel logos (made with [image2cpp](https://javl.github.io/image2cpp/)) |
-| `src/LowPass.h`, `src/MovingAverage.h` | Filters for the LDR reading |
+| `include/pics.h` | 64×64 RGB565 channel logos (made with [image2cpp](https://javl.github.io/image2cpp/)) |
+| `include/secrets.h.example` | Template for `include/secrets.h` |
+| `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
+| `examples/apiTest/` | Twitch Helix / EventSub websocket test |
+| `examples/displayTest/` | Display and smooth text-scrolling test |
+| `examples/ldrTest/` | LDR backlight dimming test |
+| `test/` | Reserved for unit tests (`pio test`) |
 | `C3_partition_minimalSPIFFS.csv` | Partition table with two OTA slots |
 
-Each source file has its own environment in `platformio.ini`
-(`build_src_filter`).
+Each program has its own environment in `platformio.ini`:
+`twitchDisplay` builds `src/`, and `twitchDisplay_apiTest`,
+`twitchDisplay_displayTest` and `twitchDisplay_ldrTest` build the matching
+folder in `examples/` (via `build_src_filter`).
 
 ## Secrets
 
-Create `src/secrets.h` (it is gitignored):
+Copy `include/secrets.h.example` to `include/secrets.h` (it is gitignored)
+and fill in your values:
 
 ```cpp
 #define WIFI_PW      "your-wifi-password"
@@ -63,3 +68,5 @@ pio run -e twitchDisplay -t upload
 ```bash
 pio device monitor
 ```
+
+To build a test sketch, use its environment, e.g. `pio run -e twitchDisplay_ldrTest`.
