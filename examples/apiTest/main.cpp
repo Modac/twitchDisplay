@@ -12,6 +12,7 @@
 #include "secrets.h"
 
 #include <Arduino.h>
+#include <inttypes.h>
 
 #include <WiFi.h>
 #include <WiFiMulti.h>
@@ -32,10 +33,10 @@ bool toSub = false;
 
 void hexdump(const void *mem, uint32_t len, uint8_t cols = 16) {
   const uint8_t* src = (const uint8_t*) mem;
-  USE_SERIAL.printf("\n[HEXDUMP] Address: 0x%08X len: 0x%X (%d)", (ptrdiff_t)src, len, len);
+  USE_SERIAL.printf("\n[HEXDUMP] Address: 0x%08" PRIXPTR " len: 0x%" PRIX32 " (%" PRIu32 ")", (uintptr_t)src, len, len);
   for(uint32_t i = 0; i < len; i++) {
     if(i % cols == 0) {
-      USE_SERIAL.printf("\n[0x%08X] 0x%08X: ", (ptrdiff_t)src, i);
+      USE_SERIAL.printf("\n[0x%08" PRIXPTR "] 0x%08" PRIX32 ": ", (uintptr_t)src, i);
     }
     USE_SERIAL.printf("%02X ", *src);
     src++;
@@ -94,7 +95,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       // send data to server
       // webSocket.sendBIN(payload, length);
       break;
-    case WStype_ERROR:      
+    case WStype_ERROR:
+    case WStype_PING:
+    case WStype_PONG:
     case WStype_FRAGMENT_TEXT_START:
     case WStype_FRAGMENT_BIN_START:
     case WStype_FRAGMENT:
@@ -155,7 +158,7 @@ void loop() {
 bool twitchEventSub(){
   /*
   curl -X POST 'https://api.twitch.tv/helix/eventsub/subscriptions' \
-  -H 'Authorization: Bearer q5ipcciplla87fjehclkow6w2a4qve' \
+  -H 'Authorization: Bearer <TWITCH_TOKEN>' \
   -H 'Client-Id: gp762nuuoqcoxypju8c569th9wz7q5' \
   -H 'Content-Type: application/json' \
   -d '{"type": "channel.update","version": "2","condition": {"broadcaster_user_id": "106159308"},"transport": {"method": "websocket","session_id": ""}}'

@@ -152,8 +152,7 @@ void drawRGBBitmapSectionFast(int16_t x, int16_t y, uint16_t *bitmap,
                                 int16_t o_x, int16_t o_y, int16_t w, int16_t h, int16_t b_w) {
   tft.startWrite();
   tft.setAddrWindow(x, y, w, h);
-  y += o_y;
-  for (int16_t j = o_y; j < (o_y+h); j++, y++) {
+  for (int16_t j = o_y; j < (o_y+h); j++) {
     tft.writePixels(&bitmap[j * b_w + o_x], w);
   }
   tft.endWrite();
@@ -260,7 +259,6 @@ void loop(){
         channelTitleInfo.textOffset++;
         channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
       }
-      tft.fillRect(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), 298, 64, ST77XX_BLACK);
       drawRGBBitmapSectionFast(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
       //enterNormalMode();
       o_X = (o_X+6)%(6*8);
@@ -308,7 +306,7 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
   uint16_t x, y;
   if(pic_slot_index<8){
-    DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id, pic_slot_index);
+    DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
     
     pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
 
@@ -362,12 +360,17 @@ void redrawLiveChannelPics(){
   }
 }
 
+// Returns nullptr if id is null or not in the channel list.
 channelInfo* setIDLiveStatus(const char* id, bool now_live, bool draw_immediat=true){
+  if(id == nullptr) {
+    DEBUG_W.printf("[%s] Cannot set live status of channel without id.\n", DEBUG_TAG);
+    return nullptr;
+  }
   // custom find_if to search by id inside of struct
   channelInfo* channel = std::find_if(channels.begin(), channels.end(), [&](const channelInfo& x){return x.id == id;});
   if(channel == channels.end()) {
-    DEBUG_I.printf("[%s] Cannot set live status of unknown channel id %s.", DEBUG_TAG, id);
-    return channel;
+    DEBUG_W.printf("[%s] Cannot set live status of unknown channel id %s.\n", DEBUG_TAG, id);
+    return nullptr;
   }
   if(now_live){
     if (channel->isLive) {
@@ -418,7 +421,7 @@ void updateLiveChannels(){
     return;
   }
 
-  DEBUG_I.printf("[JSON] Deserializing response...\n", DEBUG_TAG);
+  DEBUG_I.print("[JSON] Deserializing response...\n");
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream());
@@ -451,6 +454,7 @@ void updateLiveChannels(){
     // TODO: Error checking?
     DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, name);
     channelInfo* ch = setIDLiveStatus(id, true, false);
+    if(ch == nullptr) continue;
     if(ch->streamTitle != title) {
       ch->streamTitle = title;
       // queue channel for title display if not already in queue
