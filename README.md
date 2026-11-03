@@ -31,6 +31,7 @@ dimmed automatically via an LDR.
 | `include/secrets.h.example` | Template for the optional `include/secrets.h` (default settings) |
 | `include/web_pages.h` | HTML of the web interface |
 | `tools/version.py` | Build script that puts the git version into the firmware |
+| `.github/workflows/build.yml` | GitHub Action: builds the firmware, publishes releases for version tags |
 | `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
 | `examples/apiTest/` | Twitch Helix / EventSub websocket test |
 | `examples/displayTest/` | Display and smooth text-scrolling test |
@@ -102,7 +103,8 @@ log in as `admin` with your web password.
 
 - **Status**: live channels, last Twitch update, firmware version, uptime,
   WiFi, memory, restart button
-- **Update**: upload a new `firmware.bin` from the browser (phone or PC). The
+- **Update**: *Online update* checks the newest GitHub release and installs
+  it with one click; or upload a `firmware.bin` from the browser (phone or PC). The
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
@@ -115,6 +117,35 @@ back to the previous firmware. The status page shows the state of the running
 firmware. This needs a bootloader with rollback support; updates never replace
 the bootloader, so if the status page shows "new (bootloader without rollback
 support?)" after an update, flash once over USB.
+
+## Releases and online update
+
+GitHub builds the firmware on every push to this branch (download it from the
+run's *Artifacts*). Pushing a version tag publishes a release:
+
+```bash
+git tag v1.0.0
+```
+
+```bash
+git push origin v1.0.0
+```
+
+The release contains
+
+- `firmware.bin`: what the display's **Online update** installs (and what the
+  Update page's upload expects)
+- `firmware-merged.bin`: everything for the first flash over USB, e.g. with
+  [esptool-js](https://espressif.github.io/esptool-js/) in Chrome or Edge at
+  address `0x0`, no installation needed
+
+The firmware contains no secrets (settings are entered on the device), so the
+releases can be public. Tag versions as `vX.Y.Z` on this branch; the display
+compares the release tag with its own version (`git describe`).
+
+The online update downloads the release over HTTPS (certificate checked),
+checks that it is an ESP32-C3 application image before writing, and uses the
+same rollback protection as an upload.
 
 ## Build and upload
 

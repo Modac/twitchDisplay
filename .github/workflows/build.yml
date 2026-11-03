@@ -1,0 +1,73 @@
+# Builds the firmware on every push / pull request of the PlatformIO branch.
+# Pushing a version tag (e.g. v1.0.0) also publishes a GitHub release with
+# firmware.bin, which the display's "Online update" installs.
+name: Build firmware
+
+on:
+  push:
+    branches: [platform/platformio]
+    tags: ['v*']
+  pull_request:
+    branches: [platform/platformio]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create releases for version tags
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags for the version number (git describe)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO and esptool
+        run: pip install "platformio>=6.1,<7" "esptool>=5,<6"
+
+      - name: Build firmware (no secrets, settings are entered on the device)
+        run: |
+          test ! -e include/secrets.h
+          pio run -e twitchDisplay
+
+      - name: Build display test sketch
+        run: pio run -e twitchDisplay_displayTest
+
+      - name: Create merged image for the first flash over USB
+        run: |
+          B=.pio/build/twitchDisplay
+          esptool --chip esp32c3 merge-bin -o $B/firmware-merged.bin --flash-mode dio --flash-size 4MB \
+            0x0 $B/bootloader.bin \
+            0x8000 $B/partitions.bin \
+            0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+            0x10000 $B/firmware.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            .pio/build/twitchDisplay/firmware.bin
+            .pio/build/twitchDisplay/firmware-merged.bin
+
+      - name: Check that the firmware version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "$(git describe --always --tags --dirty)" = "$GITHUB_REF_NAME"
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            .pio/build/twitchDisplay/firmware.bin \
+            .pio/build/twitchDisplay/firmware-merged.bin \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

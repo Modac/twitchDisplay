@@ -40,9 +40,10 @@ button.danger{background:var(--err)}
 static const char WEB_PAGE_FOOT[] = R"HTML(</main></body></html>
 )HTML";
 
-// Firmware update page. %MAXSIZE% (bytes) is replaced.
-static const char WEB_UPDATE_BODY[] = R"HTML(<div class="card">
-<h2>Firmware update</h2>
+// Firmware update page. %ONLINE% (online update card or nothing) and
+// %MAXSIZE% (bytes) are replaced.
+static const char WEB_UPDATE_BODY[] = R"HTML(%ONLINE%<div class="card">
+<h2>Upload firmware</h2>
 <p class="muted">Upload <b>firmware.bin</b> from <code>.pio/build/twitchDisplay/</code>.
 The display restarts with the new firmware afterwards. If the new firmware does not
 come online within a minute, the previous one is restored on the next restart.</p>
@@ -83,5 +84,54 @@ $('go').onclick = () => {
   show('Uploading...');
   xhr.send(data);
 };
+</script>
+)HTML";
+
+// Online update card (installs the newest GitHub release). %VERSION% is replaced.
+static const char WEB_ONLINE_UPDATE_CARD[] = R"HTML(<div class="card">
+<h2>Online update</h2>
+<p class="muted">Installed version: <b>%VERSION%</b></p>
+<p><button id="check">Check for updates</button></p>
+<div id="online"></div>
+</div>
+<script>
+(() => {
+  const box = document.getElementById('online');
+  // release data is only inserted as text, never as HTML
+  function line(text, cls) { const p = document.createElement('p'); p.textContent = text; if (cls) p.className = cls; box.appendChild(p); return p; }
+  function fetchTimeout(url, opts, ms) {
+    const c = new AbortController(); setTimeout(() => c.abort(), ms);
+    return fetch(url, Object.assign({cache: 'no-store', signal: c.signal}, opts || {}));
+  }
+  function poll() {
+    fetchTimeout('/update/state', {}, 3000).then(r => r.json()).then(s => {
+      if (s.state === 'failed') { box.textContent = ''; line('Update failed: ' + s.message, 'err'); check.disabled = false; }
+      else if (s.state === 'installing') setTimeout(poll, 2000);
+      else location.href = '/';
+    }).catch(() => setTimeout(poll, 2000)); // busy installing or restarting
+  }
+  function install(btn) {
+    btn.disabled = true; check.disabled = true;
+    line('Starting...');
+    fetch('/update/install', {method: 'POST'}).then(r => r.json()).then(r => {
+      box.textContent = '';
+      if (!r.ok) { line(r.message, 'err'); check.disabled = false; return; }
+      line(r.message + ' The display shows the progress and restarts when done.', 'ok');
+      setTimeout(poll, 5000);
+    }).catch(() => { line('Request failed.', 'err'); check.disabled = false; });
+  }
+  const check = document.getElementById('check');
+  check.onclick = () => {
+    check.disabled = true; box.textContent = ''; line('Checking...');
+    fetch('/update/check', {cache: 'no-store'}).then(r => r.json()).then(r => {
+      box.textContent = ''; check.disabled = false;
+      if (!r.ok) { line(r.message, 'err'); return; }
+      if (r.upToDate) { line('You have the newest version (' + r.latest + ').', 'ok'); return; }
+      line('Version ' + r.latest + ' is available' + (r.published ? ' (released ' + r.published.slice(0, 10) + ').' : '.'));
+      if (r.notes) { const a = document.createElement('a'); a.href = r.notes; a.target = '_blank'; a.rel = 'noopener'; a.textContent = 'Release notes'; line('').appendChild(a); }
+      const p = line(''); const b = document.createElement('button'); b.textContent = 'Install ' + r.latest; b.onclick = () => install(b); p.appendChild(b);
+    }).catch(() => { box.textContent = ''; line('Request failed.', 'err'); check.disabled = false; });
+  };
+})();
 </script>
 )HTML";

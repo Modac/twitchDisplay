@@ -36,7 +36,34 @@
 static const char DEBUG_TAG[] = "TwitchDisplay";
 
 // inspiration from https://forum.arduino.cc/t/single-line-define-to-disable-code/636044/5
-#define SERIAL_PORT Serial
+// Serial output with "\r\n" line ends. The firmware writes "\n"; terminals
+// that don't add the carriage return themselves would show a staircase.
+class CrlfSerial : public Print {
+  bool lastWasCR = false;
+public:
+  void begin(unsigned long baud){ Serial.begin(baud); }
+  size_t write(uint8_t c) override {
+    if(c == '\n' && !lastWasCR) Serial.write('\r');
+    lastWasCR = (c == '\r');
+    return Serial.write(c);
+  }
+  size_t write(const uint8_t* buf, size_t len) override {
+    size_t start = 0;
+    for(size_t i = 0; i < len; i++){
+      bool prevCR = i ? buf[i-1] == '\r' : lastWasCR;
+      if(buf[i] == '\n' && !prevCR){
+        Serial.write(buf + start, i - start);
+        Serial.write('\r');
+        start = i; // the '\n' is written with the next chunk
+      }
+    }
+    Serial.write(buf + start, len - start);
+    if(len) lastWasCR = (buf[len-1] == '\r');
+    return len;
+  }
+};
+CrlfSerial debugSerial;
+#define SERIAL_PORT debugSerial
 #define DEBUG_ERROR true
 #define DEBUG_WARNING true
 #define DEBUG_INFO true
@@ -86,6 +113,13 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #ifndef FW_VERSION
 #define FW_VERSION "unknown"        // set by tools/version.py
 #endif
+
+// Online update: newest GitHub release of this repository (built by .github/workflows/build.yml)
+#ifndef GITHUB_REPO
+#define GITHUB_REPO "Modac/twitchDisplay"
+#endif
+#define FIRMWARE_ASSET   "firmware.bin"
+#define DOWNLOAD_TIMEOUT 15000      // ms without data before a download is aborted
 #ifndef ESP_APP_DESC_MAGIC_WORD
 #define ESP_APP_DESC_MAGIC_WORD 0xABCD5432
 #endif
@@ -271,6 +305,13 @@ struct {
   int lastPercent;
 } upload;
 unsigned long rebootAt = 0;        // millis() of a scheduled restart, 0 = none
+
+// Online update requested on the web page; runs in loop() (blocking, ~20 s)
+bool installRequested = false;
+String installUrl;
+String installVersion;
+enum class InstallState { Idle, Failed } installState = InstallState::Idle;
+String installError;
 unsigned long restoreDisplayAt = 0; // millis() to leave the update screen after a failed upload
 
 // Firmware state for the status page and the rollback protection
@@ -472,6 +513,7 @@ void confirmFirmwareWhenStable(bool wifiConnected);
 
 void setupModeLoop();
 void checkBootButton();
+void runInstall();
 
 void loop(){
   if(setupMode){
@@ -490,6 +532,10 @@ void loop(){
   if(restoreDisplayAt && millis() >= restoreDisplayAt){
     restoreDisplayAt = 0;
     restoreDisplay();
+  }
+  if(installRequested){
+    installRequested = false;
+    runInstall();
   }
 
   static unsigned long lastLdr = 0;
@@ -1190,6 +1236,12 @@ void handleStatus(){
 void handleUpdatePage(){
   if(!setupMode && !checkAuth()) return;
   String body = WEB_UPDATE_BODY;
+  String online;
+  if(!setupMode){ // the setup hotspot has no internet connection
+    online = WEB_ONLINE_UPDATE_CARD;
+    online.replace("%VERSION%", FW_VERSION);
+  }
+  body.replace("%ONLINE%", online);
   body.replace("%MAXSIZE%", String((unsigned)maxFirmwareSize()));
   sendPage("Update", body);
 }
@@ -1203,6 +1255,9 @@ void handleReboot(){
 void handleSettingsPage();
 void handleSettingsSave();
 void handleReset();
+void handleUpdateCheck();
+void handleUpdateInstall();
+void handleUpdateState();
 
 void setupWeb(){
   server.on("/", HTTP_GET, handleStatus);
@@ -1212,6 +1267,9 @@ void setupWeb(){
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);
+  server.on("/update/check", HTTP_GET, handleUpdateCheck);
+  server.on("/update/install", HTTP_POST, handleUpdateInstall);
+  server.on("/update/state", HTTP_GET, handleUpdateState);
   // answered without a login challenge: every challenge creates a new digest
   // nonce, which would invalidate the browser's current login
   server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); });
@@ -1511,4 +1569,211 @@ void checkBootButton(){
     delay(500);
     ESP.restart();
   }
+}
+
+
+// ---------- Online update from GitHub releases
+
+struct ReleaseInfo {
+  String tag;
+  String published;
+  String pageUrl;
+  String assetUrl;
+  size_t assetSize = 0;
+  String error;       // empty if the release has a firmware to install
+};
+
+String httpError(HTTPClient& http, int code){
+  return code <= 0 ? http.errorToString(code) : String(code);
+}
+
+// Asks GitHub for the newest release and its firmware.bin
+ReleaseInfo checkLatestRelease(){
+  ReleaseInfo release;
+  WiFiClientSecure client;
+  client.useBuiltinCACertBundle();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.begin(client, "https://api.github.com/repos/" GITHUB_REPO "/releases/latest");
+  http.setUserAgent("twitchDisplay/" FW_VERSION); // required by the GitHub API
+  http.addHeader("Accept", "application/vnd.github+json");
+  int code = http.GET();
+  if(code == 404){
+    http.end();
+    release.error = "No release has been published yet.";
+    return release;
+  }
+  if(code != HTTP_CODE_OK){
+    release.error = "GitHub request failed (" + httpError(http, code) + ").";
+    http.end();
+    return release;
+  }
+  JsonDocument filter;
+  filter["tag_name"] = true;
+  filter["published_at"] = true;
+  filter["html_url"] = true;
+  JsonObject asset = filter["assets"].add<JsonObject>();
+  asset["name"] = true;
+  asset["size"] = true;
+  asset["browser_download_url"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if(err || !doc["tag_name"].is<const char*>()){
+    release.error = "Unexpected answer from GitHub.";
+    return release;
+  }
+  release.tag = doc["tag_name"].as<const char*>();
+  release.published = doc["published_at"] | "";
+  release.pageUrl = doc["html_url"] | "";
+  for(JsonObject a : doc["assets"].as<JsonArray>()){
+    if(strcmp(a["name"] | "", FIRMWARE_ASSET) == 0){
+      release.assetUrl = a["browser_download_url"] | "";
+      release.assetSize = a["size"] | 0;
+    }
+  }
+  if(release.assetUrl.isEmpty()) release.error = "Release " + release.tag + " has no " FIRMWARE_ASSET ".";
+  else if(release.assetSize > maxFirmwareSize()) release.error = "The firmware of release " + release.tag + " is too large for this display.";
+  return release;
+}
+
+// Downloads a firmware and writes it to the update partition. The first block
+// is checked like a browser upload before anything is written.
+// Returns an empty string on success, otherwise the error.
+String downloadAndInstall(const String& url){
+  WiFiClientSecure client;
+  client.useBuiltinCACertBundle();
+  HTTPClient http;
+  http.begin(client, url);
+  http.setUserAgent("twitchDisplay/" FW_VERSION);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // GitHub redirects to its file server
+  http.setTimeout(DOWNLOAD_TIMEOUT);
+  int code = http.GET();
+  feedLoopWDT();
+  if(code != HTTP_CODE_OK){
+    String e = "Download failed (" + httpError(http, code) + ").";
+    http.end();
+    return e;
+  }
+  int size = http.getSize();
+  if(size <= 0){ http.end(); return "Download failed: unknown file size."; }
+  if((size_t)size > maxFirmwareSize()){ http.end(); return "The firmware is too large for this display."; }
+
+  auto* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  size_t total = size, written = 0;
+  bool started = false;
+  int lastPercent = -1;
+  unsigned long lastData = millis();
+  String error;
+  while(written < total){
+    feedLoopWDT();
+    size_t avail = stream->available();
+    size_t remaining = total - written;
+    // wait for data; the first read needs the whole image header for the check
+    if(avail == 0 || (!started && avail < 64 && remaining >= 64)){
+      if(millis() - lastData > DOWNLOAD_TIMEOUT){ error = "Download timed out."; break; }
+      delay(1);
+      continue;
+    }
+    size_t n = stream->readBytes(buf, std::min(std::min(avail, sizeof(buf)), remaining));
+    if(n == 0) continue;
+    lastData = millis();
+    if(!started){
+      const char* e = validateFirmwareHeader(buf, n);
+      if(e){ error = e; break; }
+      if(!Update.begin(total, U_FLASH)){ error = Update.errorString(); break; }
+      started = true;
+    }
+    if(Update.write(buf, n) != n){ error = Update.errorString(); break; }
+    written += n;
+    int percent = (int)((uint64_t)written * 100 / total);
+    if(percent != lastPercent){
+      lastPercent = percent;
+      drawUpdateProgress(percent);
+    }
+  }
+  http.end();
+  if(error.isEmpty() && written != total) error = "Download incomplete.";
+  if(error.length()){
+    if(Update.isRunning()) Update.abort();
+    return error;
+  }
+  // end() verifies the checksum and the image before switching the boot partition
+  if(!Update.end(true)) return Update.errorString();
+  return "";
+}
+
+// Runs a requested online update (called from loop())
+void runInstall(){
+  DEBUG_I.printf("[OTA] Installing %s from %s\n", installVersion.c_str(), installUrl.c_str());
+  otaActive = true; // pauses the network task
+  restoreDisplayAt = 0;
+  String title = "Downloading " + installVersion;
+  drawMessageScreen("Firmware update", ST77XX_CYAN, title.c_str());
+  drawUpdateProgress(0);
+  String error = downloadAndInstall(installUrl);
+  if(error.length()){
+    DEBUG_W.printf("[OTA] Online update failed: %s\n", error.c_str());
+    otaActive = false;
+    installState = InstallState::Failed;
+    installError = error;
+    drawMessageScreen("Update failed", ST77XX_RED, error.c_str());
+    restoreDisplayAt = millis() + 5000;
+    return;
+  }
+  DEBUG_I.printf("[OTA] Online update installed, restarting.\n");
+  drawMessageScreen("Update done", ST77XX_GREEN, "Restarting...");
+  rebootAt = millis() + 1000;
+}
+
+void sendJsonDoc(int code, JsonDocument& doc){
+  String out;
+  serializeJson(doc, out);
+  server.send(code, "application/json", out);
+}
+
+void handleUpdateCheck(){
+  if(!checkAuth()) return;
+  ReleaseInfo release = checkLatestRelease();
+  JsonDocument doc;
+  doc["ok"] = release.error.isEmpty();
+  doc["current"] = FW_VERSION;
+  if(release.error.length()) doc["message"] = release.error;
+  if(release.tag.length()){
+    doc["latest"] = release.tag;
+    doc["published"] = release.published;
+    doc["notes"] = release.pageUrl;
+    doc["upToDate"] = release.tag == FW_VERSION;
+  }
+  sendJsonDoc(200, doc);
+}
+
+void handleUpdateInstall(){
+  if(!checkAuth()) return;
+  // ask GitHub again, so only the current release's firmware is installed
+  ReleaseInfo release = checkLatestRelease();
+  JsonDocument doc;
+  if(release.error.length()){
+    doc["ok"] = false;
+    doc["message"] = release.error;
+    sendJsonDoc(200, doc);
+    return;
+  }
+  installUrl = release.assetUrl;
+  installVersion = release.tag;
+  installState = InstallState::Idle;
+  installRequested = true;
+  doc["ok"] = true;
+  doc["message"] = "Installing " + release.tag + ".";
+  sendJsonDoc(200, doc);
+}
+
+void handleUpdateState(){
+  if(!checkAuth()) return;
+  JsonDocument doc;
+  doc["state"] = installRequested ? "installing" : installState == InstallState::Failed ? "failed" : "idle";
+  doc["version"] = FW_VERSION;
+  if(installState == InstallState::Failed) doc["message"] = installError;
+  sendJsonDoc(200, doc);
 }
