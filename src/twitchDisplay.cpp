@@ -51,6 +51,34 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 
 #define MAX_NUM_PICS 8
 
+// Logo grid layout: 4 columns x 2 rows of 64x64 pics
+#define PIC_SIZE    64
+#define PIC_GAP     14
+#define PIC_BORDER  7                               // thickness of the (green/black) frame around a pic
+#define GRID_X0     11                              // left edge of the first column
+#define GRID_Y0     14                              // top edge of the first row
+#define GRID_COLS   4
+#define SLOT_PITCH  (PIC_SIZE+PIC_GAP)
+#define TITLE_WIDTH (GRID_COLS*PIC_SIZE+(GRID_COLS-1)*PIC_GAP) // scrolling title spans the full grid width
+
+// Row (0 or 1) of a slot. Slots >= MAX_NUM_PICS share the last slot (the "+N" tile).
+uint8_t slotRow(int8_t slot){
+  return (slot >= GRID_COLS) ? 1 : 0;
+}
+
+// Top edge of a row
+uint16_t rowY(uint8_t row){
+  return GRID_Y0 + SLOT_PITCH*row;
+}
+
+// Top-left pixel of a slot. Slots >= MAX_NUM_PICS share the last slot (the "+N" tile).
+void slotXY(int8_t slot, uint16_t& x, uint16_t& y){
+  if(slot >= MAX_NUM_PICS) slot = MAX_NUM_PICS-1;
+  if(slot < 0) slot = 0; // should not happen, keeps the coordinates on screen
+  x = GRID_X0 + SLOT_PITCH*(slot%GRID_COLS);
+  y = rowY(slotRow(slot));
+}
+
 // Use hardware spi (for esp32-c3 super mini this is SPI0/1 at pins 4-7)
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
@@ -64,7 +92,7 @@ uint16_t ldr;
 uint16_t ldr_f;
 uint16_t ldr_f2;
 
-void redrawLiveChannelPics();
+void redrawLiveChannelPics(int8_t row = -1);
 void updateLiveChannels();
 void setupOTA();
 
@@ -103,8 +131,9 @@ std::deque<channelInfo*> titleChangeQueue;
 // pietsmiet, bonjwa, gronkhtv
 //std::array<std::string, 3> channel_ids = {"21991090", "73437396", "106159308"};
 
-GFXcanvas16 pic_canvas(64, 64); // 16-bit, 320x170 pixels
-GFXcanvas16 text_canvas(298+(6*8), 64); 
+GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
+// one character (6*8 px at text size 8) wider than the visible title so it can scroll smoothly
+GFXcanvas16 text_canvas(TITLE_WIDTH+(6*8), PIC_SIZE);
 
 void setup(void) {
 
@@ -199,6 +228,7 @@ bool tw_update_now = true;
 
 struct {
   channelInfo* channel;
+  int8_t slot;              // slot of the channel when the title was (re)drawn
   std::string displayTitle;
   uint16_t textOffset;
   uint8_t repeats;
@@ -207,6 +237,30 @@ struct {
 bool isTitleDisplaying = false;
 
 uint8_t o_X = 0;
+
+// Green frame around the pic of the channel whose title is scrolling
+void drawTitleIndicator(){
+  uint16_t x, y;
+  slotXY(channelTitleInfo.slot, x, y);
+  drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_GREEN);
+}
+
+void startTitle(channelInfo* channel){
+  channelTitleInfo.channel = channel;
+  channelTitleInfo.slot = channel->slotNum;
+  channelTitleInfo.displayTitle = channel->streamTitle;
+  channelTitleInfo.textOffset = 0;
+  channelTitleInfo.repeats = 0;
+  o_X = 0;
+  isTitleDisplaying = true;
+  drawTitleIndicator();
+}
+
+// Ends the title display and restores all pics (the title covers one row)
+void stopTitle(){
+  isTitleDisplaying = false;
+  redrawLiveChannelPics();
+}
 
 void loop(){
   
@@ -229,29 +283,13 @@ void loop(){
       tw_last_update_start = millis();
       tw_update_now = false;
     }
-    if(!isTitleDisplaying && !titleChangeQueue.empty()) {
-      channelTitleInfo.channel = titleChangeQueue.front();
+    while(!isTitleDisplaying && !titleChangeQueue.empty()) {
+      channelInfo* next = titleChangeQueue.front();
       titleChangeQueue.pop_front();
-      channelTitleInfo.displayTitle = channelTitleInfo.channel->streamTitle;
-      channelTitleInfo.textOffset = 0;
-      channelTitleInfo.repeats = 0;
-      o_X = 0;
-      isTitleDisplaying = true;
+      // channel may have gone offline while it was queued
+      if(next->isLive) startTitle(next);
     }
-    // TODO: cleanup text when done
     if(isTitleDisplaying){
-      int8_t slot_num = channelTitleInfo.channel->slotNum;
-      uint16_t x, y;
-      if (slot_num>7) slot_num = 7;
-      if (slot_num<4) {
-        x = 11+((64+14)*slot_num);
-        y = 14;
-      } else {
-        x = 11+((64+14)*(slot_num-4));
-        y =14+64+14;
-      }
-      drawThickRect(x, y, 64, 64, -7, ST77XX_GREEN);
-      
       if(!o_X){
         text_canvas.fillScreen(ST77XX_BLACK);
         text_canvas.setCursor(0,0);
@@ -259,14 +297,14 @@ void loop(){
         channelTitleInfo.textOffset++;
         channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
       }
-      drawRGBBitmapSectionFast(11, (channelTitleInfo.channel->slotNum>3)?14:(14+64+14), text_canvas.getBuffer(), o_X, 0, 298, text_canvas.height(), text_canvas.width());
+      // the title scrolls over the row that does not contain the channel's pic
+      drawRGBBitmapSectionFast(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, 0, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
       //enterNormalMode();
       o_X = (o_X+6)%(6*8);
 
       if (!o_X && channelTitleInfo.textOffset==0) {
         if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
-          isTitleDisplaying=false;
-          redrawLiveChannelPics();
+          stopTitle();
         }
       }
 
@@ -304,59 +342,55 @@ void commonHttpInit(HTTPClient& http_client){
 
 void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
-  uint16_t x, y;
-  if(pic_slot_index<8){
+  if(pic_slot_index<MAX_NUM_PICS){
     DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
-    
     pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
-
-    if(pic_slot_index<4){
-      x = 11+((64+14)*pic_slot_index);
-      y = 14;
-      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-    } else if(pic_slot_index<8){
-      x = 11+((64+14)*(pic_slot_index-4));
-      y = 14+64+14;
-      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-    } else {
-      return; // should not be reached
-    }
   } else {
+    // more live channels than slots: the last slot shows how many are hidden
     pic_canvas.fillScreen(ST77XX_BLACK);
     pic_canvas.setCursor(4, 14);
     pic_canvas.setTextSize(5);
-    pic_canvas.printf("+%d", pic_slot_index-6);
-    x = 11+((64+14)*(3));
-    y = 14+64+14;
-    tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+    pic_canvas.printf("+%d", pic_slot_index-(MAX_NUM_PICS-2));
   }
-  drawThickRect(x, y, 64, 64, -7, ST77XX_BLACK);
+  uint16_t x, y;
+  slotXY(pic_slot_index, x, y);
+  tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+  drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
 }
 
-void redrawLiveChannelPics(){
-  //tft.fillScreen(ST77XX_BLACK);
-  
-  std::size_t i=0;
+// Blanks a slot including its frame
+void clearSlot(int8_t slot){
+  uint16_t x, y;
+  slotXY(slot, x, y);
+  tft.fillRect(x-PIC_BORDER, y-PIC_BORDER, PIC_SIZE+2*PIC_BORDER, PIC_SIZE+2*PIC_BORDER, ST77XX_BLACK);
+}
+
+// Gives every live channel the next slot in list order and offline channels -1.
+// Returns true if any channel's slot changed.
+bool assignSlots(){
+  bool changed = false;
+  int8_t next = 0;
   for (channelInfo& channel : channels) {
-    if(channel.isLive){
-      drawLiveChannelPic(channel, i++);
+    int8_t slot = channel.isLive ? next++ : -1;
+    if(channel.slotNum != slot){
+      channel.slotNum = slot;
+      changed = true;
     }
   }
-  // black out remaining pic slots
-  for (;i < MAX_NUM_PICS; i++){
-    // copied from drawLiveChannelPic()
-    uint16_t x, y;
-    pic_canvas.fillScreen(ST77XX_BLACK);
-    if(i<4){
-      x = 11+((64+14)*i);
-      y = 14;
-      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-    } else {
-      x = 11+((64+14)*(i-4));
-      y = 14+64+14;
-      tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+  live_num = next;
+  return changed;
+}
+
+// Draws the pics of all live channels at their assigned slot and blanks the
+// unused slots. With row >= 0 only that row is redrawn.
+void redrawLiveChannelPics(int8_t row){
+  for (channelInfo& channel : channels) {
+    if(channel.isLive && (row < 0 || slotRow(channel.slotNum) == row)){
+      drawLiveChannelPic(channel, channel.slotNum);
     }
-    drawThickRect(x, y, 64, 64, -7, ST77XX_BLACK);
+  }
+  for (int8_t slot = live_num; slot < MAX_NUM_PICS; slot++){
+    if(row < 0 || slotRow(slot) == row) clearSlot(slot);
   }
 }
 
@@ -386,7 +420,7 @@ channelInfo* setIDLiveStatus(const char* id, bool now_live, bool draw_immediat=t
     DEBUG_I.printf("[%s] Unsetting channel %s live status\n", DEBUG_TAG, id);
     channel->isLive = false;
     channel->slotNum = -1;
-    live_num--;
+    assignSlots();
     DEBUG_I.printf("[%s] There are now %d live channels.\n", DEBUG_TAG, live_num);
     if(draw_immediat) redrawLiveChannelPics();
   }
@@ -434,9 +468,9 @@ void updateLiveChannels(){
   // Reset is_live array
   //memset(is_live, false, sizeof is_live);
   DEBUG_I.printf("[%s] Resetting all channels live status...\n", DEBUG_TAG);
+  // slotNum is kept so assignSlots() can detect layout changes
   for (auto &&c : channels) {
     c.isLive = false;
-    c.slotNum = -1;
   }
   live_num = 0;
   
@@ -464,7 +498,31 @@ void updateLiveChannels(){
     }
   }
 
-  redrawLiveChannelPics();
+  bool layoutChanged = assignSlots();
+
+  if(isTitleDisplaying){
+    channelInfo* ch = channelTitleInfo.channel;
+    if(!ch->isLive){
+      // channel went offline during its title
+      DEBUG_I.printf("[%s] Channel %s went offline, stopping title.\n", DEBUG_TAG, ch->id.c_str());
+      stopTitle();
+    } else if(slotRow(ch->slotNum) != slotRow(channelTitleInfo.slot)){
+      // the pic moved to the row the title scrolls over: show the title again from the start
+      DEBUG_I.printf("[%s] Channel %s changed row, restarting title.\n", DEBUG_TAG, ch->id.c_str());
+      stopTitle();
+      if (std::find(titleChangeQueue.begin(), titleChangeQueue.end(), ch) == titleChangeQueue.end()) {
+        titleChangeQueue.push_front(ch);
+      }
+    } else if(layoutChanged){
+      // only redraw the row with the pics, the other row is covered by the title
+      // and gets redrawn when the title ends
+      channelTitleInfo.slot = ch->slotNum;
+      redrawLiveChannelPics(slotRow(ch->slotNum));
+      drawTitleIndicator();
+    }
+  } else if(layoutChanged){
+    redrawLiveChannelPics();
+  }
   /*
   for (const auto& id : channel_ids) {
     setIDLiveStatus(id.c_str(), true);
