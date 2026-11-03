@@ -29,6 +29,8 @@ dimmed automatically via an LDR.
 | `src/twitchDisplay.cpp` | Main firmware |
 | `include/pics.h` | 64×64 RGB565 channel logos (made with [image2cpp](https://javl.github.io/image2cpp/)) |
 | `include/secrets.h.example` | Template for `include/secrets.h` |
+| `include/web_pages.h` | HTML of the web interface |
+| `tools/version.py` | Build script that puts the git version into the firmware |
 | `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
 | `examples/apiTest/` | Twitch Helix / EventSub websocket test |
 | `examples/displayTest/` | Display and smooth text-scrolling test |
@@ -48,6 +50,9 @@ and fill in your values:
 
 ```cpp
 #define WIFI_PW      "your-wifi-password"
+
+// login for the web interface (user "admin") and ArduinoOTA uploads
+#define WEB_PASSWORD "choose-a-password"
 
 // either a fixed access token ...
 #define TWITCH_TOKEN "your-twitch-access-token"
@@ -70,19 +75,51 @@ display keeps showing the last known live channels while it is visible.
 | magenta | Twitch rejected the token (expired or invalid) |
 | red     | Twitch request failed for another reason |
 
-## Build and upload
+## Web interface
 
-Uploads go over the air (`espota`) to `twitchdisplay.fritz.box` by default.
-For the first flash over USB, override the upload protocol and port, for
-example with `--upload-port /dev/ttyACM0` and `upload_protocol = esptool`.
+Open `http://twitchdisplay.fritz.box/` (or `http://twitchdisplay.local/`) and
+log in as `admin` with `WEB_PASSWORD`.
+
+- **Status**: live channels, last Twitch update, firmware version, uptime,
+  WiFi, memory, restart button
+- **Update**: upload a new `firmware.bin` from the browser (phone or PC). The
+  file is checked before anything is written (ESP32-C3 application image, not
+  the bootloader or a merged image), the display shows the progress and
+  restarts afterwards.
+
+**Rollback protection**: a firmware installed by an update starts "on
+probation" and only confirms itself after it has been online for 60 s. If it
+crashes, hangs (30 s watchdog) or restarts before that, the bootloader switches
+back to the previous firmware. The status page shows the state of the running
+firmware. This needs a bootloader with rollback support; updates never replace
+the bootloader, so if the status page shows "new (bootloader without rollback
+support?)" after an update, flash once over USB.
+
+## Build and upload
 
 ```bash
 pio run -e twitchDisplay
 ```
 
+The firmware file is `.pio/build/twitchDisplay/firmware.bin`; upload it on the
+web interface's Update page.
+
+Alternatively upload directly from PlatformIO over WiFi (ArduinoOTA). It uses
+the same password, taken from the environment variable
+`TWITCHDISPLAY_PASSWORD` so it never ends up in the repository:
+
+```bash
+export TWITCHDISPLAY_PASSWORD='your-web-password'
+```
+
+(PowerShell: `$env:TWITCHDISPLAY_PASSWORD='your-web-password'`)
+
 ```bash
 pio run -e twitchDisplay -t upload
 ```
+
+For the first flash over USB, set `upload_protocol = esptool` and pass the
+port, e.g. `--upload-port /dev/ttyACM0`. Serial log:
 
 ```bash
 pio device monitor

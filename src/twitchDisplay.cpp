@@ -13,6 +13,11 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ESPmDNS.h>
+#include <esp_ota_ops.h>
+#include <esp_task_wdt.h>
 
 #include <deque>
 #include <string>
@@ -22,6 +27,7 @@
 #include "secrets.h"
 
 #include "MovingAverage.h"
+#include "web_pages.h"
 
 static const char DEBUG_TAG[] = "TwitchDisplay";
 
@@ -40,6 +46,23 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 #endif
 #if !defined(TWITCH_TOKEN) && !defined(TWITCH_CLIENT_SECRET)
 #error "include/secrets.h must define TWITCH_TOKEN and/or TWITCH_CLIENT_SECRET"
+#endif
+
+// Web interface (status page, firmware upload) and ArduinoOTA
+#ifndef WEB_PASSWORD
+#error "include/secrets.h must define WEB_PASSWORD (login for the web interface and ArduinoOTA)"
+#endif
+#define WEB_USER          "admin"
+#define WEB_REALM         "twitchDisplay"
+#define HOSTNAME          "twitchdisplay"
+#define APP_CONFIRM_DELAY (60*1000) // new firmware must be online this long before it is marked as good
+#define LOOP_WDT_TIMEOUT  30000     // ms; restarts the display if loop() hangs (longer than the web server timeouts)
+
+#ifndef FW_VERSION
+#define FW_VERSION "unknown"        // set by tools/version.py
+#endif
+#ifndef ESP_APP_DESC_MAGIC_WORD
+#define ESP_APP_DESC_MAGIC_WORD 0xABCD5432
 #endif
 
 // Send the LDR values via UDP (e.g. for plotting). Off by default.
@@ -130,14 +153,17 @@ uint16_t ldr_avg; // averaged LDR reading used for the backlight
 
 void redrawLiveChannelPics(int8_t row = -1);
 void setupOTA();
+void setupWeb();
 void networkTask(void*);
 
 struct channelInfo {
   std::string id;
   bool isLive;
-  std::string streamTitle;
+  std::string streamTitle;  // display charset, used for the scrolling title
   int8_t slotNum;
   const uint16_t* pic;
+  std::string name;         // display name (UTF-8) for the web interface
+  std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
 };
 
 // lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
@@ -165,6 +191,7 @@ struct StreamInfo {
   std::string id;
   std::string name;
   std::string title;  // "    <title> | <game>   " in the display charset
+  std::string webTitle; // "<title> | <game>" in UTF-8
 };
 
 // Result of one Twitch update, handed from the network task to loop()
@@ -181,6 +208,24 @@ void requestUpdate(){
   if(netTask) xTaskNotifyGive(netTask);
 }
 
+WebServer server(80);
+
+// Firmware upload state (the upload runs inside server.handleClient() in loop())
+volatile bool otaActive = false;   // also pauses the network task
+struct {
+  bool authorized;
+  bool headerChecked;
+  String error;
+  int lastPercent;
+} upload;
+unsigned long rebootAt = 0;        // millis() of a scheduled restart, 0 = none
+unsigned long restoreDisplayAt = 0; // millis() to leave the update screen after a failed upload
+
+// Firmware state for the status page and the rollback protection
+bool appPendingVerify = false;     // running a new OTA image that is not confirmed yet
+FetchResult lastFetchResult = FetchResult::Ok;
+unsigned long lastFetchMillis = 0; // 0 = no update yet
+
 GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 // one character (6*8 px at text size 8) wider than the visible title so it can scroll smoothly
 GFXcanvas16 text_canvas(TITLE_WIDTH+(6*8), PIC_SIZE);
@@ -191,6 +236,7 @@ void setup(void) {
   DEBUG_I.printf("[%s] Starting...\n", DEBUG_TAG);
 
   DEBUG_I.printf("[%s] Connecting to WIFI...\n", DEBUG_TAG);
+  WiFi.setHostname(HOSTNAME); // name in the router (twitchdisplay.fritz.box)
   wifiMulti.addAP("::1", WIFI_PW);
 
 
@@ -223,6 +269,22 @@ void setup(void) {
   tlsClient.useBuiltinCACertBundle();
 
   setupOTA();
+  setupWeb();
+
+  // New firmware from an OTA update starts "pending verify": loop() confirms it
+  // after APP_CONFIRM_DELAY online, otherwise the bootloader rolls back on the
+  // next restart (needs a bootloader with rollback support)
+  esp_ota_img_states_t otaState;
+  if(esp_ota_get_state_partition(esp_ota_get_running_partition(), &otaState) == ESP_OK
+     && otaState == ESP_OTA_IMG_PENDING_VERIFY){
+    appPendingVerify = true;
+    DEBUG_I.printf("[%s] New firmware, waiting %ds online before confirming it.\n", DEBUG_TAG, APP_CONFIRM_DELAY/1000);
+  }
+
+  // Restart if loop() hangs; with a pending firmware this triggers the rollback
+  esp_task_wdt_config_t wdtConfig = { .timeout_ms = LOOP_WDT_TIMEOUT, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdtConfig);
+  enableLoopWDT();
 
   // Twitch requests run in their own task so they don't block scrolling;
   // results come back to loop() through updateQueue
@@ -342,8 +404,22 @@ bool handleWiFi(){
 
 void applyLiveUpdate(const LiveUpdate& update);
 
+void restoreDisplay();
+void confirmFirmwareWhenStable(bool wifiConnected);
+
 void loop(){
   ArduinoOTA.handle();
+  server.handleClient();
+
+  if(rebootAt && millis() >= rebootAt){
+    DEBUG_I.printf("[%s] Restarting...\n", DEBUG_TAG);
+    delay(100);
+    ESP.restart();
+  }
+  if(restoreDisplayAt && millis() >= restoreDisplayAt){
+    restoreDisplayAt = 0;
+    restoreDisplay();
+  }
 
   static unsigned long lastLdr = 0;
   if(millis() - lastLdr >= LDR_INTERVAL){
@@ -354,6 +430,13 @@ void loop(){
   }
 
   bool wifiConnected = handleWiFi();
+  confirmFirmwareWhenStable(wifiConnected);
+
+  if(otaActive || rebootAt || restoreDisplayAt){
+    // the display shows the update screen
+    delay(10);
+    return;
+  }
 
   LiveUpdate* update;
   if(xQueueReceive(updateQueue, &update, 0) == pdTRUE){
@@ -550,8 +633,9 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
     if (id == nullptr) continue;
     StreamInfo info;
     info.id = id;
-    info.name = toDisplayText(stream["user_name"]);
+    info.name = stream["user_name"] | "";
     info.title = "    " + toDisplayText(stream["title"]) + " | " + toDisplayText(stream["game_name"]) + "   ";
+    info.webTitle = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
     update.streams.push_back(std::move(info));
   }
   return FetchResult::Ok;
@@ -560,6 +644,7 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
 // One update: fetch (renewing the token if needed) and hand the result to loop()
 void runNetworkUpdate(){
   if (WiFi.status() != WL_CONNECTED) return; // handleWiFi() requests an update when it is back
+  if (otaActive) return;                      // firmware upload in progress
 
   LiveUpdate* update = new LiveUpdate();
 #ifdef TWITCH_CLIENT_SECRET
@@ -650,6 +735,8 @@ channelInfo* findChannel(const std::string& id){
 
 // Applies a result of the network task to the channels and the display
 void applyLiveUpdate(const LiveUpdate& update){
+  lastFetchResult = update.result;
+  lastFetchMillis = millis();
   if (update.result != FetchResult::Ok) {
     // keep showing the last known state
     setStatus(update.result == FetchResult::Unauthorized ? STATUS_AUTH : STATUS_API);
@@ -670,6 +757,8 @@ void applyLiveUpdate(const LiveUpdate& update){
     }
     DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, stream.name.c_str());
     ch->isLive = true;
+    ch->name = stream.name;
+    ch->webTitle = stream.webTitle;
     if (ch->streamTitle != stream.title) {
       ch->streamTitle = stream.title;
       // queue channel for title display if not already in queue
@@ -711,14 +800,10 @@ void setupOTA(){
   // ArduinoOTA.setPort(3232);
 
   // Hostname defaults to esp3232-[MAC]
-  ArduinoOTA.setHostname("twitchdisplay");
+  ArduinoOTA.setHostname(HOSTNAME); // also starts mDNS: twitchdisplay.local
 
-  // No authentication by default
-  // ArduinoOTA.setPassword("admin");
-
-  // Password can be set with it's md5 value as well
-  // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
-  // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+  // Same password as the web interface; pio passes it via upload_flags
+  ArduinoOTA.setPassword(WEB_PASSWORD);
 
   ArduinoOTA
     .onStart([]() {
@@ -754,4 +839,291 @@ void setupOTA(){
     });
 
   ArduinoOTA.begin();
+}
+
+// ---------- Rollback protection
+
+// Tell the Arduino core that this firmware confirms itself (see
+// confirmFirmwareWhenStable()) instead of being marked as good right at boot
+extern "C" bool verifyRollbackLater(){
+  return true;
+}
+
+// Marks a freshly updated firmware as good once it has been online for
+// APP_CONFIRM_DELAY. Until then a crash or restart rolls back to the old one.
+void confirmFirmwareWhenStable(bool wifiConnected){
+  static unsigned long onlineSince = 0;
+  if(!appPendingVerify) return;
+  if(!wifiConnected){
+    onlineSince = 0;
+    return;
+  }
+  if(!onlineSince){
+    onlineSince = millis();
+    if(!onlineSince) onlineSince = 1;
+  } else if(millis() - onlineSince >= APP_CONFIRM_DELAY){
+    esp_ota_mark_app_valid_cancel_rollback();
+    appPendingVerify = false;
+    DEBUG_I.printf("[%s] New firmware confirmed.\n", DEBUG_TAG);
+  }
+}
+
+const char* otaStateName(){
+  esp_ota_img_states_t state;
+  if(esp_ota_get_state_partition(esp_ota_get_running_partition(), &state) != ESP_OK) return "unknown";
+  switch(state){
+    case ESP_OTA_IMG_NEW:            return "new (bootloader without rollback support?)";
+    case ESP_OTA_IMG_PENDING_VERIFY: return "on probation, confirmed after 60 s online";
+    case ESP_OTA_IMG_VALID:          return "confirmed";
+    case ESP_OTA_IMG_INVALID:        return "invalid";
+    case ESP_OTA_IMG_ABORTED:        return "aborted";
+    case ESP_OTA_IMG_UNDEFINED:      return "flashed via USB";
+    default:                         return "unknown";
+  }
+}
+
+// ---------- Firmware upload
+
+// Checks the first bytes of an upload before anything is written to flash.
+// Returns nullptr if it looks like an application image for this chip.
+const char* validateFirmwareHeader(const uint8_t* data, size_t len){
+  if(len < 36) return "File is too small to be a firmware image.";
+  if(data[0] != 0xE9) return "Not an ESP32 firmware image. Upload firmware.bin.";
+  uint16_t chipId = data[12] | (data[13] << 8);
+  if(chipId != CONFIG_IDF_FIRMWARE_CHIP_ID) return "This firmware is built for a different chip.";
+  // an application image starts its first segment with the app description,
+  // a bootloader or a merged image (bootloader + partitions + app) does not
+  uint32_t magic = data[32] | (data[33] << 8) | (data[34] << 16) | ((uint32_t)data[35] << 24);
+  if(magic != ESP_APP_DESC_MAGIC_WORD) return "Not an application image. Upload firmware.bin, not the bootloader or merged image.";
+  return nullptr;
+}
+
+size_t maxFirmwareSize(){
+  const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+  return next ? next->size : 0;
+}
+
+void drawUpdateScreen(const char* title, uint16_t color, const char* message){
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextWrap(true);
+  tft.setTextSize(3);
+  tft.setTextColor(color);
+  tft.setCursor(20, 30);
+  tft.print(title);
+  if(message){
+    tft.setTextSize(2);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(0, 110);
+    tft.print(message);
+  }
+}
+
+void drawUpdateProgress(int percent){
+  const int x = 20, y = 90, w = 280, h = 24;
+  tft.drawRect(x, y, w, h, ST77XX_WHITE);
+  tft.fillRect(x + 2, y + 2, (w - 4) * percent / 100, h - 4, ST77XX_GREEN);
+}
+
+// Back to the channel grid after a failed upload
+void restoreDisplay(){
+  isTitleDisplaying = false;
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, statusColor);
+  redrawLiveChannelPics();
+}
+
+void failUpload(const char* message){
+  if(upload.error.length()) return; // keep the first error
+  upload.error = message;
+  DEBUG_W.printf("[OTA] Upload failed: %s\n", message);
+  if(Update.isRunning()) Update.abort();
+}
+
+// Called by the web server for every chunk of the uploaded file
+void handleUploadChunk(){
+  HTTPUpload& up = server.upload();
+  switch(up.status){
+    case UPLOAD_FILE_START:
+      upload.authorized = server.authenticate(WEB_USER, WEB_PASSWORD);
+      upload.headerChecked = false;
+      upload.error = "";
+      upload.lastPercent = -1;
+      if(!upload.authorized) return;
+      DEBUG_I.printf("[OTA] Upload of %s started.\n", up.filename.c_str());
+      otaActive = true;
+      restoreDisplayAt = 0;
+      drawUpdateScreen("Firmware update", ST77XX_CYAN, nullptr);
+      drawUpdateProgress(0);
+      if(!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) failUpload(Update.errorString());
+      break;
+
+    case UPLOAD_FILE_WRITE:
+      feedLoopWDT();
+      if(!upload.authorized || upload.error.length()) return;
+      if(!upload.headerChecked){
+        const char* err = validateFirmwareHeader(up.buf, up.currentSize);
+        if(err){ failUpload(err); return; }
+        upload.headerChecked = true;
+      }
+      if(Update.write(up.buf, up.currentSize) != up.currentSize){
+        failUpload(Update.errorString());
+        return;
+      }
+      {
+        // Content-Length includes the multipart framing, close enough for a progress bar
+        int total = server.clientContentLength();
+        int percent = total > 0 ? (int)((uint64_t)up.totalSize * 100 / total) : 0;
+        if(percent > 100) percent = 100;
+        if(percent != upload.lastPercent){
+          upload.lastPercent = percent;
+          drawUpdateProgress(percent);
+        }
+      }
+      break;
+
+    case UPLOAD_FILE_END:
+      feedLoopWDT();
+      if(!upload.authorized || upload.error.length()) return;
+      if(!upload.headerChecked){ failUpload("File is too small to be a firmware image."); return; }
+      // end() verifies the checksum and the image before switching the boot partition
+      if(!Update.end(true)) failUpload(Update.errorString());
+      else DEBUG_I.printf("[OTA] Upload complete, %u bytes.\n", (unsigned)up.totalSize);
+      break;
+
+    case UPLOAD_FILE_ABORTED:
+      if(upload.authorized) failUpload("Upload aborted.");
+      break;
+  }
+}
+
+void sendJson(int code, bool ok, const String& message){
+  String body = String("{\"ok\":") + (ok ? "true" : "false") + ",\"message\":\"";
+  for(char c : message){
+    if(c == '"' || c == '\\') body += '\\';
+    body += c;
+  }
+  body += "\"}";
+  server.send(code, "application/json", body);
+}
+
+// Called by the web server after the whole upload has been received
+void handleUploadDone(){
+  if(!upload.authorized || !server.authenticate(WEB_USER, WEB_PASSWORD)){
+    return server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
+  }
+  if(upload.error.length() == 0 && !upload.headerChecked) failUpload("No file received.");
+  if(upload.error.length()){
+    otaActive = false;
+    drawUpdateScreen("Update failed", ST77XX_RED, upload.error.c_str());
+    restoreDisplayAt = millis() + 5000;
+    sendJson(400, false, "Update failed: " + upload.error);
+    return;
+  }
+  drawUpdateProgress(100);
+  drawUpdateScreen("Update done", ST77XX_GREEN, "Restarting...");
+  sendJson(200, true, "Update successful, the display restarts now.");
+  rebootAt = millis() + 1000; // give the response time to reach the browser
+}
+
+// ---------- Web pages
+
+String htmlEscape(const std::string& in){
+  String out;
+  for(char c : in){
+    switch(c){
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+String formatDuration(unsigned long seconds){
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%lud %02luh %02lum %02lus", seconds/86400, (seconds/3600)%24, (seconds/60)%60, seconds%60);
+  return String(buf);
+}
+
+// Sends a page made of WEB_PAGE_HEAD, body and WEB_PAGE_FOOT
+void sendPage(const char* title, const String& body){
+  String page = WEB_PAGE_HEAD;
+  page.replace("%TITLE%", title);
+  page += body;
+  page += WEB_PAGE_FOOT;
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+bool checkAuth(){
+  if(server.authenticate(WEB_USER, WEB_PASSWORD)) return true;
+  server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
+  return false;
+}
+
+void handleStatus(){
+  if(!checkAuth()) return;
+  String b;
+  b.reserve(2048);
+  b += "<div class=\"card\"><h2>Live channels</h2>";
+  int live = 0;
+  for(const channelInfo& ch : channels){
+    if(!ch.isLive) continue;
+    live++;
+    b += "<p><b>" + htmlEscape(ch.name.empty() ? ch.id : ch.name) + "</b><br><span class=\"muted\">" + htmlEscape(ch.webTitle) + "</span></p>";
+  }
+  if(!live) b += "<p class=\"muted\">No channel is live.</p>";
+  b += "</div>";
+
+  b += "<div class=\"card\"><h2>Twitch</h2><table>";
+  b += "<tr><td>Last update</td><td>";
+  if(!lastFetchMillis) b += "none yet";
+  else b += formatDuration((millis() - lastFetchMillis) / 1000) + " ago";
+  b += "</td></tr><tr><td>Result</td><td>";
+  switch(lastFetchResult){
+    case FetchResult::Ok:           b += "<span class=\"ok\">OK</span>"; break;
+    case FetchResult::Unauthorized: b += "<span class=\"err\">Token rejected (expired or invalid)</span>"; break;
+    case FetchResult::Failed:       b += "<span class=\"err\">Request failed</span>"; break;
+  }
+  b += "</td></tr></table></div>";
+
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  b += "<div class=\"card\"><h2>Device</h2><table>";
+  b += "<tr><td>Firmware</td><td>" FW_VERSION "</td></tr>";
+  b += "<tr><td>Built</td><td>" __DATE__ " " __TIME__ "</td></tr>";
+  b += String("<tr><td>Partition</td><td>") + (running ? running->label : "?") + ", " + otaStateName() + "</td></tr>";
+  b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
+  b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
+  b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
+  b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB)</td></tr>";
+  b += "<tr><td>Brightness sensor</td><td>" + String(ldr_avg) + "</td></tr>";
+  b += "</table><form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
+  sendPage("Status", b);
+}
+
+void handleUpdatePage(){
+  if(!checkAuth()) return;
+  String body = WEB_UPDATE_BODY;
+  body.replace("%MAXSIZE%", String((unsigned)maxFirmwareSize()));
+  sendPage("Update", body);
+}
+
+void handleReboot(){
+  if(!checkAuth()) return;
+  sendPage("Restart", "<div class=\"card\"><p>Restarting... <a href=\"/\">Reload</a> in a few seconds.</p></div>");
+  rebootAt = millis() + 1000;
+}
+
+void setupWeb(){
+  server.on("/", HTTP_GET, handleStatus);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
+  server.on("/reboot", HTTP_POST, handleReboot);
+  // answered without a login challenge: every challenge creates a new digest
+  // nonce, which would invalidate the browser's current login
+  server.on("/favicon.ico", HTTP_GET, [](){ server.send(204); });
+  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+  server.begin();
+  MDNS.addService("http", "tcp", 80);
 }
