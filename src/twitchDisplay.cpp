@@ -694,6 +694,7 @@ bool titleCanvasValid = false;       // text_canvas shows the text from textOffs
 // statistics of the current / last title for the status page
 uint32_t titleFrames = 0;
 unsigned long titleLastFrameUs = 0, titleMaxGapUs = 0;
+uint64_t titleDrawUsSum = 0; unsigned long titleDrawUsMax = 0;  // time per frame for rendering + transfer
 
 // Green frame around the pic of the channel whose title is scrolling
 void drawTitleIndicator(){
@@ -714,6 +715,8 @@ void startTitle(channelInfo* channel){
   titleCanvasValid = false;
   titleFrames = 0;
   titleMaxGapUs = 0;
+  titleDrawUsSum = 0;
+  titleDrawUsMax = 0;
   isTitleDisplaying = true;
   drawTitleIndicator();
 }
@@ -754,6 +757,9 @@ void drawTitleFrame(){
   }
   // the title scrolls over the row that does not contain the channel's pic
   tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
+  unsigned long drawUs = micros() - now;
+  titleDrawUsSum += drawUs;
+  if(drawUs > titleDrawUsMax) titleDrawUsMax = drawUs;
   if(!first && now - titleLastFrameUs > titleMaxGapUs) titleMaxGapUs = now - titleLastFrameUs;
   titleLastFrameUs = now;
   titleFrames++;
@@ -1976,6 +1982,10 @@ void handleStatus(){
     char fps[16];
     snprintf(fps, sizeof(fps), "%.1f", span ? (titleFrames - 1) * 1e6 / span : 0.0);
     b += String(fps) + " fps, longest frame gap " + String((unsigned)(titleMaxGapUs / 1000)) + " ms";
+    char draw[96];
+    snprintf(draw, sizeof(draw), "<br>drawing a frame takes %.1f ms (max %.1f ms), panel refresh %.1f ms",
+             titleDrawUsSum / 1000.0 / titleFrames, titleDrawUsMax / 1000.0, FRAME_INTERVAL_US / 1000.0);
+    b += draw;
   }
   b += "</td></tr>";
   b += "</table>";

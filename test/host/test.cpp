@@ -781,7 +781,7 @@ int main(){
     CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
     CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
     server.find("/", HTTP_GET)->fn();
-    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap "));
+    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 10.3 ms"));
     reset(); }
 
   printf("T44 scanline (GSCAN) and ID read diagnostics\n");
