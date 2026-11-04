@@ -284,6 +284,63 @@ public:
     spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB);
     endWrite();
   }
+
+  // A colour emoji to draw over the text: palette indices column by column
+  // (size x size, 0 = transparent) and its palette in wire byte order
+  struct EmojiDraw { int x, top, size; const uint8_t* index; const uint16_t* palette; };
+
+  // Draws a w x h section of the title: the coverage canvas alpha (row-major,
+  // stride wide, from column offsetX) through lut (wire byte order), with the
+  // emoji on top. Column by column like drawColumnwise().
+  void drawTitleColumns(int16_t x, int16_t y, const uint8_t* alpha, int16_t offsetX, int16_t w, int16_t h, int16_t stride,
+                        const uint16_t* lut, const EmojiDraw* emoji, int emojiCount){
+    auto pixel = [&](int cx, int j, const EmojiDraw* e) -> uint16_t {
+      if(e && j >= e->top && j < e->top + e->size){
+        uint8_t i = e->index[(cx - e->x) * e->size + (j - e->top)];
+        if(i) return e->palette[i];
+      }
+      return lut[alpha[j * stride + cx]];
+    };
+    auto emojiAt = [&](int cx) -> const EmojiDraw* {
+      for(int k = 0; k < emojiCount; k++) if(cx >= emoji[k].x && cx < emoji[k].x + emoji[k].size) return &emoji[k];
+      return nullptr;
+    };
+    startWrite();
+    if(!TITLE_COLUMNWISE || rotation != 1 || h > PIC_SIZE){
+      // row by row (the display's normal order)
+      setAddrWindow(x, y, w, h);
+      uint16_t line[TITLE_WIDTH];
+      for(int16_t j = 0; j < h; j++){
+        for(int16_t i = 0; i < w && i < TITLE_WIDTH; i++){ uint16_t p = pixel(offsetX + i, j, emojiAt(offsetX + i)); line[i] = (uint16_t)(p >> 8 | p << 8); }
+        writePixels(line, w);
+      }
+      endWrite();
+      return;
+    }
+    writeCommand(ST77XX_MADCTL);
+    spiWrite(ST77XX_MADCTL_RGB);
+    writeCommand(ST77XX_CASET);
+    SPI_WRITE32(((uint32_t)(y + _ystart) << 16) | (uint32_t)(y + _ystart + h - 1));
+    writeCommand(ST77XX_RASET);
+    SPI_WRITE32(((uint32_t)(319 - (x + _xstart + w - 1)) << 16) | (uint32_t)(319 - (x + _xstart)));
+    writeCommand(ST77XX_RAMWR);
+    uint32_t piece[16];
+    uint32_t n = 0;
+    for(int16_t i = w - 1; i >= 0; i--){
+      int cx = offsetX + i;
+      const EmojiDraw* e = emojiAt(cx);
+      for(int16_t j = 0; j < h; j++){
+        uint16_t p = pixel(cx, j, e);
+        if(n & 1) piece[n >> 1] |= (uint32_t)p << 16; else piece[n >> 1] = p;
+        if(++n == 32){ spiFastSend(piece, 64); n = 0; }
+      }
+    }
+    if(n) spiFastSend(piece, n * 2);
+    spiFastWait();
+    writeCommand(ST77XX_MADCTL);
+    spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB);
+    endWrite();
+  }
 };
 
 Display tft(TFT_CS, TFT_DC, TFT_RST);
@@ -500,7 +557,8 @@ GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 // The visible title plus a margin on the right, where the render task draws
 // the next characters before they scroll into view
 #define CANVAS_W (TITLE_WIDTH + TITLE_MARGIN)
-GFXcanvas16 text_canvas(CANVAS_W, PIC_SIZE);
+uint8_t titleAlpha[PIC_SIZE * CANVAS_W];   // coverage of the title text (25 KB); colour emoji are drawn on top while sending
+uint16_t titleLut[256];                    // coverage -> RGB565 of the title colour on black, wire byte order
 GFXcanvas1 builtinGlyph(BUILTIN_ADVANCE, PIC_SIZE);  // one character of the built-in font (render task)
 
 void setup(void) {
@@ -524,6 +582,10 @@ void setup(void) {
   
   tft.fillScreen(ST77XX_BLACK);
 
+  for(int a = 0; a < 256; a++){
+    uint16_t c = a == 255 ? TITLE_COLOR : (uint16_t)((((TITLE_COLOR >> 11) & 31) * a / 255) << 11 | (((TITLE_COLOR >> 5) & 63) * a / 255) << 5 | ((TITLE_COLOR & 31) * a / 255));
+    titleLut[a] = (uint16_t)(c >> 8 | c << 8);
+  }
   builtinGlyph.setTextWrap(false);
   builtinGlyph.cp437(true); // without font.bin titles are converted to CP437, see toDisplayText()
 
@@ -634,14 +696,16 @@ struct TitleText {
 } titleText;
 
 // Canvas state shared by loop() and the render task, under titleLock:
-// text_canvas columns [o_X, o_X + TITLE_WIDTH) are visible, the next
-// character goes to titleNextX.
+// titleAlpha columns [o_X, o_X + TITLE_WIDTH) are visible, the next
+// character goes to titleNextX; colour emoji are placed in titleEmoji.
 SemaphoreHandle_t titleLock = nullptr;
 uint32_t titleGeneration = 0;        // changes with every start/stop: stale renders are dropped
 size_t titleNextItem = 0;            // next character (chars.size() = the gap)
 int titleNextX = 0;
 uint16_t o_X = 0;                    // first visible canvas column
 uint32_t titleScrollTotal = 0;       // pixels until the title ends
+struct PlacedEmoji { int x; uint32_t offset, seq; };   // canvas column; cache entry (checked before drawing)
+std::vector<PlacedEmoji> titleEmoji;
 
 unsigned long titleStartedUs = 0;    // micros() of the first frame (moved on while waiting for characters)
 uint32_t titlePixels = 0;            // pixels scrolled since the start
@@ -724,7 +788,8 @@ String fontUrl(){
 
 // ---------- Cache in the font partition after font.bin, filled by the
 // network task before it hands a Twitch result to loop():
-//  - colour emoji: Twemoji images (CC-BY 4.0) as 54x54 RGB565 (about 2.4 KB)
+//  - colour emoji: Twemoji images (CC-BY 4.0) as 54x54 palette indices, column
+//    by column, with up to 255 colours (about 3.4 KB), drawn straight from flash
 //  - CJK characters rendered from downloaded font pieces (about 1 KB)
 // Entries are run-length coded and written one after another; one never
 // crosses into the next 4 KB sector unless it is larger than a sector (then
@@ -733,10 +798,10 @@ String fontUrl(){
 #define EMOJI_SIZE           54
 #define EMOJI_ADVANCE        60     // pixels in the title
 #define EMOJI_TOP            (TITLE_BASELINE - 46)   // like the monochrome emoji
-#define CACHE_MAGIC          0x32454D43UL            // "CME2"
+#define CACHE_MAGIC          0x33454D43UL            // "CME3"
 #define CACHE_SECTOR         4096
 #define CACHE_MAX_ENTRY      (2 * CACHE_SECTOR)
-#define CACHE_COLOUR         1      // RGB565 runs: (count, colour lo, colour hi)
+#define CACHE_COLOUR         1      // u16 colour count n, n colours (RGB565, wire byte order, [0] = transparent), w*h indices column by column
 #define CACHE_GLYPH          2      // coverage runs: (count, alpha)
 #define EMOJI_MAX_PER_UPDATE 8      // downloads before a Twitch result goes to loop(); the rest next time
 #define EMOJI_MAX_DOWNLOAD   16384
@@ -844,12 +909,17 @@ bool readCached(uint32_t key, std::vector<uint16_t>* colour, GlyphBitmap* glyph)
     p += sizeof(h);
     size_t out = 0, total = (size_t)h.w * h.h;
     if(h.type == CACHE_COLOUR && colour){
-      colour->assign(total, 0);
-      for(size_t i = 0; i + 3 <= h.len && out < total; i += 3){
-        uint16_t c = p[i + 1] | (p[i + 2] << 8);
-        for(int k = 0; k < p[i] && out < total; k++) (*colour)[out++] = c;
+      uint16_t n = p[0] | (p[1] << 8);
+      if(h.len == 2 + 2u * n + total){
+        colour->assign(total, 0);
+        const uint8_t* index = p + 2 + 2 * n;
+        for(int x = 0; x < h.w; x++) for(int y = 0; y < h.h; y++){
+          uint8_t i = index[x * h.h + y];
+          uint16_t c = i < n ? (uint16_t)(p[3 + 2 * i] | (p[2 + 2 * i] << 8)) : 0;   // stored in wire order (high byte first)
+          (*colour)[y * h.w + x] = i ? c : 0;
+        }
+        ok = true;
       }
-      ok = out == total;
     } else if(h.type == CACHE_GLYPH && glyph){
       glyph->w = h.w; glyph->h = h.h; glyph->xoff = h.xoff; glyph->yoff = h.yoff;
       glyph->alpha.assign(total, 0);
@@ -863,16 +933,46 @@ bool readCached(uint32_t key, std::vector<uint16_t>* colour, GlyphBitmap* glyph)
 }
 bool readEmoji(uint32_t key, std::vector<uint16_t>& px){ return readCached(key, &px, nullptr); }
 
-// Run-length coding of RGB565 pixels: (count 1..255, colour little endian)
-std::vector<uint8_t> rleEncode(const uint16_t* px, size_t n){
+// Where a cached colour emoji's palette and indices are in the mapped flash,
+// if the entry at offset is still the one with seq (checked before each frame)
+bool cachedEmojiPixels(uint32_t offset, uint32_t seq, const uint16_t*& palette, const uint8_t*& index){
+  if(!emojiCacheReady || offset + sizeof(CacheEntryHeader) + 2 > cacheBytes) return false;
+  const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + offset;
+  CacheEntryHeader h;
+  memcpy(&h, p, sizeof(h));
+  if(h.magic != CACHE_MAGIC || h.seq != seq || h.type != CACHE_COLOUR || h.w != EMOJI_SIZE || h.h != EMOJI_SIZE) return false;
+  uint16_t n = p[sizeof(h)] | (p[sizeof(h) + 1] << 8);
+  if(h.len != 2 + 2u * n + EMOJI_SIZE * EMOJI_SIZE) return false;
+  palette = (const uint16_t*)(p + sizeof(h) + 2);
+  index = p + sizeof(h) + 2 + 2 * n;
+  return true;
+}
+
+// Colour emoji for the cache: at most 255 colours (fewer bits per channel
+// until it fits; Twemoji are flat, so usually it fits right away), indices
+// column by column, 0 = transparent (black background)
+std::vector<uint8_t> paletteEncode(const uint16_t* px, int w, int h){
+  static const uint16_t masks[] = {0xFFFF, 0xF7DE, 0xE79C, 0xC718, 0x8610};
+  std::vector<uint16_t> colours;
+  uint16_t mask = 0xFFFF;
+  auto reduce = [&](uint16_t c){ uint16_t m = c & mask; return m ? m : (uint16_t)0x0841; };   // never transparent
+  for(uint16_t m : masks){
+    mask = m;
+    colours.clear();
+    for(int i = 0; i < w * h; i++) if(px[i]) colours.push_back(reduce(px[i]));
+    std::sort(colours.begin(), colours.end());
+    colours.erase(std::unique(colours.begin(), colours.end()), colours.end());
+    if(colours.size() <= 255) break;
+  }
   std::vector<uint8_t> out;
-  for(size_t i = 0; i < n;){
-    size_t run = 1;
-    while(i + run < n && run < 255 && px[i + run] == px[i]) run++;
-    out.push_back((uint8_t)run);
-    out.push_back(px[i] & 0xFF);
-    out.push_back(px[i] >> 8);
-    i += run;
+  out.reserve(2 + 2 * (colours.size() + 1) + w * h);
+  uint16_t n = (uint16_t)(colours.size() + 1);
+  out.push_back(n & 0xFF); out.push_back(n >> 8);
+  out.push_back(0); out.push_back(0);                      // [0]: transparent
+  for(uint16_t c : colours){ out.push_back(c >> 8); out.push_back(c & 0xFF); }   // wire byte order
+  for(int x = 0; x < w; x++) for(int y = 0; y < h; y++){
+    uint16_t c = px[y * w + x];
+    out.push_back(c ? (uint8_t)(std::lower_bound(colours.begin(), colours.end(), reduce(c)) - colours.begin() + 1) : 0);
   }
   return out;
 }
@@ -923,8 +1023,8 @@ bool storeCached(uint32_t key, uint8_t type, uint8_t w, uint8_t h, int8_t xoff, 
   return ok;
 }
 
-bool storeEmoji(uint32_t key, const std::vector<uint8_t>& rle){
-  return storeCached(key, CACHE_COLOUR, EMOJI_SIZE, EMOJI_SIZE, 0, 0, EMOJI_ADVANCE, rle);
+bool storeEmoji(uint32_t key, const std::vector<uint8_t>& data){
+  return storeCached(key, CACHE_COLOUR, EMOJI_SIZE, EMOJI_SIZE, 0, 0, EMOJI_ADVANCE, data);
 }
 
 // Green frame around the pic of the channel whose title is scrolling
@@ -967,10 +1067,25 @@ void blitGlyph(GFXcanvas16& canvas, const GlyphBitmap& g, int x, int baseline, u
   }
 }
 
+// The same into the title's coverage canvas (overlapping characters add up)
+void blitTitleGlyph(const GlyphBitmap& g, int x){
+  for(int j = 0; j < g.h; j++){
+    int py = TITLE_BASELINE + g.yoff + j;
+    if(py < 0 || py >= PIC_SIZE) continue;
+    const uint8_t* src = &g.alpha[(size_t)j * g.w];
+    uint8_t* dst = &titleAlpha[py * CANVAS_W];
+    for(int i = 0; i < g.w; i++){
+      int px = x + g.xoff + i;
+      if(px >= 0 && px < CANVAS_W && src[i]) dst[px] = (uint8_t)(src[i] + dst[px] * (255 - src[i]) / 255);
+    }
+  }
+}
+
 // Outline box for a character no font has
-void drawGlyphBox(GFXcanvas16& canvas, int x, int advance, uint16_t color){
-  int h = (int)(TITLE_EM * 0.7f);
-  canvas.drawRect(x + 3, TITLE_BASELINE - h, advance - 6, h, color);
+void drawGlyphBox(int x, int advance){
+  int h = (int)(TITLE_EM * 0.7f), x0 = x + 3, x1 = x + advance - 4, y0 = TITLE_BASELINE - h, y1 = TITLE_BASELINE - 1;
+  for(int px = x0; px <= x1; px++) if(px >= 0 && px < CANVAS_W){ titleAlpha[y0 * CANVAS_W + px] = 255; titleAlpha[y1 * CANVAS_W + px] = 255; }
+  for(int py = y0; py <= y1; py++){ if(x0 >= 0 && x0 < CANVAS_W) titleAlpha[py * CANVAS_W + x0] = 255; if(x1 >= 0 && x1 < CANVAS_W) titleAlpha[py * CANVAS_W + x1] = 255; }
 }
 
 // A character of the built-in 5x7 font at text size 8 (48x64, top at row 0)
@@ -1028,15 +1143,14 @@ bool renderAheadStep(){
   if(!room) return false;
 
   GlyphBitmap glyph;
-  std::vector<uint16_t> colour;     // a colour emoji, if it is (still) in the cache
-  bool box = false;
-  // a cached colour emoji (5.8 KB buffer) or CJK character; without the RAM the fonts' version
-  bool cachedGlyph = false;
-  if(key && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GLYPH_MIN_FREE_BLOCK){
-    if(!readCached(key, &colour, &glyph)) colour.clear();
-    else cachedGlyph = colour.empty();
+  bool box = false, colour = false, cachedGlyph = false;
+  CacheIndexEntry cached;
+  // a cached colour emoji (drawn from flash while sending) or CJK character; else the fonts' version
+  if(key && cacheLookup(key, &cached)){
+    if(cached.type == CACHE_COLOUR) colour = true;
+    else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GLYPH_MIN_FREE_BLOCK) cachedGlyph = readCached(key, nullptr, &glyph);
   }
-  if(!gap && colour.empty() && !cachedGlyph && (c || !key)){
+  if(!gap && !colour && !cachedGlyph && (c || !key)){
     if(builtin) renderBuiltinGlyph((uint8_t)c, glyph);
     else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) box = c != ' ';  // no RAM: a box instead of failing
     else box = !titleFont.render(c, TITLE_EM, glyph);
@@ -1044,17 +1158,9 @@ bool renderAheadStep(){
 
   xSemaphoreTake(titleLock, portMAX_DELAY);
   if(generation == titleGeneration && isTitleDisplaying){
-    if(!colour.empty()){
-      // centred in its advance; black is the transparent background
-      int x0 = titleNextX + (advance - EMOJI_SIZE) / 2;
-      uint16_t* buf = text_canvas.getBuffer();
-      for(int y = 0; y < EMOJI_SIZE; y++) for(int x = 0; x < EMOJI_SIZE; x++){
-        uint16_t px = colour[y * EMOJI_SIZE + x];
-        if(px && x0 + x >= 0 && x0 + x < CANVAS_W) buf[(EMOJI_TOP + y) * CANVAS_W + x0 + x] = px;
-      }
-    }
-    else if(box) drawGlyphBox(text_canvas, titleNextX, advance, TITLE_COLOR);
-    else if(!gap) blitGlyph(text_canvas, glyph, titleNextX, TITLE_BASELINE, TITLE_COLOR);
+    if(colour) titleEmoji.push_back({titleNextX + (advance - EMOJI_SIZE) / 2, cached.offset, cached.seq});   // centred in its advance
+    else if(box) drawGlyphBox(titleNextX, advance);
+    else if(!gap) blitTitleGlyph(glyph, titleNextX);
     titleNextX += advance;
     titleNextItem = (item + 1) % (count + 1);
   }
@@ -1070,12 +1176,13 @@ void titleRenderTask(void*){
 
 // Moves the canvas content left by n columns (under titleLock)
 void shiftTitleCanvas(int n){
-  uint16_t* buf = text_canvas.getBuffer();
   for(int y = 0; y < PIC_SIZE; y++){
-    uint16_t* row = &buf[y * CANVAS_W];
-    memmove(row, row + n, (CANVAS_W - n) * sizeof(uint16_t));
-    memset(row + CANVAS_W - n, 0, n * sizeof(uint16_t));
+    uint8_t* row = &titleAlpha[y * CANVAS_W];
+    memmove(row, row + n, CANVAS_W - n);
+    memset(row + CANVAS_W - n, 0, n);
   }
+  for(auto& e : titleEmoji) e.x -= n;
+  titleEmoji.erase(std::remove_if(titleEmoji.begin(), titleEmoji.end(), [](const PlacedEmoji& e){ return e.x + EMOJI_SIZE <= 0; }), titleEmoji.end());
   titleNextX -= n;
   o_X -= n;
 }
@@ -1087,7 +1194,8 @@ void startTitle(channelInfo* channel){
   xSemaphoreTake(titleLock, portMAX_DELAY);
   titleGeneration++;
   layoutTitle(channel->streamTitle);
-  text_canvas.fillScreen(ST77XX_BLACK);
+  memset(titleAlpha, 0, sizeof(titleAlpha));
+  titleEmoji.clear();
   titleNextItem = 0;
   titleNextX = TITLE_LEAD;
   o_X = 0;
@@ -1139,7 +1247,14 @@ void drawTitleFrame(){
   if(!first && step == 0){ xSemaphoreGive(titleLock); return; }  // nothing moved
   unsigned long xferStart = micros();
   // the title scrolls over the row that does not contain the channel's pic
-  tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W);
+  Display::EmojiDraw emoji[8];
+  int emojiCount = 0;
+  for(const auto& e : titleEmoji){
+    if(emojiCount == 8 || e.x >= o_X + TITLE_WIDTH || e.x + EMOJI_SIZE <= o_X) continue;
+    const uint16_t* palette; const uint8_t* index;
+    if(cachedEmojiPixels(e.offset, e.seq, palette, index)) emoji[emojiCount++] = {e.x, EMOJI_TOP, EMOJI_SIZE, index, palette};
+  }
+  tft.drawTitleColumns(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), titleAlpha, o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W, titleLut, emoji, emojiCount);
   xSemaphoreGive(titleLock);
   unsigned long drawUs = micros() - now;
   titleDrawUsSum += drawUs;
@@ -1541,11 +1656,11 @@ void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
     png.clear(); png.shrink_to_fit();
     if(e && !strcmp(e, "Out of memory")){ emojiError = name.c_str() + String(": out of memory while decoding, trying again later"); break; }
     if(e){ emojiError = name.c_str() + String(": ") + e; emojiMissing.insert(key); continue; }   // a broken image: not asked again
-    std::vector<uint8_t> rle = rleEncode(px.data(), px.size());
+    std::vector<uint8_t> data = paletteEncode(px.data(), EMOJI_SIZE, EMOJI_SIZE);
     px.clear(); px.shrink_to_fit();
-    if(!storeEmoji(key, rle)){ emojiError = name.c_str() + String(": cannot store it"); continue; }
+    if(!storeEmoji(key, data)){ emojiError = name.c_str() + String(": cannot store it"); continue; }
     emojiDownloads++;
-    DEBUG_I.printf("[Emoji] %s stored (%u bytes).\n", name.c_str(), (unsigned)rle.size());
+    DEBUG_I.printf("[Emoji] %s stored (%u colours).\n", name.c_str(), (unsigned)(data[0] | (data[1] << 8)));
   }
 }
 

@@ -128,10 +128,14 @@ uint16_t frame(int slot){ uint16_t x,y; slotXY(slot,x,y); return g_fb[y+32][x-3]
 // true if the row shows the visible part of the title canvas (and some text)
 #define ROW_HEIGHT_FOR_TEST 64
 int xSemaphoreTakeCount(SemaphoreHandle_t m){ return m->taken; }
+uint16_t titlePixel(int cx, int j){ uint16_t w = titleLut[titleAlpha[j*CANVAS_W + cx]]; return (uint16_t)(w >> 8 | w << 8); }
+bool underEmoji(int cx, int j){ for(auto& e : titleEmoji) if(cx >= e.x && cx < e.x + EMOJI_SIZE && j >= EMOJI_TOP && j < EMOJI_TOP + EMOJI_SIZE) return true; return false; }
 bool titleInRow(int row){
-  const uint16_t* b = text_canvas.getBuffer(); int y0 = rowY(row); bool text = false;
+  int y0 = rowY(row); bool text = false;
   for(int j = 0; j < 64; j++) for(int i = 0; i < TITLE_WIDTH; i++){
-    uint16_t v = b[j*CANVAS_W + o_X + i];
+    int cx = o_X + i;
+    if(underEmoji(cx, j)) continue;
+    uint16_t v = titlePixel(cx, j);
     if(g_fb[y0+j][GRID_X0+i] != v) return false;
     if(v) text = true;
   }
@@ -527,9 +531,8 @@ int main(){
       bool box = false;
       for(int k = 0; k < 400 && isTitleDisplaying && !box; k++){
         loopNoUpdate(1);
-        const uint16_t* b = text_canvas.getBuffer();
         for(int x = 0; x < CANVAS_W && !box; x++){
-          int n = 0; for(int y = TITLE_BASELINE - 37; y < TITLE_BASELINE; y++) if(b[y*CANVAS_W + x] == TITLE_COLOR) n++;
+          int n = 0; for(int y = TITLE_BASELINE - 37; y < TITLE_BASELINE; y++) if(titleAlpha[y*CANVAS_W + x] == 255) n++;
           if(n == 37) box = true;
         }
       }
@@ -538,8 +541,7 @@ int main(){
     printf("    no RAM for a character: boxes instead\n");
     g_largestBlock = 4096;
     reset(); setResponse({{0,"Hallo"}}); loopWithUpdate();
-    { const uint16_t* b = text_canvas.getBuffer();
-      auto column = [&](int x){ int n = 0; for(int y = 0; y < 64; y++) if(b[y*CANVAS_W + x] == TITLE_COLOR) n++; return n; };
+    { auto column = [&](int x){ int n = 0; for(int y = 0; y < 64; y++) if(titleAlpha[y*CANVAS_W + x] == 255) n++; return n; };
       CHECK(column(TITLE_LEAD + 3) == 37 && column(TITLE_LEAD + 10) == 2); }  // "H" as a box outline: left edge, top and bottom
     runUntilTitleDone(); g_largestBlock = 61440;
     server.find("/", HTTP_GET)->fn();
@@ -631,19 +633,43 @@ int main(){
     CHECK(isTitleDisplaying && titleText.cacheKey[7] == emojiKey("1f525") && titleText.advance[7] == EMOJI_ADVANCE && titleText.cacheKey[9] == emojiKey("1f1e9-1f1ea"));
     { std::vector<uint16_t> px; CHECK(readEmoji(emojiKey("1f525"), px));
       std::vector<uint16_t> expect(EMOJI_SIZE * EMOJI_SIZE); pngToRgb565((const uint8_t*)fire.data(), fire.size(), expect.data(), EMOJI_SIZE, EMOJI_SIZE);
-      CHECK(px == expect);                                                       // stored losslessly
-      bool drawn = false;                                                        // and drawn into the title
+      std::set<uint16_t> colours(expect.begin(), expect.end()); colours.erase(0);
+      if(colours.size() <= 255) CHECK(px == expect);                            // stored losslessly when it has few colours
+      bool close = true;                                                         // otherwise with fewer bits per channel
+      for(size_t i = 0; i < px.size(); i++){
+        int dr = abs((px[i] >> 11) - (expect[i] >> 11)), dg = abs(((px[i] >> 5) & 63) - ((expect[i] >> 5) & 63)), db = abs((px[i] & 31) - (expect[i] & 31));
+        if(dr > 8 || dg > 16 || db > 8 || (expect[i] == 0) != (px[i] == 0)) close = false;
+      }
+      CHECK(close);
+      bool drawn = false;                                                        // and drawn over the title, straight from the cache
       for(int k = 0; k < 300 && isTitleDisplaying && !drawn; k++){
         loopNoUpdate(1);
-        const uint16_t* b = text_canvas.getBuffer();
-        for(int x = 0; x + EMOJI_SIZE <= CANVAS_W && !drawn; x++){
-          bool same = true;
-          for(int y = 0; y < EMOJI_SIZE && same; y += 7) for(int i = 0; i < EMOJI_SIZE && same; i += 5) if(expect[y*EMOJI_SIZE + i] && b[(EMOJI_TOP + y)*CANVAS_W + x + i] != expect[y*EMOJI_SIZE + i]) same = false;
-          if(same) drawn = true;
+        for(auto& e : titleEmoji){
+          if(e.x < o_X || e.x + EMOJI_SIZE > o_X + TITLE_WIDTH) continue;        // wholly visible
+          int y0 = rowY(1), x0 = GRID_X0 + e.x - o_X, same = 0, ink = 0;
+          for(int y = 0; y < EMOJI_SIZE; y++) for(int i = 0; i < EMOJI_SIZE; i++) if(px[y*EMOJI_SIZE + i]){ ink++; if(g_fb[y0 + EMOJI_TOP + y][x0 + i] == px[y*EMOJI_SIZE + i]) same++; }
+          if(ink > 500 && same == ink) drawn = true;
         }
       }
-      CHECK(drawn); }
+      CHECK(drawn && titleInRow(1));
+      CacheIndexEntry e; const uint16_t* pal; const uint8_t* idx;
+      CHECK(cacheLookup(emojiKey("1f525"), &e) && cachedEmojiPixels(e.offset, e.seq, pal, idx) && !cachedEmojiPixels(e.offset, e.seq + 1, pal, idx)); }   // a replaced entry is not drawn
     runUntilTitleDone(); CHECK(xSemaphoreTakeCount(emojiLock) == 0);
+
+    printf("    palette: exact with few colours, fewer bits with many, black stays transparent\n");
+    { auto decode = [](const std::vector<uint8_t>& d, int w, int h){
+        uint16_t n = d[0] | (d[1] << 8); std::vector<uint16_t> out(w * h);
+        for(int x = 0; x < w; x++) for(int y = 0; y < h; y++){ uint8_t i = d[2 + 2*n + x*h + y]; out[y*w + x] = i ? (uint16_t)(d[2 + 2*i] << 8 | d[3 + 2*i]) : 0; }
+        return std::make_pair(n, out); };
+      std::vector<uint16_t> few(54 * 54, 0); for(int i = 0; i < 54 * 54; i++) few[i] = i % 3 == 0 ? 0 : i % 3 == 1 ? 0xF800 : 0x0001;
+      auto r = decode(paletteEncode(few.data(), 54, 54), 54, 54);
+      CHECK(r.first == 3 && r.second == few && paletteEncode(few.data(), 54, 54).size() == 2 + 2 * 3 + 54 * 54);
+      std::vector<uint16_t> many(54 * 54); for(int i = 0; i < 54 * 54; i++) many[i] = (uint16_t)(i * 37 + 1);
+      r = decode(paletteEncode(many.data(), 54, 54), 54, 54);
+      bool ok = r.first <= 256;
+      for(int i = 0; i < 54 * 54; i++){ uint16_t a = many[i], b = r.second[i];
+        if(!b || abs((a >> 11) - (b >> 11)) > 8 || abs(((a >> 5) & 63) - ((b >> 5) & 63)) > 16 || abs((a & 31) - (b & 31)) > 8) ok = false; }
+      CHECK(ok); }
 
     printf("    cached: not downloaded again, also after a restart\n");
     g_requests.clear(); setResponse({{0, "Neu \xf0\x9f\x94\xa5\xe2\x9d\xa4"}}); twitchAnswer(); loopWithUpdate();
@@ -736,10 +762,9 @@ int main(){
       GlyphBitmap g; readCached(glyphKey(0xC548), nullptr, &g);
       for(int k = 0; k < 200 && isTitleDisplaying && !drawn; k++){
         loopNoUpdate(1);
-        const uint16_t* b = text_canvas.getBuffer();
         for(int x = 0; x + g.w < CANVAS_W && !drawn; x++){
           int same = 0, ink = 0;
-          for(int j = 0; j < g.h; j++) for(int i = 0; i < g.w; i++) if(g.alpha[j*g.w + i] == 255){ ink++; if(b[(TITLE_BASELINE + g.yoff + j)*CANVAS_W + x + g.xoff + i] == TITLE_COLOR) same++; }
+          for(int j = 0; j < g.h; j++) for(int i = 0; i < g.w; i++) if(g.alpha[j*g.w + i] == 255){ ink++; int px = x + g.xoff + i; if(px >= 0 && titleAlpha[(TITLE_BASELINE + g.yoff + j)*CANVAS_W + px] == 255) same++; }
           if(ink > 50 && same == ink) drawn = true;
         }
       }

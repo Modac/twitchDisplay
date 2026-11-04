@@ -102,7 +102,8 @@ Titles are drawn in Noto Sans SemiBold: Latin with all its extensions, Greek,
 Cyrillic, typographic quotes and dashes. Emoji appear in colour: the display
 downloads each one once as a [Twemoji](https://github.com/jdecked/twemoji)
 image (CC-BY 4.0) from cdn.jsdelivr.net before the title starts, and keeps
-about 60 of them in flash (the oldest are replaced). Flags, skin tones and
+about 60 of them in flash (the oldest are replaced), from where they are drawn
+directly (up to 255 colours each). Flags, skin tones and
 combined emoji work too. Emoji without a colour image, or while a download
 fails, are drawn from a monochrome emoji font in the text colour (about 400
 common ones). Settings > **Emoji in titles** switches to monochrome only (no
