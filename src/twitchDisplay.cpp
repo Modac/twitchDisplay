@@ -1045,23 +1045,32 @@ size_t maxFirmwareSize(){
 }
 
 // Full screen message (firmware update, WiFi connection, setup mode)
+// Layout of the message screen: title (text size 3, 24 px high), message
+// (text size 2, 16 px per line) and progress bar. A one-line message ends at
+// y=76, well above the bar; longer messages (errors) are shown without a bar.
+#define MSG_X        20
+#define MSG_TITLE_Y  20
+#define MSG_TEXT_Y   60
+#define PROGRESS_Y   120
+#define PROGRESS_H   24
+
 void drawMessageScreen(const char* title, uint16_t color, const char* message){
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(true);
   tft.setTextSize(3);
   tft.setTextColor(color);
-  tft.setCursor(20, 30);
+  tft.setCursor(MSG_X, MSG_TITLE_Y);
   tft.print(title);
   if(message){
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(0, 110);
+    tft.setCursor(MSG_X, MSG_TEXT_Y);
     tft.print(message);
   }
 }
 
 void drawUpdateProgress(int percent){
-  const int x = 20, y = 90, w = 280, h = 24;
+  const int x = MSG_X, y = PROGRESS_Y, w = 320 - 2*MSG_X, h = PROGRESS_H;
   tft.drawRect(x, y, w, h, ST77XX_WHITE);
   tft.fillRect(x + 2, y + 2, (w - 4) * percent / 100, h - 4, ST77XX_GREEN);
 }
