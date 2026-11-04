@@ -1353,6 +1353,8 @@ void setupModeLoop();
 void checkBootButton();
 void runInstall();
 void waitForCjkSlot();
+void waitForNetworkIdle();
+extern volatile bool netBusy;
 void runFontDownload();
 
 void loop(){
@@ -2131,13 +2133,15 @@ bool runChannelSync(){
 
 void networkTask(void*){
   for(;;){
-    if (channelSyncRequested || millis() - lastChannelSync >= CHANNEL_SYNC_INTERVAL) {
+    netBusy = true;
+    if (!otaActive && (channelSyncRequested || millis() - lastChannelSync >= CHANNEL_SYNC_INTERVAL)) {
       if (runChannelSync()) {
         channelSyncRequested = false;
         lastChannelSync = millis();
       }
     }
     runNetworkUpdate();
+    netBusy = false;
     // sleep until the next interval or until requestUpdate()
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TW_UPDATE_INTERVAL));
   }
@@ -3703,6 +3707,7 @@ void runFontDownload(){
   String url = fontUrl();
   DEBUG_I.printf("[Font] Downloading %s\n", url.c_str());
   otaActive = true; // pauses the network task
+  waitForNetworkIdle();
   drawMessageScreen("Font update", ST77XX_CYAN, "Downloading font.bin");
   drawUpdateProgress(0);
   String error = downloadFontBin(url);
@@ -3717,6 +3722,17 @@ void runFontDownload(){
     fontDownloadWanted = true;
   }
   restoreDisplay();
+}
+
+// An HTTPS connection needs about 45 KB: two at once do not fit. Font
+// download and online update set otaActive (the network task starts nothing
+// new) and then wait for the network task's current request to finish.
+volatile bool netBusy = false;   // the network task is in a request (Twitch, logos, emoji, CJK)
+void waitForNetworkIdle(){
+  for(unsigned long t0 = millis(); netBusy && millis() - t0 < 60000;){
+    feedLoopWDT();
+    delay(50);
+  }
 }
 
 // Before an update writes the free firmware slot: wait until a CJK piece
@@ -3734,6 +3750,7 @@ void runInstall(){
   DEBUG_I.printf("[OTA] Installing %s from %s\n", installVersion.c_str(), installUrl.c_str());
   otaActive = true; // pauses the network task
   waitForCjkSlot();
+  waitForNetworkIdle();
   restoreDisplayAt = 0;
   String title = "Downloading " + installVersion;
   drawMessageScreen("Firmware update", ST77XX_CYAN, title.c_str());

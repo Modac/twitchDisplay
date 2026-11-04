@@ -573,6 +573,9 @@ int main(){
     CHECK(std::equal(g_fontBin.begin(), g_fontBin.end(), g_fontData.begin()) && g_mmaps == 1);
     reset(); setResponse({{0,"A"}}); loopWithUpdate(); CHECK(isTitleDisplaying && !titleText.builtin); runUntilTitleDone();
 
+    printf("    waits for a running network request (two HTTPS connections do not fit)\n");
+    { netBusy = true; unsigned long t0 = g_millis; waitForNetworkIdle(); CHECK(g_millis - t0 >= 60000);   // gives up after a minute
+      netBusy = false; t0 = g_millis; waitForNetworkIdle(); CHECK(g_millis - t0 < 10); }
     printf("    download fails: built-in font, next try in an hour\n");
     g_fontData[1000] ^= 1; openFont();
     g_responses.push_back({404, "Not Found"}); loop();
