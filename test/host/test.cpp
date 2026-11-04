@@ -38,6 +38,7 @@ std::map<std::string,std::string> g_args, g_respHeaders; std::map<std::string, s
 std::string g_serialOut;
 esp_partition_t g_spiffs{"spiffs", 0x20000}; std::vector<uint8_t> g_flashData(0x20000, 0xFF); int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
 std::vector<TextBox> g_textBoxes;
+uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
 int g_dnsStarted = 0; bool g_bootPressed = false; std::vector<std::string> g_scan; std::string g_beginSsid, g_beginPw, g_apSsid, g_apPw; int g_apStations = 0;
 bool contains(const std::string& h, const std::string& n){ return h.find(n) != std::string::npos; }
 bool throwsRestart(std::function<void()> f){ try { f(); } catch(const char*) { return true; } return false; }
@@ -700,6 +701,28 @@ int main(){
 
     g_nvs.erase("logos"); std::fill(g_flashData.begin(), g_flashData.end(), 0xFF); loadLogoIndex(netLogoIndex);
     g_nvs["config"].erase("chcache"); loadConfig(); buildChannels(); assignLogoSlots(); reset(); }
+
+  printf("T42 display: the emulator reproduces Adafruit's rotation table\n");
+  { // the emulator's MADCTL model must reproduce Adafruit's rotation table:
+    // a point in rotation m is the same memory cell as in rotation 0 under GFXcanvas' rotation formula
+    auto cellOf = [](int rot, int x, int y){
+      tft.setRotation(rot); uint16_t marker = 0xBEEF; tft.setAddrWindow(x, y, 1, 1);
+      for(auto& row : g_gram) for(auto& v : row) if(v == marker) v = 0;
+      tft.writePixels(&marker, 1);
+      for(int Y = 0; Y < 320; Y++) for(int X = 0; X < 240; X++) if(g_gram[Y][X] == marker) return std::make_pair(X, Y);
+      return std::make_pair(-1, -1); };
+    bool consistent = true;
+    for(auto pt : std::vector<std::pair<int,int>>{{0,0},{319,0},{0,169},{319,169},{100,37},{11,92}}){
+      int x = pt.first, y = pt.second;                                        // landscape point (rotation 1 / 3)
+      if(cellOf(1, x, y) != cellOf(0, 169 - y, x)) consistent = false;
+      if(cellOf(3, x, y) != cellOf(0, y, 319 - x)) consistent = false;
+      int px = std::min(x, 169), py = std::min(y * 2, 319);                  // portrait point (rotation 2)
+      if(cellOf(2, px, py) != cellOf(0, 169 - px, 319 - py)) consistent = false;
+    }
+    CHECK(consistent);
+    tft.setRotation(1); CHECK(g_madctl == (ST77XX_MADCTL_MY | ST77XX_MADCTL_MV));
+
+    reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");
   g_serialOut.clear();
