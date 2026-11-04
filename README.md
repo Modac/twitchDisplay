@@ -209,7 +209,10 @@ logos, and its Status page says that the USB flash is needed.
 ## Releases and online update
 
 GitHub builds the firmware on every push to this branch (download it from the
-run's *Artifacts*). Pushing a version tag publishes a release:
+run's *Artifacts*). A release is published either by running the workflow
+manually with a version (GitHub > Actions > Build firmware > Run workflow on
+`platform/platformio`, version e.g. `v1.0.1`: it tags the newest commit
+itself), or by pushing a version tag:
 
 ```bash
 git tag v1.0.0

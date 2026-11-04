@@ -4,6 +4,9 @@
 # firmware.bin, which the display's "Online update" installs, and font.bin
 # (fonts/font.bin, built by tools/make_fonts.py), which it downloads when its
 # font partition lacks it.
+# A manual run ("Run workflow", or the API) with a version (e.g. v1.0.1) on
+# the PlatformIO branch tags its newest commit itself and publishes the
+# release the same way, without pushing a tag by hand.
 name: Build firmware
 
 on:
@@ -13,6 +16,11 @@ on:
   pull_request:
     branches: [platform/platformio]
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (vX.Y.Z): tags the newest commit and publishes the release; empty = build only'
+        required: false
+        type: string
 
 permissions:
   contents: write # create releases for version tags
@@ -20,10 +28,22 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # the release to publish: a pushed version tag, or the version of a manual run
+      RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # tags for the version number (git describe)
+
+      - name: Tag the release (manual run with a version)
+        if: github.event_name == 'workflow_dispatch' && inputs.version != ''
+        run: |
+          [[ "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "The version must look like v1.2.3"; exit 1; }
+          [ "$GITHUB_REF" = "refs/heads/platform/platformio" ] || { echo "Releases are made from platform/platformio"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$RELEASE" >/dev/null; then echo "$RELEASE exists already"; exit 1; fi
+          git tag "$RELEASE"
+          git push origin "refs/tags/$RELEASE"
 
       - uses: actions/setup-python@v5
         with:
@@ -61,16 +81,16 @@ jobs:
             fonts/font.bin
 
       - name: Check that the firmware version matches the tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: test "$(git describe --always --tags --dirty)" = "$GITHUB_REF_NAME"
+        if: env.RELEASE != ''
+        run: test "$(git describe --always --tags --dirty)" = "$RELEASE"
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.RELEASE != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE" \
             .pio/build/twitchDisplay/firmware.bin \
             .pio/build/twitchDisplay/firmware-merged.bin \
             fonts/font.bin \
-            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+            --title "$RELEASE" --generate-notes --verify-tag
