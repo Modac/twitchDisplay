@@ -1,0 +1,4 @@
+build/
+*.html
+# fake test credentials of the simulation (the root .gitignore excludes every secrets.h)
+!stubs/secrets.h
