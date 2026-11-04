@@ -38,7 +38,7 @@ std::map<std::string,std::string> g_args, g_respHeaders; std::map<std::string, s
 std::string g_serialOut;
 esp_partition_t g_spiffs{"spiffs", 0x20000}; std::vector<uint8_t> g_flashData(0x20000, 0xFF); int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
 std::vector<TextBox> g_textBoxes;
-uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
+int g_panelFrameRate = -1; uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
 int g_dnsStarted = 0; bool g_bootPressed = false; std::vector<std::string> g_scan; std::string g_beginSsid, g_beginPw, g_apSsid, g_apPw; int g_apStations = 0;
 bool contains(const std::string& h, const std::string& n){ return h.find(n) != std::string::npos; }
 bool throwsRestart(std::function<void()> f){ try { f(); } catch(const char*) { return true; } return false; }
@@ -154,7 +154,7 @@ int main(){
   CHECK(frame(4)==ST77XX_GREEN); CHECK(titleInRow(0));
   setResponse({{1,"B"},{2,"C"},{3,"D"},{4,"E2"}}); loopWithUpdate();
   CHECK(isTitleDisplaying && channelTitleInfo.channel==&channels[4] && channelTitleInfo.slot==3);
-  CHECK(channelTitleInfo.textOffset==1 && channelTitleInfo.repeats==0); // restarted
+  CHECK(channelTitleInfo.textOffset==0 && channelTitleInfo.repeats==0 && titleFrames==1); // restarted from the first character
   CHECK(tileIsPic(0,1)); CHECK(tileIsPic(1,2)); CHECK(tileIsPic(2,3)); CHECK(tileIsPic(3,4));
   CHECK(frame(3)==ST77XX_GREEN); CHECK(frame(4)==ST77XX_BLACK); CHECK(titleInRow(1));
 
@@ -747,6 +747,37 @@ int main(){
     CHECK(g_writeOrder.size() >= (size_t)TITLE_WIDTH * 64 && g_writeOrder[0] == std::make_pair(GRID_X0, (int)rowY(1)) && g_writeOrder[1] == std::make_pair(GRID_X0, (int)rowY(1) + 1));
     runUntilTitleDone();
     CHECK(tileIsPic(0,0) && tileIsPic(1,4) && tileIsFill(2,0));
+    reset(); }
+
+  printf("T43 title scrolling: fixed frame rate, even steps, constant speed\n");
+  { CHECK(g_panelFrameRate == PANEL_FRAME_RATE);                        // panel refresh set at boot
+    reset(); setResponse({{0,"A long title to scroll over the display"}}); loopWithUpdate();
+    CHECK(isTitleDisplaying && titleFrames == 1);
+    // one second: ~100 frames of 3 px each
+    std::vector<uint32_t> steps; uint32_t lastPixels = titlePixels, framesBefore = titleFrames;
+    unsigned long t0 = g_millis;
+    while(g_millis - t0 < 1000){ loopNoUpdate(1); if(titleFrames != framesBefore + steps.size()){ steps.push_back(titlePixels - lastPixels); lastPixels = titlePixels; } }
+    CHECK(steps.size() >= 98 && steps.size() <= 101);
+    bool even = true; for(auto st : steps) if(st != 3) even = false;
+    CHECK(even);                                                           // 3 px per frame, no 6 px jumps
+    CHECK(titlePixels >= 297 && titlePixels <= 303);                       // 300 px per second
+    printf("    a late frame catches up, the speed stays the same\n");
+    uint32_t p0 = titlePixels; unsigned long tStall = g_millis;
+    g_millis += 47;                                                        // e.g. a slow web request
+    loopNoUpdate(1);
+    CHECK(titlePixels - p0 >= 16 && titlePixels - p0 <= 18);              // (10 ms frame + 47 ms stall) * 300 px/s
+    t0 = g_millis; p0 = titlePixels;
+    while(g_millis - t0 < 500) loopNoUpdate(1);
+    CHECK(titlePixels - p0 >= 147 && titlePixels - p0 <= 153);
+    (void)tStall;
+    printf("    the title takes as long as the speed says\n");
+    reset(); setResponse({{0,"Exactly twenty chars"}}); loopWithUpdate();
+    t0 = g_millis; runUntilTitleDone();
+    unsigned long expectMs = (unsigned long)(channels[0].streamTitle.length() - 5) * CHAR_WIDTH * MAX_TITLE_REPEAT * 1000 / SCROLL_SPEED;
+    CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
+    CHECK(titleFrames >= expectMs / 10 - 5 && titleMaxGapUs <= 11000);
+    server.find("/", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap "));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");

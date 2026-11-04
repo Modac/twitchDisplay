@@ -160,6 +160,13 @@ CrlfSerial debugSerial;
 
 #define MAX_NUM_PICS 8
 
+// Title scrolling: frames at a fixed rate, position from the elapsed time, so
+// the speed stays even when a frame is late (the next one catches up)
+#define CHAR_WIDTH          (6*8)  // text size 8: 6 px per character * 8
+#define SCROLL_SPEED        300    // px per second (3 px per frame at 100 fps)
+#define FRAME_INTERVAL_US   10000  // 100 frames per second
+#define PANEL_FRAME_RATE    0x03   // ST7789 FRCTRL2: 0x03 = 99 Hz, close to the frame rate (0x0F = 60 Hz default)
+
 // Logo grid layout: 4 columns x 2 rows of 64x64 pics
 #define PIC_SIZE    64
 #define PIC_GAP     14
@@ -431,6 +438,10 @@ void setup(void) {
   tft.init(170, 320);           // Init ST7789 170x320
   tft.setRotation(1);
   tft.setSPISpeed(80000000);
+  {
+    uint8_t frameRate = PANEL_FRAME_RATE; // FRCTRL2
+    tft.sendCommand(0xC6, &frameRate, 1);
+  }
   
   tft.fillScreen(ST77XX_BLACK);
 
@@ -523,6 +534,7 @@ void drawThickRect(int16_t x, int16_t y, int16_t w, int16_t h,
 
 #define MAX_TITLE_REPEAT 2
 
+
 struct {
   channelInfo* channel;
   int8_t slot;              // slot of the channel when the title was (re)drawn
@@ -533,7 +545,15 @@ struct {
 
 bool isTitleDisplaying = false;
 
-uint8_t o_X = 0;
+uint8_t o_X = 0;                     // pixel offset within the first visible character
+unsigned long titleStartedUs = 0;    // micros() of the first frame
+uint32_t titlePixels = 0;            // pixels scrolled since the start
+unsigned long nextFrameUs = 0;       // micros() of the next frame
+bool titleCanvasValid = false;       // text_canvas shows the text from textOffset
+
+// statistics of the current / last title for the status page
+uint32_t titleFrames = 0;
+unsigned long titleLastFrameUs = 0, titleMaxGapUs = 0;
 
 // Green frame around the pic of the channel whose title is scrolling
 void drawTitleIndicator(){
@@ -549,8 +569,54 @@ void startTitle(channelInfo* channel){
   channelTitleInfo.textOffset = 0;
   channelTitleInfo.repeats = 0;
   o_X = 0;
+  titlePixels = 0;
+  titleStartedUs = nextFrameUs = micros();
+  titleCanvasValid = false;
+  titleFrames = 0;
+  titleMaxGapUs = 0;
   isTitleDisplaying = true;
   drawTitleIndicator();
+}
+
+void stopTitle();
+
+// Next character: the canvas is drawn from it on the next frame. After the
+// whole text has passed MAX_TITLE_REPEAT times the title ends.
+void advanceTitleCharacter(){
+  channelTitleInfo.textOffset = (channelTitleInfo.textOffset + 1) % (channelTitleInfo.displayTitle.length() - 5);
+  titleCanvasValid = false;
+  if(channelTitleInfo.textOffset == 0 && ++channelTitleInfo.repeats == MAX_TITLE_REPEAT) stopTitle();
+}
+
+// Draws the title frame for the current time (called from loop() when a frame is due)
+void drawTitleFrame(){
+  unsigned long now = micros();
+  bool first = titleFrames == 0;
+  uint32_t target = (uint32_t)((uint64_t)(now - titleStartedUs) * SCROLL_SPEED / 1000000);
+  uint32_t step = target - titlePixels;
+  titlePixels = target;
+  for(uint32_t moved = o_X + step; moved >= CHAR_WIDTH && isTitleDisplaying; moved -= CHAR_WIDTH){
+    advanceTitleCharacter();
+    o_X = (uint8_t)(moved - CHAR_WIDTH);
+    step = 0;
+  }
+  if(!isTitleDisplaying) return;
+  o_X += step;
+  // next frame on the fixed raster; after a long stall start a new one
+  nextFrameUs += FRAME_INTERVAL_US;
+  if((long)(now - nextFrameUs) > FRAME_INTERVAL_US) nextFrameUs = now + FRAME_INTERVAL_US;
+  if(!first && step == 0 && titleCanvasValid) return; // nothing moved
+  if(!titleCanvasValid){
+    text_canvas.fillScreen(ST77XX_BLACK);
+    text_canvas.setCursor(0,0);
+    text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
+    titleCanvasValid = true;
+  }
+  // the title scrolls over the row that does not contain the channel's pic
+  tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
+  if(!first && now - titleLastFrameUs > titleMaxGapUs) titleMaxGapUs = now - titleLastFrameUs;
+  titleLastFrameUs = now;
+  titleFrames++;
 }
 
 // Ends the title display and restores all pics (the title covers one row)
@@ -659,24 +725,7 @@ void loop(){
     // channel may have gone offline while it was queued
     if(next->isLive) startTitle(next);
   }
-  if(isTitleDisplaying){
-    if(!o_X){
-      text_canvas.fillScreen(ST77XX_BLACK);
-      text_canvas.setCursor(0,0);
-      text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
-      channelTitleInfo.textOffset++;
-      channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
-    }
-    // the title scrolls over the row that does not contain the channel's pic
-    tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
-    o_X = (o_X+6)%(6*8);
-
-    if (!o_X && channelTitleInfo.textOffset==0) {
-      if(++channelTitleInfo.repeats==MAX_TITLE_REPEAT){
-        stopTitle();
-      }
-    }
-  }
+  if(isTitleDisplaying && (long)(micros() - nextFrameUs) >= 0) drawTitleFrame();
 
 #ifdef DEBUG_UDP_LDR
   static unsigned long lastUdp = 0;
@@ -692,7 +741,14 @@ void loop(){
 #else
   (void)wifiConnected;
 #endif
-  delay(10);
+  if(isTitleDisplaying){
+    // sleep until the next title frame
+    long wait = (long)(nextFrameUs - micros());
+    if(wait >= 1000) delay(wait / 1000);
+    else if(wait > 0) delayMicroseconds(wait);
+  } else {
+    delay(10);
+  }
 }
 
 // ---------- Text conversion
@@ -1771,6 +1827,15 @@ void handleStatus(){
   b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB, largest block "
        + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024)) + " KB)</td></tr>";
   b += "<tr><td>Brightness sensor</td><td>" + String(ldr_avg) + "</td></tr>";
+  b += "<tr><td>Title scrolling</td><td>";
+  if(titleFrames < 2) b += "no title shown yet";
+  else {
+    unsigned long span = titleLastFrameUs - titleStartedUs;
+    char fps[16];
+    snprintf(fps, sizeof(fps), "%.1f", span ? (titleFrames - 1) * 1e6 / span : 0.0);
+    b += String(fps) + " fps, longest frame gap " + String((unsigned)(titleMaxGapUs / 1000)) + " ms";
+  }
+  b += "</td></tr>";
   b += "</table><form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
   sendPage("Status", b);
 }

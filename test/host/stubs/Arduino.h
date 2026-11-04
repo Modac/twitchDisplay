@@ -13,6 +13,7 @@ extern bool g_quiet;
 inline unsigned long millis(){ return g_millis; }
 inline unsigned long micros(){ return g_millis*1000UL; }
 inline void delay(unsigned long ms){ g_millis += ms; }
+inline void delayMicroseconds(unsigned long us){ g_millis += (us + 999) / 1000; }
 extern int g_analogReads;
 inline int analogRead(int){ g_analogReads++; return 2000; }
 inline void analogWrite(int,int){}

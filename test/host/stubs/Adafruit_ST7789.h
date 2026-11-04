@@ -36,6 +36,7 @@ extern uint16_t g_gram[320][240];      // controller memory [row Y][column X]
 extern uint8_t g_madctl;               // current MADCTL value
 extern bool g_recordWrites;            // record the screen position of every written pixel
 extern std::vector<std::pair<int,int>> g_writeOrder; // (x, y) in landscape, in write order
+extern int g_panelFrameRate;             // last FRCTRL2 (0xC6) value, -1 = never set
 
 class Adafruit_ST7789 {
   uint8_t cmd = 0; std::vector<uint8_t> data;
@@ -72,6 +73,7 @@ public:
   void spiWrite(uint8_t b){ data.push_back(b); execute(); }
   void writePixels(uint16_t* p, uint32_t n, bool = true, bool = false){ if(!writing){ fprintf(stderr, "pixels without RAMWR\n"); return; } for(uint32_t k = 0; k < n; k++) pixel(p[k]); }
   void startWrite(){} void endWrite(){}
+  void sendCommand(uint8_t command, const uint8_t* d, uint8_t n){ writeCommand(command); for(uint8_t i = 0; i < n; i++) spiWrite(d[i]); if(command == 0xC6 && n == 1) g_panelFrameRate = d[0]; }
   // same as Adafruit_ST7789::setRotation() for a 170x320 panel
   void setRotation(uint8_t m){
     rotation = m & 3;
