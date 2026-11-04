@@ -425,6 +425,60 @@ int main(){
     g_nvs["config"].erase("repeatmin"); loadConfig(); CHECK(config.titleRepeatMinutes == 5);
     reset(); }
 
+  printf("T47 web login can be switched off on the Settings page\n");
+  { CHECK(config.requireLogin);                                                // default: password needed
+    g_authOk = false; g_authChallenges = 0;
+    server.find("/", HTTP_GET)->fn(); CHECK(g_lastCode == 401 && g_authChallenges == 1);
+    server.find("/settings", HTTP_GET)->fn();
+    CHECK(g_lastCode == 401);
+    g_authOk = true;
+    server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "name=\"login\" value=\"1\" checked>Require the password") && contains(g_lastBody, "name=\"login_form\""));
+    server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "Web login"));
+    printf("    switched off: saved, pages and uploads without password\n");
+    auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
+    rebootAt = 0;
+    post({{"login_form", "1"}}); CHECK(rebootAt != 0 && g_nvs["config"]["login"] == "0"); rebootAt = 0;
+    loadConfig(); CHECK(!config.requireLogin);
+    g_authOk = false; g_authChallenges = 0;
+    server.find("/", HTTP_GET)->fn();
+    CHECK(g_lastCode == 200 && g_authChallenges == 0 && contains(g_lastBody, "Web login</td><td class=\"err\">off: anyone on the network"));
+    server.find("/settings", HTTP_GET)->fn(); CHECK(g_lastCode == 200 && contains(g_lastBody, "name=\"login\" value=\"1\">Require"));
+    server.find("/update/check", HTTP_GET)->fn(); CHECK(g_authChallenges == 0);
+    g_updateBegins = 0; g_updateEnds = 0; g_flashed.clear(); rebootAt = 0; otaActive = false;
+    simulateUpload(fw);
+    CHECK(g_authChallenges == 0 && g_flashed == fw && g_updateEnds == 1 && rebootAt != 0);
+    rebootAt = 0; otaActive = false;
+    printf("    the settings form keeps the posted choice after an error\n");
+    post({{"login_form", "1"}, {"login", "1"}, {"repeatmin", "abc"}});
+    CHECK(contains(g_lastBody, "Title repeat") && contains(g_lastBody, "value=\"1\" checked>Require") && g_nvs["config"]["login"] == "0");
+    printf("    switched on again\n");
+    post({{"login_form", "1"}, {"login", "1"}}); CHECK(g_nvs["config"]["login"] == "1"); rebootAt = 0;
+    loadConfig(); CHECK(config.requireLogin);
+    server.find("/", HTTP_GET)->fn(); CHECK(g_lastCode == 401 && g_authChallenges == 1);
+    g_authOk = true; g_nvs["config"].erase("login"); loadConfig(); CHECK(config.requireLogin); }
+
+  printf("T48 status page button shows all live titles once more\n");
+  { reset();
+    server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "/titles/show"));   // nobody live: no button
+    setResponse({{0,"Title zero"},{2,"Title two"},{5,"Title five"}}); loopWithUpdate();
+    for(int k = 0; k < 3; k++){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(!isTitleDisplaying && titleChangeQueue.empty());
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "action=\"/titles/show\"><p><button>Show all titles on the display"));
+    g_authOk = false; g_authChallenges = 0; server.find("/titles/show", HTTP_POST)->fn();
+    CHECK(g_authChallenges == 1 && titleChangeQueue.empty()); g_authOk = true;
+    server.find("/titles/show", HTTP_POST)->fn();
+    CHECK(g_lastCode == 303 && g_respHeaders["Location"] == "/");
+    std::vector<channelInfo*> shown;
+    for(int k = 0; k < 3; k++){ loopNoUpdate(1); CHECK(isTitleDisplaying); shown.push_back(channelTitleInfo.channel); runUntilTitleDone(); }
+    CHECK(shown[0] == &channels[0] && shown[1] == &channels[2] && shown[2] == &channels[5]);
+    loopNoUpdate(1); CHECK(!isTitleDisplaying);                               // each once
+    printf("    pressed while a title scrolls: that one is not repeated, the others follow\n");
+    server.find("/titles/show", HTTP_POST)->fn(); loopNoUpdate(1); CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[0]);
+    server.find("/titles/show", HTTP_POST)->fn();                             // pressed twice: no duplicates
+    CHECK(titleChangeQueue.size() == 2 && titleChangeQueue[0] == &channels[2] && titleChangeQueue[1] == &channels[5]);
+    reset(); }
+
   printf("T23 new firmware confirmed only after 60 s online\n");
   appPendingVerify = true; g_otaState = ESP_OTA_IMG_PENDING_VERIFY; g_markedValid = 0; g_wifiUp = true;
   for(int i=0;i<3000;i++) loop();              // ~30 s

@@ -121,17 +121,20 @@ display keeps showing the last known live channels while it is visible.
 ## Web interface
 
 Open `http://twitchdisplay.fritz.box/` (or `http://twitchdisplay.local/`) and
-log in as `admin` with your web password.
+log in as `admin` with your web password. The login can be switched off on the
+Settings page; then anyone on your WiFi can use the web interface (stored
+passwords stay hidden, uploads from PlatformIO still need the password).
 
-- **Status**: live channels, last Twitch update, firmware version, uptime,
-  WiFi, memory, restart button
+- **Status**: live channels (with a button that scrolls all their titles once
+  more), last Twitch update, firmware version, uptime, WiFi, memory, restart
+  button
 - **Update**: *Online update* checks the newest GitHub release and installs
   it with one click; or upload a `firmware.bin` from the browser (phone or PC). The
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
-- **Settings**: WiFi, Twitch credentials, channel list, web password, reset
-  to defaults
+- **Settings**: WiFi, Twitch credentials, channel list, title repeat, web
+  password and login, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on
 probation" and only confirms itself after it has been online for 60 s. If it

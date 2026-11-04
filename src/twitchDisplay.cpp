@@ -283,6 +283,7 @@ struct Config {
   String webPassword;
   String channelList;  // comma separated logins (or numeric ids), empty = default channels
   uint16_t titleRepeatMinutes;  // show a live channel's title again after this many minutes without a title, 0 = off
+  bool requireLogin;   // web interface needs the password (off: anyone on the network may use it)
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -302,6 +303,7 @@ void loadConfig(){
   config.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
   config.channelList  = prefs.getString("channels", "");
   config.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
+  config.requireLogin = prefs.getString("login", "1") != "0";
   prefs.end();
 }
 
@@ -447,6 +449,12 @@ struct {
 } upload;
 unsigned long rebootAt = 0;        // millis() of a scheduled restart, 0 = none
 void checkUploadTimeout();
+
+// true if the request may use the web interface: the login is switched off
+// on the Settings page, or the request carries the right password
+bool loginOk(){
+  return !config.requireLogin || server.authenticate(WEB_USER, config.webPassword.c_str());
+}
 
 // Online update requested on the web page; runs in loop() (blocking, ~20 s)
 bool installRequested = false;
@@ -1747,7 +1755,7 @@ void handleUploadChunk(){
   HTTPUpload& up = server.upload();
   switch(up.status){
     case UPLOAD_FILE_START:
-      upload.authorized = setupMode || server.authenticate(WEB_USER, config.webPassword.c_str()); // setup mode: hotspot password protects
+      upload.authorized = setupMode || loginOk(); // setup mode: hotspot password protects
       if(!upload.authorized) return;
       upload.pieces = server.hasArg("offset");
       upload.offset = upload.pieces ? (size_t)server.arg("offset").toInt() : 0;
@@ -1829,7 +1837,7 @@ void sendJson(int code, bool ok, const String& message){
 
 // Called by the web server after the whole upload has been received
 void handleUploadDone(){
-  if(!upload.authorized || !(setupMode || server.authenticate(WEB_USER, config.webPassword.c_str()))){
+  if(!upload.authorized || !(setupMode || loginOk())){
     return server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
   }
   if(upload.error.length() == 0 && !upload.headerChecked) failUpload("No file received.");
@@ -1885,7 +1893,7 @@ void sendPage(const char* title, const String& body){
 }
 
 bool checkAuth(){
-  if(server.authenticate(WEB_USER, config.webPassword.c_str())) return true;
+  if(loginOk()) return true;
   server.requestAuthentication(DIGEST_AUTH, WEB_REALM);
   return false;
 }
@@ -1902,6 +1910,7 @@ void handleStatus(){
     b += "<p><b>" + htmlEscape(ch.name.empty() ? ch.id : ch.name) + "</b><br><span class=\"muted\">" + htmlEscape(ch.webTitle) + "</span></p>";
   }
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
+  else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
   b += "</div>";
 
   b += "<div class=\"card\"><h2>Channels</h2><table>";
@@ -1939,6 +1948,7 @@ void handleStatus(){
   b += "<tr><td>Built</td><td>" __DATE__ " " __TIME__ "</td></tr>";
   b += String("<tr><td>Partition</td><td>") + (running ? running->label : "?") + ", " + otaStateName() + "</td></tr>";
   b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
+  if(!config.requireLogin) b += "<tr><td>Web login</td><td class=\"err\">off: anyone on the network can use this page</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
   b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
   b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB, largest block "
@@ -1984,6 +1994,19 @@ void handleLogoReload(){
   server.send(303, "text/plain", "");
 }
 
+// "Show all titles": every live channel's title scrolls once more, in the
+// order of the channel list (after a title that is scrolling right now)
+void handleShowTitles(){
+  if(!checkAuth()) return;
+  for(auto& ch : channels){
+    if(!ch.isLive || ch.slotNum < 0 || ch.streamTitle.length() <= 5) continue;
+    if(isTitleDisplaying && channelTitleInfo.channel == &ch) continue;
+    if(std::find(titleChangeQueue.begin(), titleChangeQueue.end(), &ch) == titleChangeQueue.end()) titleChangeQueue.push_back(&ch);
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 void handleReboot(){
   if(!checkAuth()) return;
   sendPage("Restart", "<div class=\"card\"><p>Restarting... <a href=\"/\">Reload</a> in a few seconds.</p></div>");
@@ -2003,6 +2026,7 @@ void setupWeb(){
   server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/logos/reload", HTTP_POST, handleLogoReload);
+  server.on("/titles/show", HTTP_POST, handleShowTitles);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);
@@ -2151,6 +2175,13 @@ void sendSettingsPage(const String& message, bool isError){
   b += "<p class=\"hint\">Login user is <b>admin</b>. The password is also used for uploads from PlatformIO.</p>";
   b += secretField("New password", "webpw", config.webPassword.length() > 0, nullptr, false);
   b += "<label>Repeat new password<input type=\"password\" name=\"webpw2\" autocomplete=\"new-password\"></label>";
+  {
+    bool require = server.hasArg("login_form") ? server.hasArg("login") : config.requireLogin;
+    b += String("<input type=\"hidden\" name=\"login_form\" value=\"1\"><label class=\"check\"><input type=\"checkbox\" name=\"login\" value=\"1\"")
+         + (require ? " checked" : "") + ">Require the password for the web interface</label>";
+    b += "<p class=\"hint\">Without it, anyone on your WiFi can open these pages, change the settings and install firmware "
+         "(stored passwords stay hidden). Uploads from PlatformIO always need the password.</p>";
+  }
 
   b += "<p><button>Save and restart</button></p></form></div>";
 
@@ -2218,6 +2249,7 @@ void handleSettingsSave(){
     prefs.putString("channels", list);
   }
   if(repeatSubmitted) prefs.putString("repeatmin", String(repeatMinutes));
+  if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back
