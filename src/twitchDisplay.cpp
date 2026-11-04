@@ -200,6 +200,7 @@ struct Config {
   String clientSecret;
   String token;
   String webPassword;
+  String channelList;  // comma separated logins (or numeric ids), empty = default channels
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -214,6 +215,7 @@ void loadConfig(){
   config.clientSecret = prefs.getString("secret", TWITCH_CLIENT_SECRET);
   config.token        = prefs.getString("token", TWITCH_TOKEN);
   config.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
+  config.channelList  = prefs.getString("channels", "");
   prefs.end();
 }
 
@@ -242,33 +244,57 @@ void startSetupMode(const char* reason, bool retryLater);
 bool connectWiFi();
 void drawMessageScreen(const char* title, uint16_t color, const char* message);
 void assignLogoSlots();
+void buildChannels();
 void networkTask(void*);
 
 struct channelInfo {
-  std::string id;
-  bool isLive;
+  std::string id;           // Twitch user id, empty until the name is resolved
+  bool isLive = false;
   std::string streamTitle;  // display charset, used for the scrolling title
-  int8_t slotNum;
-  const uint16_t* pic;
-  std::string name;         // display name (UTF-8) for the web interface
+  int8_t slotNum = -1;
+  const uint16_t* pic = nullptr;
+  std::string name;         // display name (UTF-8)
   std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
   int8_t logoSlot = -1;     // slot of the downloaded logo in flash, -1 = none
+  std::string login;        // Twitch login (channel name in the URL)
 };
 
+#define MAX_CHANNELS 16
+
+// Channels until a list is saved on the Settings page (Twitch user ids):
 // lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
-std::array<channelInfo, 10> channels = {{
-  {"761017145", false, "", -1, epd_bitmap_lidi},
-  {"21991090", false, "", -1, epd_bitmap_pietsmiet},
-  {"73437396", false, "", -1, epd_bitmap_bonjwa},
-  {"1024088182", false, "", -1, epd_bitmap_bonjwachill},
-  {"12875057", false, "", -1, epd_bitmap_gronkh},
-//  {"106159308", false, "", -1, epd_bitmap_gronkh}, gronkhtv
-  {"16064695", false, "", -1, epd_bitmap_dhalucard},
-  {"55898523", false, "", -1, epd_bitmap_trilluxe},
-  {"38770961", false, "", -1, epd_bitmap_dracon},
-  {"172376071", false, "", -1, epd_bitmap_maxim},
-  {"549536744", false, "", -1, epd_bitmap_finanzfluss}
-}};
+static const char* const DEFAULT_CHANNEL_IDS[] = {
+  "761017145", "21991090", "73437396", "1024088182", "12875057",
+  "16064695", "55898523", "38770961", "172376071", "549536744"
+};
+
+// Built-in pictures of the default channels
+const uint16_t* builtinPic(const std::string& id){
+  static const struct { const char* id; const uint16_t* pic; } pics[] = {
+    {"761017145", epd_bitmap_lidi}, {"21991090", epd_bitmap_pietsmiet}, {"73437396", epd_bitmap_bonjwa},
+    {"1024088182", epd_bitmap_bonjwachill}, {"12875057", epd_bitmap_gronkh}, {"16064695", epd_bitmap_dhalucard},
+    {"55898523", epd_bitmap_trilluxe}, {"38770961", epd_bitmap_dracon}, {"172376071", epd_bitmap_maxim},
+    {"549536744", epd_bitmap_finanzfluss}
+  };
+  for(const auto& p : pics) if(id == p.id) return p.pic;
+  return nullptr;
+}
+
+// Built once at boot from the settings and never resized afterwards
+// (titleChangeQueue keeps pointers into it)
+std::vector<channelInfo> channels;
+
+// A configured channel as the network task sees it
+struct ChannelRef {
+  std::string id;        // empty until resolved
+  std::string login;     // empty if configured by id and not resolved yet
+  std::string name;      // display name
+  std::string avatarUrl; // profile_image_url from Twitch
+  bool found = false;    // Twitch knows this channel (set by fetchUsers())
+};
+
+std::vector<ChannelRef> netChannels;      // network task's copy of the channel list
+std::vector<std::string> unknownChannels; // loop(): configured names Twitch does not know
 
 uint16_t live_num = 0;
 
@@ -287,6 +313,14 @@ struct StreamInfo {
 struct LiveUpdate {
   FetchResult result;
   std::vector<StreamInfo> streams;
+};
+
+// Message from the network task to loop() (through updateQueue)
+struct NetMessage {
+  enum class Type { Live, Channels } type = Type::Live;
+  LiveUpdate live;                  // Live: result of a stream update
+  std::vector<ChannelRef> channels; // Channels: resolved list, same order as configured
+  std::vector<std::string> unknown; // Channels: configured names Twitch does not know
 };
 
 TaskHandle_t netTask = nullptr;
@@ -364,6 +398,7 @@ void setup(void) {
 
   loadConfig();
   twitchToken = config.token;
+  buildChannels();
   assignLogoSlots();
 
   if(setupRequested == SETUP_REQUEST_MAGIC){
@@ -397,7 +432,7 @@ void setup(void) {
 
   // Twitch requests run in their own task so they don't block scrolling;
   // results come back to loop() through updateQueue
-  updateQueue = xQueueCreate(2, sizeof(LiveUpdate*));
+  updateQueue = xQueueCreate(4, sizeof(NetMessage*));
   xTaskCreate(networkTask, "network", NET_TASK_STACK, nullptr, NET_TASK_PRIORITY, &netTask);
 
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
@@ -512,6 +547,7 @@ bool handleWiFi(){
 }
 
 void applyLiveUpdate(const LiveUpdate& update);
+void applyChannels(const NetMessage& msg);
 
 void restoreDisplay();
 void confirmFirmwareWhenStable(bool wifiConnected);
@@ -560,10 +596,11 @@ void loop(){
     return;
   }
 
-  LiveUpdate* update;
-  if(xQueueReceive(updateQueue, &update, 0) == pdTRUE){
-    applyLiveUpdate(*update);
-    delete update;
+  NetMessage* msg;
+  if(xQueueReceive(updateQueue, &msg, 0) == pdTRUE){
+    if(msg->type == NetMessage::Type::Live) applyLiveUpdate(msg->live);
+    else applyChannels(*msg);
+    delete msg;
   }
 
   while(!isTitleDisplaying && !titleChangeQueue.empty()) {
@@ -712,11 +749,15 @@ bool requestAppToken(){
 FetchResult fetchLiveChannels(LiveUpdate& update){
   // Could maybe be done as constexpr??
   String url = String("https://api.twitch.tv/helix/streams?");
-  for (auto& channel : channels) {
+  int ids = 0;
+  for (auto& channel : netChannels) {
+    if (channel.id.empty()) continue; // name not resolved yet
     url += "user_id=";
     url += channel.id.c_str();
     url += "&";
+    ids++;
   }
+  if (ids == 0) return FetchResult::Ok; // nothing to ask for
 
   DEBUG_I.printf("[%s] Update live channels with url: %s\n", DEBUG_TAG, url.c_str());
 
@@ -777,7 +818,8 @@ void runNetworkUpdate(){
   if (WiFi.status() != WL_CONNECTED) return; // handleWiFi() requests an update when it is back
   if (otaActive) return;                      // firmware upload in progress
 
-  LiveUpdate* update = new LiveUpdate();
+  NetMessage* msg = new NetMessage();
+  LiveUpdate* update = &msg->live;
   bool canRenewToken = config.clientSecret.length() > 0;
   if (!config.hasTwitchCredentials()) {
     update->result = FetchResult::NoCredentials;
@@ -790,11 +832,96 @@ void runNetworkUpdate(){
       update->result = fetchLiveChannels(*update);
     }
   }
-  if (xQueueSend(updateQueue, &update, portMAX_DELAY) != pdTRUE) delete update;
+  if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
+}
+
+// Looks the channels up on Twitch (by id, or by login if the id is not known
+// yet) and fills in id, login, display name and avatar URL
+FetchResult fetchUsers(std::vector<ChannelRef>& refs){
+  String url = "https://api.twitch.tv/helix/users?";
+  int n = 0;
+  for (auto& r : refs) {
+    r.found = false;
+    if (!r.id.empty()) { url += "id=" + String(r.id.c_str()) + "&"; n++; }
+    else if (!r.login.empty()) { url += "login=" + urlEncode(r.login.c_str()) + "&"; n++; }
+  }
+  if (n == 0) return FetchResult::Ok;
+
+  DEBUG_I.printf("[%s] Looking up channels: %s\n", DEBUG_TAG, url.c_str());
+  HTTPClient http;
+  http.begin(tlsClient, url);
+  commonHttpInit(http);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    DEBUG_W.printf("[HTTP] Channel lookup failed, error: %s\n",
+      (httpCode<=0) ? http.errorToString(httpCode).c_str() : String(httpCode).c_str());
+    http.end();
+    return (httpCode == HTTP_CODE_UNAUTHORIZED) ? FetchResult::Unauthorized : FetchResult::Failed;
+  }
+  JsonDocument filter;
+  JsonObject user = filter["data"].add<JsonObject>();
+  user["id"] = true;
+  user["login"] = true;
+  user["display_name"] = true;
+  user["profile_image_url"] = true;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err || !doc["data"].is<JsonArray>()) return FetchResult::Failed;
+  for (JsonObject u : doc["data"].as<JsonArray>()) {
+    std::string id = u["id"] | "", login = u["login"] | "";
+    for (auto& r : refs) {
+      if ((!r.id.empty() && r.id == id) || (r.id.empty() && !login.empty() && r.login == login)) {
+        r.id = id;
+        r.login = login;
+        r.name = u["display_name"] | "";
+        r.avatarUrl = u["profile_image_url"] | "";
+        r.found = true;
+      }
+    }
+  }
+  return FetchResult::Ok;
+}
+
+void saveChannelCache(const std::vector<ChannelRef>& refs);
+
+#define CHANNEL_SYNC_INTERVAL (24UL*60*60*1000) // look the channels up again once a day
+bool channelSyncRequested = true;               // first lookup right after the start
+unsigned long lastChannelSync = 0;
+
+// Resolves the channel list and hands it to loop(). False if it has to be retried.
+bool runChannelSync(){
+  if (WiFi.status() != WL_CONNECTED || otaActive || !config.hasTwitchCredentials()) return false;
+  std::vector<ChannelRef> refs = netChannels;
+  bool canRenewToken = config.clientSecret.length() > 0;
+  if (canRenewToken && twitchToken.isEmpty()) requestAppToken();
+  FetchResult result = fetchUsers(refs);
+  if (canRenewToken && result == FetchResult::Unauthorized && requestAppToken()) {
+    refs = netChannels;
+    result = fetchUsers(refs);
+  }
+  if (result != FetchResult::Ok) return false;
+
+  NetMessage* msg = new NetMessage();
+  msg->type = NetMessage::Type::Channels;
+  for (const auto& r : refs) {
+    if (!r.found) msg->unknown.push_back(r.login.empty() ? r.id : r.login);
+  }
+  msg->channels = refs;
+  netChannels = refs;
+  saveChannelCache(refs);
+  if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
+  return true;
 }
 
 void networkTask(void*){
   for(;;){
+    if (channelSyncRequested || millis() - lastChannelSync >= CHANNEL_SYNC_INTERVAL) {
+      if (runChannelSync()) {
+        channelSyncRequested = false;
+        lastChannelSync = millis();
+      }
+    }
     runNetworkUpdate();
     // sleep until the next interval or until requestUpdate()
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(TW_UPDATE_INTERVAL));
@@ -955,9 +1082,110 @@ void redrawLiveChannelPics(int8_t row){
   }
 }
 
+// ---------- Channel list
+
+bool isNumeric(const std::string& s){
+  if (s.empty()) return false;
+  for (char c : s) if (!isdigit((unsigned char)c)) return false;
+  return true;
+}
+
+// The configured channels: the saved list (logins, or numeric user ids) or the defaults
+std::vector<ChannelRef> configuredChannels(){
+  std::vector<ChannelRef> refs;
+  if (config.channelList.length()) {
+    std::string list = config.channelList.c_str();
+    size_t start = 0;
+    while (start <= list.size()) {
+      size_t end = list.find(',', start);
+      if (end == std::string::npos) end = list.size();
+      std::string entry = list.substr(start, end - start);
+      if (!entry.empty() && refs.size() < MAX_CHANNELS) {
+        ChannelRef r;
+        if (isNumeric(entry)) r.id = entry; else r.login = entry;
+        refs.push_back(r);
+      }
+      start = end + 1;
+    }
+  }
+  if (refs.empty()) {
+    for (const char* id : DEFAULT_CHANNEL_IDS) { ChannelRef r; r.id = id; refs.push_back(r); }
+  }
+  return refs;
+}
+
+// Fills in what the last lookup found ("id\tlogin\tname" lines), so the display
+// works right away after a restart, before Twitch has been asked again
+void applyChannelCache(std::vector<ChannelRef>& refs){
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, true);
+  std::string cache = prefs.getString("chcache", "").c_str();
+  prefs.end();
+  size_t start = 0;
+  while (start < cache.size()) {
+    size_t end = cache.find('\n', start);
+    if (end == std::string::npos) end = cache.size();
+    std::string line = cache.substr(start, end - start);
+    size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+    if (t2 != std::string::npos) {
+      std::string id = line.substr(0, t1), login = line.substr(t1 + 1, t2 - t1 - 1), name = line.substr(t2 + 1);
+      for (auto& r : refs) {
+        if ((!r.id.empty() && r.id == id) || (r.id.empty() && r.login == login)) { r.id = id; r.login = login; r.name = name; }
+      }
+    }
+    start = end + 1;
+  }
+}
+
+void saveChannelCache(const std::vector<ChannelRef>& refs){
+  std::string cache;
+  for (const auto& r : refs) {
+    if (r.found) cache += r.id + "\t" + r.login + "\t" + r.name + "\n";
+  }
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, false);
+  if (prefs.getString("chcache", "") != String(cache.c_str())) prefs.putString("chcache", cache.c_str());
+  prefs.end();
+}
+
+// Builds the channel list at boot (before the network task starts)
+void buildChannels(){
+  std::vector<ChannelRef> refs = configuredChannels();
+  applyChannelCache(refs);
+  channels.clear();
+  channels.reserve(MAX_CHANNELS);
+  for (const auto& r : refs) {
+    channelInfo ch;
+    ch.id = r.id;
+    ch.login = r.login;
+    ch.name = r.name;
+    ch.pic = builtinPic(r.id);
+    channels.push_back(ch);
+  }
+  netChannels = refs;
+  unknownChannels.clear();
+}
+
+// Takes over the result of a channel lookup from the network task
+void applyChannels(const NetMessage& msg){
+  unknownChannels = msg.unknown;
+  bool changed = false;
+  for (size_t i = 0; i < channels.size() && i < msg.channels.size(); i++) {
+    channelInfo& ch = channels[i];
+    const ChannelRef& r = msg.channels[i];
+    if (ch.id != r.id) { ch.id = r.id; ch.pic = builtinPic(r.id); changed = true; }
+    if (ch.login != r.login) { ch.login = r.login; changed = true; }
+    if (!r.name.empty() && ch.name != r.name) { ch.name = r.name; changed = true; }
+  }
+  if (!changed) return;
+  assignLogoSlots();
+  // placeholders show the initials of the name; the title row is redrawn when the title ends
+  if (!isTitleDisplaying) redrawLiveChannelPics();
+}
+
 channelInfo* findChannel(const std::string& id){
   for (channelInfo& channel : channels) {
-    if (channel.id == id) return &channel;
+    if (!id.empty() && channel.id == id) return &channel;
   }
   return nullptr;
 }
@@ -1330,6 +1558,17 @@ void handleStatus(){
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   b += "</div>";
 
+  b += "<div class=\"card\"><h2>Channels</h2><table>";
+  for(const channelInfo& ch : channels){
+    b += "<tr><td>" + htmlEscape(!ch.name.empty() ? ch.name : !ch.login.empty() ? ch.login : ch.id) + "</td><td>";
+    if(ch.id.empty()) b += "<span class=\"err\">not found</span>";
+    else b += ch.isLive ? "<span class=\"ok\">live</span>" : "offline";
+    b += "</td></tr>";
+  }
+  b += "</table>";
+  if(!unknownChannels.empty()) b += "<p class=\"err\">Some channels are unknown to Twitch, see <a href=\"/settings\">Settings</a>.</p>";
+  b += "</div>";
+
   b += "<div class=\"card\"><h2>Twitch</h2><table>";
   b += "<tr><td>Last update</td><td>";
   if(!lastFetchMillis) b += "none yet";
@@ -1451,6 +1690,43 @@ String secretField(const char* label, const char* name, bool isSet, const char* 
   return f;
 }
 
+// Splits the entered channel list (names separated by new lines, commas or
+// spaces; twitch.tv links are accepted) into lower-case logins.
+// Returns an empty string if the list is valid, otherwise the error.
+String parseChannelList(const String& text, std::vector<std::string>& logins){
+  logins.clear();
+  std::string current;
+  std::string all = std::string(text.c_str()) + "\n";
+  for (char c : all) {
+    if (c == '\n' || c == '\r' || c == ',' || c == ';' || c == ' ' || c == '\t') {
+      if (!current.empty()) {
+        size_t slash = current.find_last_of('/');
+        if (slash != std::string::npos) current = current.substr(slash + 1); // twitch.tv/name
+        if (!current.empty() && std::find(logins.begin(), logins.end(), current) == logins.end()) logins.push_back(current);
+        current.clear();
+      }
+    } else current += (char)tolower((unsigned char)c);
+  }
+  for (const auto& l : logins) {
+    bool ok = l.size() >= 1 && l.size() <= 25;
+    for (char c : l) if (!(isalnum((unsigned char)c) || c == '_')) ok = false;
+    if (!ok) return String("Invalid channel name: ") + l.c_str();
+  }
+  if (logins.empty()) return "Enter at least one channel.";
+  if (logins.size() > MAX_CHANNELS) return "At most " + String(MAX_CHANNELS) + " channels.";
+  return "";
+}
+
+// The channel list for the Settings page: logins where known, else ids
+String channelListText(){
+  String text;
+  for (const auto& ch : channels) {
+    if (text.length()) text += "\n";
+    text += (ch.login.empty() ? ch.id : ch.login).c_str();
+  }
+  return text;
+}
+
 void sendSettingsPage(const String& message, bool isError){
   String b;
   b.reserve(4096);
@@ -1478,6 +1754,19 @@ void sendSettingsPage(const String& message, bool isError){
   b += "<label>Client ID<input type=\"text\" name=\"clientid\" maxlength=\"128\" autocomplete=\"off\" value=\"" + inputValue("clientid", config.clientId) + "\"></label>";
   b += secretField("Client secret", "secret", config.clientSecret.length() > 0, nullptr, true);
   b += secretField("Access token (optional)", "token", config.token.length() > 0, "Only needed without a client secret. It expires and is not renewed.", true);
+
+  b += "<h3>Channels</h3>";
+  b += "<label>Twitch channels<textarea name=\"channels\" rows=\"6\" autocapitalize=\"none\" spellcheck=\"false\">";
+  if(server.hasArg("channels")) b += escapeString(server.arg("channels"));
+  else b += escapeString(channelListText());
+  b += "</textarea></label>";
+  b += "<p class=\"hint\">One channel name per line (as in twitch.tv/<i>name</i>), at most " + String(MAX_CHANNELS) + ". "
+       "They are shown in this order; up to 8 live channels get a tile.</p>";
+  if(!unknownChannels.empty()){
+    String names;
+    for(const auto& n : unknownChannels){ if(names.length()) names += ", "; names += n.c_str(); }
+    b += "<p class=\"err\">Twitch does not know: " + escapeString(names) + "</p>";
+  }
 
   b += "<h3>Web interface</h3>";
   b += "<p class=\"hint\">Login user is <b>admin</b>. The password is also used for uploads from PlatformIO.</p>";
@@ -1514,6 +1803,15 @@ void handleSettingsSave(){
     sendSettingsPage(err, true);
     return;
   }
+  std::vector<std::string> logins;
+  bool channelsSubmitted = server.hasArg("channels");
+  if(channelsSubmitted){
+    String channelError = parseChannelList(server.arg("channels"), logins);
+    if(channelError.length()){
+      sendSettingsPage(channelError, true);
+      return;
+    }
+  }
 
   // empty secret fields keep the stored value, "Remove" stores an empty one
   Preferences prefs;
@@ -1527,6 +1825,11 @@ void handleSettingsSave(){
   if(token.length()) prefs.putString("token", token);
   else if(server.hasArg("token_clear")) prefs.putString("token", "");
   if(webPassword.length()) prefs.putString("webpw", webPassword);
+  if(channelsSubmitted){
+    String list;
+    for(const auto& l : logins){ if(list.length()) list += ","; list += l.c_str(); }
+    prefs.putString("channels", list);
+  }
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back

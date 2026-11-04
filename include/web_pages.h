@@ -29,7 +29,7 @@ progress{width:100%;height:16px;margin:12px 0}
 input[type=file]{color:var(--text);max-width:100%}
 h3{margin:20px 0 8px;font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
 label{display:block;margin-bottom:10px}
-input[type=text],input[type=password]{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid #3a3a44;border-radius:6px;background:var(--bg);color:var(--text);font:inherit}
+input[type=text],input[type=password],textarea{display:block;width:100%;margin-top:4px;padding:8px;border:1px solid #3a3a44;border-radius:6px;background:var(--bg);color:var(--text);font:inherit}
 label.check{display:flex;gap:8px;align-items:center;color:var(--muted);margin-top:-4px}
 button.danger{background:var(--err)}
 .hint{font-size:13px;color:var(--muted)}
