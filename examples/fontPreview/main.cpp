@@ -272,7 +272,7 @@ String download(const String& url, std::vector<uint8_t>& data, size_t maxLen, ui
   int size = http.getSize();
   if(size > (int)maxLen){ http.end(); return "too large: " + String(size / 1024) + " KB"; }
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  size_t room = size > 0 ? (size_t)size : std::min(maxLen, largest > 16384 ? largest - 16384 : 0);
+  size_t room = size > 0 ? (size_t)size : std::min(maxLen, largest > 8192 ? largest - 8192 : 0);  // TLS buffers are already allocated here
   if(largest < room + 4096 || room == 0){
     http.end();
     return "no RAM for " + String((size > 0 ? size : (int)maxLen) / 1024) + " KB";
