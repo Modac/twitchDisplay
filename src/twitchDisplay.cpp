@@ -208,14 +208,17 @@ void slotXY(int8_t slot, uint16_t& x, uint16_t& y){
 // The 170x320 panel refreshes its native lines, which are columns in
 // landscape (rotation 1). Writing the title row by row crosses every refresh
 // line, so moving text tears diagonally. drawColumnwise() switches the
-// address order for the transfer (MADCTL MY instead of MY|MV: no row/column
-// exchange), so the pixels arrive column by column, in the panel's line order.
+// address order for the transfer (MADCTL 0 instead of MY|MV: no row/column
+// exchange, no mirroring), so the pixels arrive column by column, in the
+// panel's line order and refresh direction (MADCTL ML = 0: the panel refreshes
+// memory rows top to bottom, data sheet 9.1.28).
 //
 // Mapping (rotation 1, MADCTL MY|MV, offsets _xstart/_ystart): landscape (x, y)
 // is memory column X = y + _ystart and memory row Y = 319 - (x + _xstart).
-// With MADCTL MY the column address (CASET) runs along X and the row address
-// (RASET) along Y mirrored, so CASET = y + _ystart, RASET = x + _xstart and
-// each landscape column is one memory row.
+// With MADCTL 0 the column address (CASET) runs along X and the row address
+// (RASET) along Y, so CASET = y + _ystart, RASET = 319 - (x + _xstart) for the
+// rightmost column up to the leftmost one: each landscape column is one memory
+// row, sent from right to left = ascending memory rows.
 class Display : public Adafruit_ST7789 {
 public:
   using Adafruit_ST7789::Adafruit_ST7789;
@@ -233,13 +236,13 @@ public:
       return;
     }
     writeCommand(ST77XX_MADCTL);
-    spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_RGB);
+    spiWrite(ST77XX_MADCTL_RGB);
     writeCommand(ST77XX_CASET);
     SPI_WRITE32(((uint32_t)(y + _ystart) << 16) | (uint32_t)(y + _ystart + h - 1));
     writeCommand(ST77XX_RASET);
-    SPI_WRITE32(((uint32_t)(x + _xstart) << 16) | (uint32_t)(x + _xstart + w - 1));
+    SPI_WRITE32(((uint32_t)(319 - (x + _xstart + w - 1)) << 16) | (uint32_t)(319 - (x + _xstart)));
     writeCommand(ST77XX_RAMWR);
-    for(int16_t i = 0; i < w; i++){
+    for(int16_t i = w - 1; i >= 0; i--){
       for(int16_t j = 0; j < h; j++) column[j] = bitmap[j * bitmapWidth + offsetX + i];
       writePixels(column, h);
     }

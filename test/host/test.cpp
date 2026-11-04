@@ -733,10 +733,11 @@ int main(){
       for(int j = 0; j < 64; j++) for(int i = 0; i < TITLE_WIDTH; i++) if(g_fb[rowTop + j][GRID_X0 + i] != bm[j * 346 + 6 + i]) same = false;
       CHECK(same);                                                          // right place, not mirrored or shifted
       CHECK(g_writeOrder.size() == (size_t)TITLE_WIDTH * 64);
-      bool columnwise = true;                                               // top to bottom, then the next column
+      bool columnwise = true;                                               // top to bottom, then the next column to the left
       for(size_t k = 0; k < g_writeOrder.size(); k++)
-        if(g_writeOrder[k] != std::make_pair(GRID_X0 + (int)(k / 64), rowTop + (int)(k % 64))) { columnwise = false; break; }
+        if(g_writeOrder[k] != std::make_pair(GRID_X0 + TITLE_WIDTH - 1 - (int)(k / 64), rowTop + (int)(k % 64))) { columnwise = false; break; }
       CHECK(columnwise);
+      CHECK(319 - g_writeOrder.front().first < 319 - g_writeOrder.back().first);  // ascending memory rows = panel refresh direction (ML = 0)
       CHECK(g_madctl == (ST77XX_MADCTL_MY | ST77XX_MADCTL_MV));            // back to rotation 1
     }
 
@@ -744,7 +745,7 @@ int main(){
     reset(); setResponse({{0,"A"},{4,"B"}}); loopWithUpdate();
     CHECK(isTitleDisplaying && titleInRow(1));
     g_writeOrder.clear(); g_recordWrites = true; loopNoUpdate(1); g_recordWrites = false;
-    CHECK(g_writeOrder.size() >= (size_t)TITLE_WIDTH * 64 && g_writeOrder[0] == std::make_pair(GRID_X0, (int)rowY(1)) && g_writeOrder[1] == std::make_pair(GRID_X0, (int)rowY(1) + 1));
+    CHECK(g_writeOrder.size() >= (size_t)TITLE_WIDTH * 64 && g_writeOrder[0] == std::make_pair(GRID_X0 + TITLE_WIDTH - 1, (int)rowY(1)) && g_writeOrder[1] == std::make_pair(GRID_X0 + TITLE_WIDTH - 1, (int)rowY(1) + 1));
     runUntilTitleDone();
     CHECK(tileIsPic(0,0) && tileIsPic(1,4) && tileIsFill(2,0));
     reset(); }
