@@ -700,7 +700,7 @@ struct TitleText {
 // character goes to titleNextX; colour emoji are placed in titleEmoji.
 SemaphoreHandle_t titleLock = nullptr;
 uint32_t titleGeneration = 0;        // changes with every start/stop: stale renders are dropped
-size_t titleNextItem = 0;            // next character (chars.size() = the gap)
+size_t titleNextItem = 0;            // next item: characters, the gap, characters again, then black
 int titleNextX = 0;
 uint16_t o_X = 0;                    // first visible canvas column
 uint32_t titleScrollTotal = 0;       // pixels until the title ends
@@ -1131,12 +1131,16 @@ bool renderAheadStep(){
   if(!isTitleDisplaying || !titleLock) return false;
   xSemaphoreTake(titleLock, portMAX_DELAY);
   uint32_t generation = titleGeneration;
+  // items: the characters, the gap, the characters again (MAX_TITLE_REPEAT times), then
+  // only black, so the end of the last pass scrolls out into an empty row
   size_t count = titleText.chars.size(), item = titleNextItem;
-  bool gap = item >= count;
-  uint32_t c = gap ? 0 : titleText.chars[item];
-  uint32_t key = gap ? 0 : titleText.cacheKey[item];
+  size_t pos = item % (count + 1);
+  bool done = item / (count + 1) >= MAX_TITLE_REPEAT || (item / (count + 1) == MAX_TITLE_REPEAT - 1 && pos == count);
+  bool gap = done || pos >= count;
+  uint32_t c = gap ? 0 : titleText.chars[pos];
+  uint32_t key = gap ? 0 : titleText.cacheKey[pos];
   bool builtin = titleText.builtin;
-  int advance = gap ? TITLE_GAP : titleText.advance[item];
+  int advance = done ? TITLE_WIDTH : gap ? TITLE_GAP : titleText.advance[pos];
   // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
   bool room = isTitleDisplaying && (gap ? titleNextX <= CANVAS_W : titleNextX + advance + 8 <= CANVAS_W);
   xSemaphoreGive(titleLock);
@@ -1162,7 +1166,7 @@ bool renderAheadStep(){
     else if(box) drawGlyphBox(titleNextX, advance);
     else if(!gap) blitTitleGlyph(glyph, titleNextX);
     titleNextX += advance;
-    titleNextItem = (item + 1) % (count + 1);
+    titleNextItem = item + 1;
   }
   xSemaphoreGive(titleLock);
   return true;
@@ -1199,7 +1203,8 @@ void startTitle(channelInfo* channel){
   titleNextItem = 0;
   titleNextX = TITLE_LEAD;
   o_X = 0;
-  titleScrollTotal = MAX_TITLE_REPEAT * (titleText.width + TITLE_GAP);
+  // until the last character of the last pass has left the row
+  titleScrollTotal = TITLE_LEAD + MAX_TITLE_REPEAT * titleText.width + (MAX_TITLE_REPEAT - 1) * TITLE_GAP;
   isTitleDisplaying = true;
   xSemaphoreGive(titleLock);
   // the first characters right away, so the title does not start with gaps

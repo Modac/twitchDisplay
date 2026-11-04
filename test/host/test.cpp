@@ -1308,10 +1308,22 @@ int main(){
     while(g_millis - t0 < 500) loopNoUpdate(1);
     CHECK(titlePixels - p0 >= 136 && titlePixels - p0 <= 142);
     (void)tStall;
+    printf("    the end of the second pass scrolls out into black (the start does not come back)\n");
+    { reset(); setResponse({{0,"Kurzer Titel"}}); loopWithUpdate();
+      while(isTitleDisplaying && titlePixels < titleScrollTotal - TITLE_WIDTH / 2) loopNoUpdate(1);
+      CHECK(isTitleDisplaying);
+      int end = (int)(titleScrollTotal - titlePixels);                          // where the last character ends, in view columns
+      bool black = true;
+      for(int j = 0; j < 64; j++) for(int i = end + 8; i < TITLE_WIDTH; i++) if(titleAlpha[j*CANVAS_W + o_X + i] || g_fb[rowY(1)+j][GRID_X0+i]) black = false;
+      CHECK(black);
+      bool text = false;                                                       // the end of the text is still there
+      for(int j = 0; j < 64; j++) for(int i = 0; i < end; i++) if(titleAlpha[j*CANVAS_W + o_X + i]) text = true;
+      CHECK(text);
+      runUntilTitleDone(); CHECK(!isTitleDisplaying && tileIsPic(0,0)); }
     printf("    the title takes as long as the speed says\n");
     reset(); setResponse({{0,"Exactly twenty chars"}}); loopWithUpdate();
     t0 = g_millis; runUntilTitleDone();
-    unsigned long expectMs = (unsigned long)((uint64_t)MAX_TITLE_REPEAT * (titleText.width + TITLE_GAP) * FRAME_INTERVAL_US / SCROLL_STEP / 1000);
+    unsigned long expectMs = (unsigned long)((uint64_t)(TITLE_LEAD + MAX_TITLE_REPEAT * titleText.width + (MAX_TITLE_REPEAT - 1) * TITLE_GAP) * FRAME_INTERVAL_US / SCROLL_STEP / 1000);
     CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
     CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
     server.find("/", HTTP_GET)->fn();
