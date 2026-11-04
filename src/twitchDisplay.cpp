@@ -262,14 +262,14 @@ public:
   // (data sheet 8.4), so the clock and data pins are taken from the SPI
   // peripheral for this, driven by hand and attached again afterwards.
   // Must not be called inside a startWrite()/endWrite() transfer.
-  uint32_t readScanlineRaw(int bits = 25){
+  uint32_t readRaw(uint8_t cmd, int bits){
     pinMatrixOutDetach(TFT_SCK, false, false);
     pinMatrixOutDetach(TFT_SDA, false, false);
     gpio_set_level((gpio_num_t)TFT_SCK, 0);
     digitalWrite(TFT_DC, LOW);
     digitalWrite(TFT_CS, LOW);
     for(int b = 7; b >= 0; b--){ // command, MSB first, sampled on the rising edge
-      gpio_set_level((gpio_num_t)TFT_SDA, (0x45 >> b) & 1);
+      gpio_set_level((gpio_num_t)TFT_SDA, (cmd >> b) & 1);
       esp_rom_delay_us(1);
       gpio_set_level((gpio_num_t)TFT_SCK, 1);
       esp_rom_delay_us(1);
@@ -293,6 +293,7 @@ public:
     pinMatrixOutAttach(TFT_SCK, FSPICLK_OUT_IDX, false, false);
     return value;
   }
+  uint32_t readScanlineRaw(int bits = 25){ return readRaw(0x45, bits); }
 };
 
 Display tft(TFT_CS, TFT_DC, TFT_RST);
@@ -343,6 +344,37 @@ ScanlineTest runScanlineTest(){
 }
 
 ScanlineTest bootScanlineTest;
+
+// Display ID read test: tells whether the module answers reads at all. The ID
+// is fixed (ST7789V: 85h 85h 52h), so the result is unambiguous.
+// RDDID (04h) returns the three bytes after a dummy clock (or byte);
+// RDID1..3 (DAh..DCh) one byte each, with or without a dummy clock.
+#define ST7789V_ID 0x858552UL
+struct IdTest { uint32_t raw04; uint16_t rawDx[3]; uint32_t id04A, id04B, idDxA, idDxB; const char* verdict; };
+
+IdTest runIdTest(){
+  IdTest t;
+  t.raw04 = tft.readRaw(0x04, 32);
+  t.id04A = (t.raw04 >> 7) & 0xFFFFFF;      // 1 dummy clock
+  t.id04B = t.raw04 & 0xFFFFFF;             // dummy byte
+  t.idDxA = t.idDxB = 0;
+  bool allZero = t.raw04 == 0, allOnes = t.raw04 == 0xFFFFFFFF;
+  for(int i = 0; i < 3; i++){
+    t.rawDx[i] = (uint16_t)tft.readRaw(0xDA + i, 9);
+    t.idDxA = t.idDxA << 8 | (t.rawDx[i] >> 1);   // no dummy clock
+    t.idDxB = t.idDxB << 8 | (t.rawDx[i] & 0xFF); // 1 dummy clock
+    if(t.rawDx[i]) allZero = false;
+    if(t.rawDx[i] != 0x1FF) allOnes = false;
+  }
+  if(allZero) t.verdict = "no answer (SDA stays low): the module does not answer reads";
+  else if(allOnes) t.verdict = "no answer (SDA stays high): the module does not answer reads";
+  else if(t.id04A == ST7789V_ID || t.id04B == ST7789V_ID || t.idDxA == ST7789V_ID || t.idDxB == ST7789V_ID)
+    t.verdict = "works: ST7789V ID 85 85 52 read back";
+  else t.verdict = "answer, but not the expected ID (85 85 52)";
+  return t;
+}
+
+IdTest bootIdTest;
 
 // Settings, loaded once at boot; saving them restarts the display
 struct Config {
@@ -555,6 +587,11 @@ void setup(void) {
                    (unsigned long)bootScanlineTest.raw[i], bootScanlineTest.a[i], bootScanlineTest.b[i]);
   }
   DEBUG_I.printf("[%s] Scanline read: %s\n", DEBUG_TAG, bootScanlineTest.verdict);
+  bootIdTest = runIdTest();
+  DEBUG_I.printf("[%s] ID read: 04h raw 0x%08lx (A %06lx, B %06lx), DAh-DCh raw %03x %03x %03x (A %06lx, B %06lx)\n", DEBUG_TAG,
+                 (unsigned long)bootIdTest.raw04, (unsigned long)bootIdTest.id04A, (unsigned long)bootIdTest.id04B,
+                 bootIdTest.rawDx[0], bootIdTest.rawDx[1], bootIdTest.rawDx[2], (unsigned long)bootIdTest.idDxA, (unsigned long)bootIdTest.idDxB);
+  DEBUG_I.printf("[%s] ID read: %s\n", DEBUG_TAG, bootIdTest.verdict);
 
   // New firmware from an OTA update starts "pending verify" and must confirm
   // itself (confirmFirmwareWhenStable()), otherwise the bootloader rolls back
@@ -1956,6 +1993,19 @@ void handleStatus(){
     b += "<tr><td>A (1 dummy clock)</td><td>" + a + "</td></tr>";
     b += "<tr><td>B (dummy byte)</td><td>" + bb + "</td></tr>";
     b += String("<tr><td>At boot</td><td>") + bootScanlineTest.verdict + "</td></tr></table>";
+    IdTest id = runIdTest();
+    char line[64];
+    b += "<h2 style=\"margin-top:16px\">Display ID read (test)</h2><table>";
+    b += String("<tr><td>Result</td><td>") + id.verdict + "</td></tr>";
+    snprintf(line, sizeof(line), "%08lx", (unsigned long)id.raw04);
+    b += String("<tr><td>04h raw (32 bits)</td><td><code>") + line + "</code></td></tr>";
+    snprintf(line, sizeof(line), "%06lx / %06lx", (unsigned long)id.id04A, (unsigned long)id.id04B);
+    b += String("<tr><td>04h ID (1 dummy clock / dummy byte)</td><td><code>") + line + "</code></td></tr>";
+    snprintf(line, sizeof(line), "%03x %03x %03x", id.rawDx[0], id.rawDx[1], id.rawDx[2]);
+    b += String("<tr><td>DAh-DCh raw (9 bits each)</td><td><code>") + line + "</code></td></tr>";
+    snprintf(line, sizeof(line), "%06lx / %06lx", (unsigned long)id.idDxA, (unsigned long)id.idDxB);
+    b += String("<tr><td>DAh-DCh ID (no dummy / 1 dummy clock)</td><td><code>") + line + "</code></td></tr>";
+    b += String("<tr><td>At boot</td><td>") + bootIdTest.verdict + "</td></tr></table>";
   }
   b += "<form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
   sendPage("Status", b);

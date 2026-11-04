@@ -784,7 +784,7 @@ int main(){
     CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap "));
     reset(); }
 
-  printf("T44 scanline read (GSCAN) diagnostic\n");
+  printf("T44 scanline (GSCAN) and ID read diagnostics\n");
   { CHECK(bootScanlineTest.verdict != nullptr);
     struct { int dummy; const char* expect; } modes[] = {
       {1, "works (interpretation A: 1 dummy clock)"}, {8, "works (interpretation B: dummy byte)"}, {0, "no answer (SDA stays low)"}};
@@ -798,12 +798,22 @@ int main(){
       CHECK(g_pinLevel[7] == 1);                                                                       // CS released
     }
     g_scanlineDummyBits = 1;
+    CHECK(bootIdTest.verdict != nullptr);
+    for(int dummy : {1, 8, 0}){
+      g_scanlineDummyBits = dummy;
+      IdTest id = runIdTest();
+      if(dummy) CHECK(contains(id.verdict, "works: ST7789V ID") && id.idDxA == 0x858552 && (dummy == 1 ? id.id04A : id.id04B) == 0x858552);
+      else CHECK(contains(id.verdict, "no answer (SDA stays low)"));
+      CHECK(g_pinSignal[4] == FSPICLK_OUT_IDX && g_pinSignal[6] == FSPID_OUT_IDX && !g_pinInput[6] && g_pinLevel[7] == 1);
+    }
+    g_scanlineDummyBits = 1;
     // drawing still works afterwards
     std::vector<uint16_t> bm(346 * 64, 0x5A5A);
     tft.drawColumnwise(GRID_X0, 14, bm.data(), 0, TITLE_WIDTH, 64, 346);
     CHECK(g_fb[14][GRID_X0] == 0x5A5A && g_fb[77][GRID_X0 + TITLE_WIDTH - 1] == 0x5A5A);
     server.find("/", HTTP_GET)->fn();
     CHECK(contains(g_lastBody, "Display scanline read (test)") && contains(g_lastBody, "works (interpretation A"));
+    CHECK(contains(g_lastBody, "Display ID read (test)") && contains(g_lastBody, "works: ST7789V ID 85 85 52") && contains(g_lastBody, "<code>858552 / "));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");
