@@ -420,13 +420,23 @@ WebServer server(80);
 
 // Firmware upload state (the upload runs inside server.handleClient() in loop())
 volatile bool otaActive = false;   // also pauses the network task
+// The upload page sends the file in pieces (one request each, ?offset=&total=)
+// so its progress bar only advances with what the display has written; a
+// request without offset carries the whole file.
+#define UPLOAD_PIECE_TIMEOUT 30000  // ms without the next piece: upload abandoned
 struct {
   bool authorized;
   bool headerChecked;
   String error;
   int lastPercent;
+  bool pieces;                 // current request is one piece of a file
+  size_t offset;               // where the current piece starts
+  size_t total;                // file size (pieces only)
+  size_t written;              // bytes written so far (pieces only)
+  unsigned long lastPieceAt;   // millis() of the last piece, 0 = no upload in pieces running
 } upload;
 unsigned long rebootAt = 0;        // millis() of a scheduled restart, 0 = none
+void checkUploadTimeout();
 
 // Online update requested on the web page; runs in loop() (blocking, ~20 s)
 bool installRequested = false;
@@ -713,6 +723,7 @@ void loop(){
   }
   ArduinoOTA.handle();
   server.handleClient();
+  checkUploadTimeout();
   checkBootButton();
 
   if(rebootAt && millis() >= rebootAt){
@@ -1685,22 +1696,47 @@ void failUpload(const char* message){
   if(Update.isRunning()) Update.abort();
 }
 
+// An upload in pieces whose next piece does not come (page closed, connection
+// lost): give up, so the display and the Twitch updates continue
+void checkUploadTimeout(){
+  if(!upload.lastPieceAt || millis() - upload.lastPieceAt < UPLOAD_PIECE_TIMEOUT) return;
+  upload.lastPieceAt = 0;
+  if(!otaActive) return;
+  failUpload("Upload stopped (no data for 30 s).");
+  otaActive = false;
+  drawMessageScreen("Update failed", ST77XX_RED, upload.error.c_str());
+  restoreDisplayAt = millis() + 5000;
+}
+
 // Called by the web server for every chunk of the uploaded file
 void handleUploadChunk(){
   HTTPUpload& up = server.upload();
   switch(up.status){
     case UPLOAD_FILE_START:
       upload.authorized = setupMode || server.authenticate(WEB_USER, config.webPassword.c_str()); // setup mode: hotspot password protects
+      if(!upload.authorized) return;
+      upload.pieces = server.hasArg("offset");
+      upload.offset = upload.pieces ? (size_t)server.arg("offset").toInt() : 0;
+      if(upload.pieces && upload.offset > 0){
+        // next piece of the running upload
+        upload.lastPieceAt = millis();
+        if(upload.error.length()) return;
+        if(!otaActive || !Update.isRunning() || upload.offset != upload.written) failUpload("Upload out of order, start again.");
+        return;
+      }
       upload.headerChecked = false;
       upload.error = "";
       upload.lastPercent = -1;
-      if(!upload.authorized) return;
+      upload.written = 0;
+      upload.total = upload.pieces ? (size_t)server.arg("total").toInt() : 0;
+      upload.lastPieceAt = upload.pieces ? millis() : 0;
       DEBUG_I.printf("[OTA] Upload of %s started.\n", up.filename.c_str());
       otaActive = true;
       restoreDisplayAt = 0;
       drawMessageScreen("Firmware update", ST77XX_CYAN, nullptr);
       drawUpdateProgress(0);
-      if(!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) failUpload(Update.errorString());
+      if(upload.pieces && (upload.total == 0 || upload.total > maxFirmwareSize())) failUpload("File is too large.");
+      else if(!Update.begin(upload.pieces ? upload.total : UPDATE_SIZE_UNKNOWN, U_FLASH)) failUpload(Update.errorString());
       break;
 
     case UPLOAD_FILE_WRITE:
@@ -1711,14 +1747,17 @@ void handleUploadChunk(){
         if(err){ failUpload(err); return; }
         upload.headerChecked = true;
       }
+      if(upload.pieces && upload.written + up.currentSize > upload.total){ failUpload("More data than announced."); return; }
       if(Update.write(up.buf, up.currentSize) != up.currentSize){
         failUpload(Update.errorString());
         return;
       }
+      upload.written += up.currentSize;
       {
-        // Content-Length includes the multipart framing, close enough for a progress bar
-        int total = server.clientContentLength();
-        int percent = total > 0 ? (int)((uint64_t)up.totalSize * 100 / total) : 0;
+        // single request: Content-Length includes the multipart framing, close enough for a progress bar
+        int total = upload.pieces ? (int)upload.total : server.clientContentLength();
+        int done = upload.pieces ? (int)upload.written : (int)up.totalSize;
+        int percent = total > 0 ? (int)((uint64_t)done * 100 / total) : 0;
         if(percent > 100) percent = 100;
         if(percent != upload.lastPercent){
           upload.lastPercent = percent;
@@ -1731,9 +1770,11 @@ void handleUploadChunk(){
       feedLoopWDT();
       if(!upload.authorized || upload.error.length()) return;
       if(!upload.headerChecked){ failUpload("File is too small to be a firmware image."); return; }
+      if(upload.pieces && upload.written < upload.total) return;   // more pieces to come
       // end() verifies the checksum and the image before switching the boot partition
       if(!Update.end(true)) failUpload(Update.errorString());
-      else DEBUG_I.printf("[OTA] Upload complete, %u bytes.\n", (unsigned)up.totalSize);
+      else DEBUG_I.printf("[OTA] Upload complete, %u bytes.\n", (unsigned)(upload.pieces ? upload.written : up.totalSize));
+      upload.lastPieceAt = 0;
       break;
 
     case UPLOAD_FILE_ABORTED:
@@ -1759,10 +1800,15 @@ void handleUploadDone(){
   }
   if(upload.error.length() == 0 && !upload.headerChecked) failUpload("No file received.");
   if(upload.error.length()){
+    upload.lastPieceAt = 0;
     otaActive = false;
     drawMessageScreen("Update failed", ST77XX_RED, upload.error.c_str());
     restoreDisplayAt = millis() + 5000;
     sendJson(400, false, "Update failed: " + upload.error);
+    return;
+  }
+  if(upload.pieces && upload.written < upload.total){
+    sendJson(200, true, "Received " + String((unsigned)upload.written) + " bytes.");
     return;
   }
   drawUpdateProgress(100);
@@ -2254,6 +2300,7 @@ void startSetupMode(const char* reason, bool retryLater){
 void setupModeLoop(){
   dnsServer.processNextRequest();
   server.handleClient();
+  checkUploadTimeout();
   if(rebootAt && millis() >= rebootAt){
     delay(100);
     ESP.restart();

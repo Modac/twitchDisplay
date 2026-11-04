@@ -61,28 +61,40 @@ function waitForRestart() {
     .then(() => { location.href = '/'; })
     .catch(() => setTimeout(waitForRestart, 2000));
 }
+// The file goes in pieces, one request each: the bar then follows what the
+// display has written (a single request would show what the browser has
+// buffered, which runs well ahead).
+const PIECE = 65536;
+function fail(text) { show(text, 'err'); $('go').disabled = false; }
+function sendPiece(f, offset) {
+  const end = Math.min(offset + PIECE, f.size);
+  const data = new FormData();
+  data.append('firmware', f.slice(offset, end), f.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update?offset=' + offset + '&total=' + f.size);
+  xhr.upload.onprogress = e => { if (e.lengthComputable) $('bar').value = (offset + (end - offset) * e.loaded / e.total) / f.size * 100; };
+  xhr.onload = () => {
+    let r;
+    try { r = JSON.parse(xhr.responseText); } catch (e) { r = {ok: false, message: 'Error ' + xhr.status + ' ' + xhr.statusText}; }
+    if (!r.ok) { $('bar').value = offset / f.size * 100; fail(r.message); return; }  // back to what the display confirmed
+    $('bar').value = end / f.size * 100;
+    if (end < f.size) { sendPiece(f, end); return; }
+    show(r.message + ' Waiting for the display to come back...', 'ok');
+    setTimeout(waitForRestart, 5000);
+  };
+  xhr.onerror = () => fail('Upload failed: connection lost.');
+  xhr.send(data);
+}
 $('go').onclick = () => {
   const f = $('file').files[0];
   if (!f) { show('Choose a file first.', 'err'); return; }
   if (!f.name.endsWith('.bin')) { show('Please choose a .bin file.', 'err'); return; }
   if (f.size > maxSize) { show('File is too large (' + f.size + ' bytes, max ' + maxSize + ').', 'err'); return; }
-  const data = new FormData();
-  data.append('firmware', f, f.name);
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/update');
-  xhr.upload.onprogress = e => { if (e.lengthComputable) $('bar').value = e.loaded / e.total * 100; };
-  xhr.onload = () => {
-    let r;
-    try { r = JSON.parse(xhr.responseText); } catch (e) { r = {ok: false, message: 'Error ' + xhr.status + ' ' + xhr.statusText}; }
-    if (r.ok) { show(r.message + ' Waiting for the display to come back...', 'ok'); setTimeout(waitForRestart, 5000); }
-    else { show(r.message, 'err'); $('go').disabled = false; }
-  };
-  xhr.onerror = () => { show('Upload failed: connection lost.', 'err'); $('go').disabled = false; };
   $('go').disabled = true;
   $('bar').hidden = false;
   $('bar').value = 0;
   show('Uploading...');
-  xhr.send(data);
+  sendPiece(f, 0);
 };
 </script>
 )HTML";

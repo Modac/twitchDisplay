@@ -26,6 +26,17 @@ void simulateUpload(const std::vector<uint8_t>& file, bool abortHalfway=false){
   up.status = UPLOAD_FILE_END; up.currentSize = 0; r->ufn();
   r->fn();
 }
+// Sends a file in pieces like the upload page does (?offset=&total=, one request each)
+void simulatePieces(const std::vector<uint8_t>& file, size_t piece, size_t stopAfter = SIZE_MAX){
+  size_t sent = 0;
+  for(size_t off = 0; off < file.size() && sent < stopAfter; off += piece, sent++){
+    std::vector<uint8_t> part(file.begin() + off, file.begin() + std::min(file.size(), off + piece));
+    g_args["offset"] = std::to_string(off); g_args["total"] = std::to_string(file.size());
+    simulateUpload(part);
+    if(g_lastBody.find("\"ok\":true") == std::string::npos) break;
+  }
+  g_args.erase("offset"); g_args.erase("total");
+}
 
 unsigned long g_millis = 1; unsigned long g_usFrac = 0; bool g_quiet = true;
 SerialStub Serial; EspStub ESP; ArduinoOTAClass ArduinoOTA;
@@ -320,6 +331,43 @@ int main(){
   g_updateAborts = 0; simulateUpload(fw, true); server.find("/update", HTTP_POST)->fn();
   CHECK(g_updateAborts == 1 && g_lastCode == 400 && rebootAt == 0);
   g_millis += 5100; loop();
+
+  printf("T45 upload in pieces: display progress follows the written bytes, one restart at the end\n");
+  { reset(); setResponse({{0,"A"}}); loopWithUpdate();
+    g_updateBegins = g_updateEnds = 0; g_flashed.clear(); rebootAt = 0;
+    simulatePieces(fw, 65536, 1);
+    CHECK(otaActive && g_updateBegins == 1 && g_flashed.size() == 65536 && rebootAt == 0);
+    CHECK(contains(g_lastBody, "\"ok\":true") && contains(g_lastBody, "Received 65536 bytes."));
+    CHECK(upload.lastPercent == (int)(65536ULL * 100 / fw.size()));            // display bar: written / file size
+    loop(); loop(); CHECK(otaActive && !tileIsPic(0,0));                         // update screen stays between pieces
+    g_flashed.clear(); g_updateBegins = 0; otaActive = false; Update.abort();
+    simulatePieces(fw, 65536);
+    CHECK(g_flashed == fw && g_updateBegins == 1 && g_updateEnds == 1 && rebootAt != 0);
+    CHECK(contains(g_lastBody, "Update successful") && upload.lastPieceAt == 0);
+    rebootAt = 0; otaActive = false;
+
+    printf("    a piece out of order is rejected\n");
+    reset(); setResponse({{0,"A"}}); loopWithUpdate();
+    simulatePieces(fw, 65536, 1);
+    std::vector<uint8_t> part(fw.begin() + 131072, fw.begin() + 196608);
+    g_args["offset"] = "131072"; g_args["total"] = std::to_string(fw.size());
+    g_updateEnds = 0; simulateUpload(part); g_args.clear();
+    CHECK(g_lastCode == 400 && contains(g_lastBody, "out of order") && !otaActive && g_updateEnds == 0 && rebootAt == 0);
+    g_millis += 5100; loop(); CHECK(tileIsPic(0,0));
+
+    printf("    a merged image is rejected with the first piece\n");
+    g_updateBegins = 0; simulatePieces(merged, 65536);
+    CHECK(g_lastCode == 400 && contains(g_lastBody, "bootloader or merged") && !otaActive && g_flashed.empty());
+    g_millis += 5100; loop();
+
+    printf("    the page stops sending: given up after 30 s, display back\n");
+    g_updateAborts = 0; simulatePieces(fw, 65536, 2);
+    CHECK(otaActive);
+    g_millis += 29000; loop(); CHECK(otaActive);
+    g_millis += 1500; loop(); CHECK(!otaActive && g_updateAborts == 1 && restoreDisplayAt != 0);
+    g_millis += 5100; loop(); CHECK(tileIsPic(0,0));
+    setResponse({{0,"A2"}}); loopWithUpdate(); CHECK(isTitleDisplaying);     // Twitch updates run again
+    reset(); }
 
   printf("T23 new firmware confirmed only after 60 s online\n");
   appPendingVerify = true; g_otaState = ESP_OTA_IMG_PENDING_VERIFY; g_markedValid = 0; g_wifiUp = true;
