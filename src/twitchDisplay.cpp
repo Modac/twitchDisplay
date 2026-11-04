@@ -1483,6 +1483,28 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
 }
 
 // One update: fetch (renewing the token if needed) and hand the result to loop()
+// Emoji and CJK downloads need an HTTPS connection (about 45 KB: two 16 KB
+// buffers plus the handshake) and then decoding/rendering. With titles being
+// rendered and drawn at the same time the heap ran empty, so these downloads
+// wait for a pause between titles, and only start with enough RAM in one
+// block. Returns false if there is no pause within 2 minutes (next update).
+#define DOWNLOAD_MIN_FREE_BLOCK 24576
+#define DOWNLOAD_MIN_FREE       49152
+#define TITLE_PAUSE_WAIT        120000
+bool waitForDownloadSlot(){
+  for(unsigned long t0 = millis(); isTitleDisplaying || installRequested;){
+    if(millis() - t0 > TITLE_PAUSE_WAIT || otaActive) return false;
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  if(otaActive) return false;
+  if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < DOWNLOAD_MIN_FREE_BLOCK || ESP.getFreeHeap() < DOWNLOAD_MIN_FREE){
+    emojiError = "not enough free memory for a download (" + String((unsigned)(ESP.getFreeHeap() / 1024)) + " KB, largest block "
+                 + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024)) + " KB), trying again later";
+    return false;
+  }
+  return true;
+}
+
 // Downloads the colour emoji of the live titles that are not cached yet
 // (network task), so a new title already shows them when it starts
 std::set<uint32_t> emojiMissing;   // not in Twemoji (404): not asked again until a restart
@@ -1496,7 +1518,7 @@ void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
   for(const auto& name : names){
     uint32_t key = emojiKey(name);
     if(emojiMissing.count(key) || emojiCached(key)) continue;
-    if(downloads++ >= EMOJI_MAX_PER_UPDATE || otaActive) break;
+    if(downloads++ >= EMOJI_MAX_PER_UPDATE || otaActive || !waitForDownloadSlot()) break;
     std::vector<uint8_t> png;
     String error = downloadToMemory(TWEMOJI_URL + name + ".png", png, EMOJI_MAX_DOWNLOAD);
     tlsClient.stop();   // free the TLS session before decoding
@@ -1710,7 +1732,7 @@ void fetchMissingCjk(const std::vector<StreamInfo>& streams){
       if(isCjk(cp) && titleFont.sourceFor(cp) == TitleFont::NONE && !cjkMissing.count(cp)
          && std::find(pending.begin(), pending.end(), cp) == pending.end() && !cacheLookup(glyphKey(cp)))
         if(pending.size() < CJK_MAX_CHARS) pending.push_back(cp);
-  if(pending.empty()) return;
+  if(pending.empty() || !waitForDownloadSlot()) return;
   cjkSlotBusy = true;
   int pieces = 0;
   for(int round = 0; round < CJK_FONTS && !pending.empty() && !otaActive; round++){
@@ -1719,12 +1741,13 @@ void fetchMissingCjk(const std::vector<StreamInfo>& streams){
       for(uint32_t cp : pending) if(cjkFontChoice(cp, round) == f) ask.push_back(cp);
       if(ask.empty()) continue;
       std::map<uint32_t, int> pieceOf;
+      if(!waitForDownloadSlot()) goto done;
       String error = cjkLookup(f, ask, pieceOf);
       if(error.length()){ emojiError = String(CJK_FONT_NAMES[f]) + " CSS: " + error; goto done; }
       std::set<int> needed;
       for(auto& kv : pieceOf) needed.insert(kv.second);
       for(int piece : needed){
-        if(pieces++ >= CJK_MAX_PIECES || otaActive) goto done;
+        if(pieces++ >= CJK_MAX_PIECES || otaActive || !waitForDownloadSlot()) goto done;
         size_t size = 0;
         error = cjkDownloadPiece(f, piece, slot, size);
         if(error.length()){ emojiError = String(CJK_FONT_NAMES[f]) + " piece " + String(piece) + ": " + error; goto done; }

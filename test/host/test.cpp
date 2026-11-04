@@ -767,6 +767,21 @@ int main(){
     cjkSlotBusy = true; unsigned long t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 >= 20000);   // gives up after 20 s
     cjkSlotBusy = false; t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 < 10);
 
+    printf("    downloads wait for a pause between titles and for enough RAM\n");
+    { reset(); setResponse({{0, "Lang genug"}}); loopWithUpdate(); CHECK(isTitleDisplaying);   // a title scrolls
+      g_requests.clear(); setResponse({{0, "Lang genug"}, {2, "Neu \xf0\x9f\xa6\x84"}}); twitchAnswer();   // 🦄 new
+      unsigned long t0 = g_millis; runNetworkUpdate();
+      CHECK(cjkUrls().empty() && std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
+      CHECK(g_millis - t0 >= TITLE_PAUSE_WAIT && !updateQueue->items.empty());   // waited 2 minutes, then handed the result over anyway
+      loop(); runUntilTitleDone(); while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+      g_requests.clear(); setResponse({{0, "Lang genug"}, {2, "Neu \xf0\x9f\xa6\x84!"}}); twitchAnswer(); g_responses.push_back({200, avatar("x")});
+      runNetworkUpdate(); CHECK(emojiCached(emojiKey("1f984")));          // in the pause: downloaded
+      loop(); runUntilTitleDone(); while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+      g_largestBlock = 20000; emojiError = "";
+      g_requests.clear(); setResponse({{0, "Wenig \xf0\x9f\xa6\x8a"}}); twitchAnswer(); runNetworkUpdate();
+      CHECK(!emojiCached(emojiKey("1f98a")) && contains(emojiError.c_str(), "not enough free memory") && std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
+      g_largestBlock = 61440; loop(); runUntilTitleDone(); reset(); }
+
     printf("    setting\n");
     auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
     server.find("/settings", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<select name=\"cjk\"><option value=\"on\" selected>downloaded when a title needs them"));
