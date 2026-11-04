@@ -11,9 +11,10 @@
 extern unsigned long g_millis;
 extern bool g_quiet;
 inline unsigned long millis(){ return g_millis; }
-inline unsigned long micros(){ return g_millis*1000UL; }
+extern unsigned long g_usFrac; // microseconds below g_millis
+inline unsigned long micros(){ return g_millis*1000UL + g_usFrac; }
 inline void delay(unsigned long ms){ g_millis += ms; }
-inline void delayMicroseconds(unsigned long us){ g_millis += (us + 999) / 1000; }
+inline void delayMicroseconds(unsigned long us){ unsigned long t = g_usFrac + us; g_millis += t / 1000; g_usFrac = t % 1000; }
 extern int g_analogReads;
 inline int analogRead(int){ g_analogReads++; return 2000; }
 inline void analogWrite(int,int){}

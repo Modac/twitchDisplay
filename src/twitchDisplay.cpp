@@ -160,12 +160,16 @@ CrlfSerial debugSerial;
 
 #define MAX_NUM_PICS 8
 
-// Title scrolling: frames at a fixed rate, position from the elapsed time, so
-// the speed stays even when a frame is late (the next one catches up)
+// Title scrolling: one frame per panel refresh, position from the elapsed
+// time, so the speed stays even when a frame is late (the next one catches up)
 #define CHAR_WIDTH          (6*8)  // text size 8: 6 px per character * 8
-#define SCROLL_SPEED        300    // px per second (3 px per frame at 100 fps)
-#define FRAME_INTERVAL_US   10000  // 100 frames per second
-#define PANEL_FRAME_RATE    0x03   // ST7789 FRCTRL2: 0x03 = 99 Hz, close to the frame rate (0x0F = 60 Hz default)
+// Panel refresh (ST7789V data sheet, FRCTRL2 C6h): 10 MHz / ((320 + FPA + BPA) * (250 + 16 * RTNA))
+// with the default porches FPA = BPA = 0x0C (B2h, not changed by the library).
+// RTNA 0x03 ("99 Hz" in the table) = 97.6 Hz, i.e. one refresh every 10251 us.
+// The module has no TE pin, so frames cannot be synchronised exactly.
+#define PANEL_FRAME_RATE    0x03
+#define FRAME_INTERVAL_US   ((320 + 0x0C + 0x0C) * (250 + 16 * PANEL_FRAME_RATE) / 10)
+#define SCROLL_STEP         3      // px per frame (= 293 px/s)
 
 // Logo grid layout: 4 columns x 2 rows of 64x64 pics
 #define PIC_SIZE    64
@@ -592,7 +596,7 @@ void advanceTitleCharacter(){
 void drawTitleFrame(){
   unsigned long now = micros();
   bool first = titleFrames == 0;
-  uint32_t target = (uint32_t)((uint64_t)(now - titleStartedUs) * SCROLL_SPEED / 1000000);
+  uint32_t target = (uint32_t)((uint64_t)(now - titleStartedUs) * SCROLL_STEP / FRAME_INTERVAL_US);
   uint32_t step = target - titlePixels;
   titlePixels = target;
   for(uint32_t moved = o_X + step; moved >= CHAR_WIDTH && isTitleDisplaying; moved -= CHAR_WIDTH){
@@ -744,8 +748,10 @@ void loop(){
   if(isTitleDisplaying){
     // sleep until the next title frame
     long wait = (long)(nextFrameUs - micros());
-    if(wait >= 1000) delay(wait / 1000);
-    else if(wait > 0) delayMicroseconds(wait);
+    if(wait > 0){
+      if(wait >= 1000) delay(wait / 1000);    // lets the network task run
+      delayMicroseconds(wait % 1000);
+    }
   } else {
     delay(10);
   }
