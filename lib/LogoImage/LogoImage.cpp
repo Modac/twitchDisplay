@@ -58,6 +58,8 @@ inline uint8_t paeth(int a, int b, int c){
 
 struct Image {
   int width = 0, height = 0, colorType = -1, bytesPerPixel = 0;
+  int bitDepth = 8;          // 1, 2 or 4 only for grayscale and palette images (packed samples)
+  size_t rowBytes = 0;       // per row, without the filter byte
   const uint8_t* palette = nullptr; int paletteSize = 0;      // PLTE entries
   const uint8_t* paletteAlpha = nullptr; int paletteAlphaSize = 0; // tRNS for palette images
   uint8_t* raw = nullptr; // unfiltered rows, each starting with its filter byte
@@ -65,7 +67,15 @@ struct Image {
 
 // RGB565 of a pixel, transparency blended onto black
 inline uint16_t pixel565(const Image& im, int x, int y){
-  const uint8_t* p = im.raw + (size_t)y * (1 + im.width * im.bytesPerPixel) + 1 + x * im.bytesPerPixel;
+  const uint8_t* row = im.raw + (size_t)y * (1 + im.rowBytes) + 1;
+  const uint8_t* p = row + x * im.bytesPerPixel;
+  uint8_t packed[1];
+  if(im.bitDepth < 8){   // unpack the sample: grayscale scaled to 0..255, palette index as is
+    int bit = x * im.bitDepth, mask = (1 << im.bitDepth) - 1;
+    int v = (row[bit >> 3] >> (8 - im.bitDepth - (bit & 7))) & mask;
+    packed[0] = (uint8_t)(im.colorType == 0 ? v * 255 / mask : v);
+    p = packed;
+  }
   uint32_t r, g, b, a = 255;
   switch(im.colorType){
     case 0: r = g = b = p[0]; break;
@@ -86,8 +96,8 @@ inline uint16_t pixel565(const Image& im, int x, int y){
 
 // Undoes the PNG row filters in place. False if a filter type is invalid.
 bool unfilter(Image& im){
-  size_t stride = 1 + (size_t)im.width * im.bytesPerPixel;
-  int bpp = im.bytesPerPixel, n = im.width * bpp;
+  size_t stride = 1 + im.rowBytes;
+  int bpp = im.bytesPerPixel, n = (int)im.rowBytes;   // packed samples: filters work on whole bytes
   for(int y = 0; y < im.height; y++){
     uint8_t* row = im.raw + y * stride;
     uint8_t* cur = row + 1;
@@ -110,7 +120,7 @@ void scaleRgb565(const uint16_t* src, int srcW, int srcH, uint16_t* dst, int dst
   scaleBox(srcW, srcH, [&](int x, int y){ return src[y * srcW + x]; }, dst, dstW, dstH);
 }
 
-const char* pngToLogo(const uint8_t* data, size_t len, uint16_t* out){
+const char* pngToRgb565(const uint8_t* data, size_t len, uint16_t* out, int outW, int outH){
   static const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
   if(len < 8 || memcmp(data, signature, 8) != 0) return "Unsupported image format (not PNG)";
 
@@ -137,14 +147,17 @@ const char* pngToLogo(const uint8_t* data, size_t len, uint16_t* out){
   static const int bytesPerPixel[] = {1, 0, 3, 1, 2, 0, 4};
   if(im.width < 1 || im.height < 1 || im.colorType < 0 || im.colorType > 6 || !bytesPerPixel[im.colorType] || idatChunks == 0) return "Invalid PNG image";
   if(interlace) return "Unsupported PNG (interlaced)";
-  if(bitDepth != 8) return "Unsupported PNG (not 8 bit)";
+  bool packed = (bitDepth == 1 || bitDepth == 2 || bitDepth == 4) && (im.colorType == 0 || im.colorType == 3);
+  if(bitDepth != 8 && !packed) return "Unsupported PNG (bit depth)";
   if(im.width > LOGO_MAX_SOURCE || im.height > LOGO_MAX_SOURCE) return "Image too large";
   if(im.colorType == 3 && !im.palette) return "Invalid PNG image";
   if(im.colorType != 3) im.paletteAlphaSize = 0; // tRNS colour keys of other types are ignored
   im.bytesPerPixel = bytesPerPixel[im.colorType];
+  im.bitDepth = bitDepth;
+  im.rowBytes = packed ? ((size_t)im.width * bitDepth + 7) / 8 : (size_t)im.width * im.bytesPerPixel;
 
   // second pass: unpack the IDAT chunks straight into the image buffer
-  size_t rawSize = (size_t)im.height * (1 + (size_t)im.width * im.bytesPerPixel);
+  size_t rawSize = (size_t)im.height * (1 + im.rowBytes);
   tinfl_decompressor* inflator = (tinfl_decompressor*)malloc(sizeof(tinfl_decompressor));
   im.raw = (uint8_t*)malloc(rawSize);
   if(!inflator || !im.raw){ free(inflator); free(im.raw); return "Out of memory"; }
@@ -167,7 +180,11 @@ const char* pngToLogo(const uint8_t* data, size_t len, uint16_t* out){
 
   const char* error = nullptr;
   if(status != TINFL_STATUS_DONE || outPos != rawSize || !unfilter(im)) error = "Invalid PNG image";
-  else scaleBox(im.width, im.height, [&](int x, int y){ return pixel565(im, x, y); }, out, LOGO_SIZE, LOGO_SIZE);
+  else scaleBox(im.width, im.height, [&](int x, int y){ return pixel565(im, x, y); }, out, outW, outH);
   free(im.raw);
   return error;
+}
+
+const char* pngToLogo(const uint8_t* data, size_t len, uint16_t* out){
+  return pngToRgb565(data, len, out, LOGO_SIZE, LOGO_SIZE);
 }
