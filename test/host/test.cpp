@@ -78,7 +78,7 @@ int g_wdtFeeds = 0; uint32_t g_wdtTimeout = 0;
 bool g_authOk = true; int g_lastCode = 0; std::string g_lastBody; int g_authChallenges = 0; int g_contentLength = 0;
 std::vector<uint8_t> g_flashed; bool g_updateRunning = false, g_updateEndOk = true; int g_updateBegins = 0, g_updateAborts = 0, g_updateEnds = 0;
 UpdateClass Update; MDNSStub MDNS;
-esp_partition_t g_running{"app0", 0x1e0000}, g_next{"app1", 0x1e0000}; esp_ota_img_states_t g_otaState = ESP_OTA_IMG_UNDEFINED; int g_markedValid = 0; int g_reconnects = 0; bool g_bundleUsed = false; int g_tlsStops = 0; WiFiClass WiFi;
+esp_partition_t g_running{"app0", 0x190000}, g_next{"app1", 0x190000}; std::vector<uint8_t> g_nextData(0x190000, 0xFF); esp_ota_img_states_t g_otaState = ESP_OTA_IMG_UNDEFINED; int g_markedValid = 0; int g_reconnects = 0; bool g_bundleUsed = false; int g_tlsStops = 0; WiFiClass WiFi;
 
 static int fails = 0;
 #define CHECK(cond) do{ if(!(cond)){ printf("  FAIL line %d: %s\n", __LINE__, #cond); fails++; } }while(0)
@@ -616,7 +616,7 @@ int main(){
     CHECK(names("\xf0\x9f\x91\xa9\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\x91\xa8") == std::vector<std::string>({"1f469-200d-2764-fe0f-200d-1f468"}));   // joiner sequence keeps VS16
     CHECK(names("\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xa5\xf3\xa0\x81\xae\xf3\xa0\x81\xa7\xf3\xa0\x81\xbf") == std::vector<std::string>({"1f3f4-e0067-e0062-e0065-e006e-e0067-e007f"}));   // England
     emojiMissing.clear(); emojiError = "";                                    // earlier tests' titles had emoji too (with no images to get)
-    CHECK(emojiCacheReady && emojiIndex.empty() && emojiCacheSectors == 62);
+    CHECK(emojiCacheReady && cacheIndex.empty() && cacheBytes == 62 * 4096);
     std::string fire = avatar("bonjwa"), flag = avatar("gronkh"), heart = avatar("x");
     auto twitchAnswer = [](){ g_responses.push_back({200, g_response}); };
     reset(); g_requests.clear();
@@ -625,8 +625,8 @@ int main(){
     loopWithUpdate();
     std::vector<std::string> urls; for(auto& r : g_requests) if(contains(r.url, "twemoji")) urls.push_back(r.url);
     CHECK(urls == std::vector<std::string>({TWEMOJI_URL "1f525.png", TWEMOJI_URL "1f1e9-1f1ea.png", TWEMOJI_URL "2764.png"}));   // each once, before the title
-    CHECK(emojiIndex.size() == 3 && emojiDownloads >= 3 && emojiError.isEmpty());
-    CHECK(isTitleDisplaying && titleText.emojiKey[7] == emojiKey("1f525") && titleText.advance[7] == EMOJI_ADVANCE && titleText.emojiKey[9] == emojiKey("1f1e9-1f1ea"));
+    CHECK(cacheIndex.size() == 3 && emojiDownloads >= 3 && emojiError.isEmpty());
+    CHECK(isTitleDisplaying && titleText.cacheKey[7] == emojiKey("1f525") && titleText.advance[7] == EMOJI_ADVANCE && titleText.cacheKey[9] == emojiKey("1f1e9-1f1ea"));
     { std::vector<uint16_t> px; CHECK(readEmoji(emojiKey("1f525"), px));
       std::vector<uint16_t> expect(EMOJI_SIZE * EMOJI_SIZE); pngToRgb565((const uint8_t*)fire.data(), fire.size(), expect.data(), EMOJI_SIZE, EMOJI_SIZE);
       CHECK(px == expect);                                                       // stored losslessly
@@ -647,41 +647,44 @@ int main(){
     g_requests.clear(); setResponse({{0, "Neu \xf0\x9f\x94\xa5\xe2\x9d\xa4"}}); twitchAnswer(); loopWithUpdate();
     CHECK(std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
     runUntilTitleDone();
-    { size_t used = 0; for(auto& e : emojiIndex) used += e.sectors;
-      openFont(); CHECK(emojiIndex.size() == 3 && emojiCached(emojiKey("2764")) && emojiNextSector == used); }   // the test images need one or two sectors
+    openFont(); CHECK(cacheIndex.size() == 3 && emojiCached(emojiKey("2764")) && cacheWriteOffset % CACHE_SECTOR == 0 && cacheWriteOffset > 0);   // next entry in a fresh sector
 
     printf("    not in Twemoji (404): monochrome, not asked again; network error: tried again next time\n");
     g_requests.clear(); setResponse({{0, "A \xf0\x9f\x8e\xae \xf0\x9f\x91\xbe"}}); twitchAnswer();
     g_responses.push_back({404, "Not Found"}); g_responses.push_back({500, "oops"});
     loopWithUpdate();
-    CHECK(isTitleDisplaying && titleText.emojiKey[2] == 0 && titleText.chars[2] == 0x1F3AE && titleText.advance[2] == titleFont.advance(0x1F3AE, TITLE_EM));   // monochrome 🎮
+    CHECK(isTitleDisplaying && titleText.cacheKey[2] == 0 && titleText.chars[2] == 0x1F3AE && titleText.advance[2] == titleFont.advance(0x1F3AE, TITLE_EM));   // monochrome 🎮
     CHECK(contains(emojiError.c_str(), "1f47e") && contains(emojiError.c_str(), "500"));
     runUntilTitleDone();
     g_requests.clear(); setResponse({{0, "A \xf0\x9f\x8e\xae \xf0\x9f\x91\xbe!"}}); twitchAnswer(); g_responses.push_back({200, heart}); loopWithUpdate();
     { std::vector<std::string> u; for(auto& r : g_requests) if(contains(r.url, "twemoji")) u.push_back(r.url);
       CHECK(u == std::vector<std::string>({TWEMOJI_URL "1f47e.png"})); }      // 🎮 not again, 👾 now
-    CHECK(emojiCached(emojiKey("1f47e")) && titleText.emojiKey[4] == emojiKey("1f47e"));
-    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji</td><td>colour (Twemoji, CC-BY 4.0): 4 stored, ") && contains(g_lastBody, " of 248 KB"));
+    CHECK(emojiCached(emojiKey("1f47e")) && titleText.cacheKey[4] == emojiKey("1f47e"));
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji, CJK</td><td>colour emoji (Twemoji, CC-BY 4.0), CJK downloaded<br>cache: 4 emoji, 0 CJK characters, ") && contains(g_lastBody, " of 248 KB"));
     runUntilTitleDone();
 
     printf("    monochrome only: no downloads, flags left out\n");
     config.colourEmoji = false; g_requests.clear();
     setResponse({{0, "B \xf0\x9f\x8d\x95 \xf0\x9f\x87\xa9\xf0\x9f\x87\xaa \xf0\x9f\x94\xa5"}}); twitchAnswer(); loopWithUpdate();
     CHECK(std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
-    CHECK(isTitleDisplaying && titleText.chars.size() == 10 && titleText.emojiKey[5] == 0 && titleText.chars[5] == 0x1F525);   // "B 🍕  🔥 | g" without the flag
-    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji</td><td>monochrome only"));
+    CHECK(isTitleDisplaying && titleText.chars.size() == 10 && titleText.cacheKey[5] == 0 && titleText.chars[5] == 0x1F525);   // "B 🍕  🔥 | g" without the flag
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji, CJK</td><td>monochrome emoji, CJK downloaded"));
     runUntilTitleDone(); config.colourEmoji = true;
 
-    printf("    full cache: the oldest are replaced, the index survives a restart\n");
-    std::vector<uint8_t> small = rleEncode(std::vector<uint16_t>(EMOJI_SIZE * EMOJI_SIZE, 0x1234).data(), EMOJI_SIZE * EMOJI_SIZE);
-    std::vector<uint8_t> big(5000, 0); for(size_t i = 0; i + 3 <= big.size(); i += 3) big[i] = 1;   // two sectors
-    for(int i = 0; i < 70; i++) CHECK(storeEmoji(emojiKey("e" + std::to_string(i)), i % 10 == 9 ? big : small));
+    printf("    full cache: the oldest sectors are replaced, the index survives a restart\n");
+    std::vector<uint8_t> typical(2400, 1), big(5000, 1), tiny(30, 1);
+    for(int i = 0; i < 70; i++) CHECK(storeCached(emojiKey("e" + std::to_string(i)), CACHE_COLOUR, EMOJI_SIZE, EMOJI_SIZE, 0, 0, EMOJI_ADVANCE, i % 10 == 9 ? big : typical));
     CHECK(!emojiCached(emojiKey("1f525")) && !emojiCached(emojiKey("e0")) && emojiCached(emojiKey("e69")) && emojiCached(emojiKey("e60")));
-    size_t count = emojiIndex.size(); uint16_t next = emojiNextSector;
-    openFont(); CHECK(emojiIndex.size() == count && emojiNextSector == next && emojiCached(emojiKey("e69")));
-    CHECK(!storeEmoji(1, std::vector<uint8_t>(9000, 1)));                      // more than two sectors: not stored
-    g_fontData[emojiCacheStart + (size_t)emojiNextSector * EMOJI_SECTOR + 30] ^= 0xFF;   // damaged entry: dropped at the next start
-    openFont(); CHECK(emojiIndex.size() == count - 1);
+    for(int i = 0; i < 100; i++) CHECK(storeCached(emojiKey("t" + std::to_string(i)), CACHE_GLYPH, 2, 2, 0, -2, 20, tiny));   // small ones share sectors
+    { std::set<uint32_t> sectors; for(auto& e : cacheIndex) if(e.size < 100) sectors.insert(e.offset / CACHE_SECTOR);
+      CHECK(sectors.size() == 2); }                                          // 100 x 56 bytes in two sectors
+    for(auto& e : cacheIndex) CHECK(e.size > CACHE_SECTOR ? e.offset % CACHE_SECTOR == 0 : e.offset % CACHE_SECTOR + e.size <= CACHE_SECTOR);
+    size_t count = cacheIndex.size();
+    openFont(); CHECK(cacheIndex.size() == count && emojiCached(emojiKey("e69")) && emojiCached(emojiKey("t99")));
+    CHECK(!storeCached(1, CACHE_COLOUR, EMOJI_SIZE, EMOJI_SIZE, 0, 0, EMOJI_ADVANCE, std::vector<uint8_t>(9000, 1)));   // more than two sectors
+    { const CacheIndexEntry* newest = nullptr; for(auto& e : cacheIndex) if(!newest || e.seq > newest->seq) newest = &e;
+      g_fontData[emojiCacheStart + newest->offset + 30] ^= 0xFF; }          // damaged entry: dropped at the next start
+    openFont(); CHECK(cacheIndex.size() == count - 1);
 
     printf("    setting\n");
     auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
@@ -691,6 +694,85 @@ int main(){
     loadConfig(); CHECK(!config.colourEmoji);
     server.find("/settings", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<option value=\"mono\" selected>"));
     g_nvs["config"].erase("emoji"); loadConfig(); CHECK(config.colourEmoji);
+    reset(); }
+
+  printf("T52 CJK characters: looked up in the CSS, piece into the free slot, rendered, cached\n");
+  { auto css = [](std::vector<std::pair<int, std::string>> pieces){   // fontsource-like CSS: piece number -> unicode-range
+      std::string c = "/* noto-sans-xx-latin-600-normal */\n@font-face {\n  src: url(./files/noto-sans-xx-latin-600-normal.woff2) format('woff2');\n  unicode-range: U+0000-00FF,U+4e00-9fff;\n}\n";
+      for(auto& p : pieces) c += "@font-face {\n  font-family: 'Noto Sans XX';\n  src: url(./files/noto-sans-xx-" + std::to_string(p.first) + "-600-normal.woff2) format('woff2'), url(./files/noto-sans-xx-"
+                                + std::to_string(p.first) + "-600-normal.woff) format('woff');\n  unicode-range: " + p.second + ";\n}\n\n";
+      return c; };
+    auto piece = readFile("data/noto-sans-kr-118-600-normal.ttf");
+    CHECK(piece.size() > 10000);
+    auto twitchAnswer = [](){ g_responses.push_back({200, g_response}); };
+    auto cjkUrls = [](){ std::vector<std::string> v; for(auto& r : g_requests) if(contains(r.url, "fontsource")) v.push_back(r.url); return v; };
+    reset(); g_requests.clear(); emojiError = ""; cjkMissing.clear(); appPendingVerify = false;
+    size_t glyphsBefore = 0; for(auto& e : cacheIndex) if(e.type == CACHE_GLYPH) glyphsBefore++;
+    std::fill(g_nextData.begin(), g_nextData.end(), 0xAB);                   // the free slot holds an old firmware
+    setResponse({{0, "\xec\x95\x88\xec\x84\xb8 \xe4\xbd\xa0"}}); twitchAnswer();   // "안세 你"
+    g_responses.push_back({200, css({{3, "U+3041-3096"}})});                 // Japanese: not there (你 asked here first)
+    g_responses.push_back({200, css({{117, "U+c544-c547"}, {118, "U+c138,U+c548,U+4??"}})});   // Korean: piece 118
+    g_responses.push_back({200, std::string(piece.begin(), piece.end()), -1});   // no Content-Length: until the server closes
+    g_responses.push_back({200, css({{5, "U+4f5f-4f61"}})});                 // Chinese: piece 5
+    g_responses.push_back({404, "Not Found"});
+    loopWithUpdate();
+    CHECK(cjkUrls() == std::vector<std::string>({
+      "https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-jp@5.3.1/600.css",
+      "https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-kr@5.3.1/600.css",
+      "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-kr@5.3.1/118-600-normal.ttf",
+      "https://cdn.jsdelivr.net/npm/@fontsource/noto-sans-sc@5.3.1/600.css",
+      "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@5.3.1/5-600-normal.ttf"}));
+    CHECK(std::equal(piece.begin(), piece.end(), g_nextData.begin()) && !cjkSlotBusy);   // the piece went into the free slot
+    CHECK(contains(emojiError.c_str(), "noto-sans-sc piece 5: download failed (404)") && !cjkMissing.count(0x4F60));   // tried again later
+    { CacheIndexEntry e; CHECK(cacheLookup(glyphKey(0xC548), &e) && e.type == CACHE_GLYPH && cacheLookup(glyphKey(0xC138)) && !cacheLookup(glyphKey(0x4F60)));
+      GlyphBitmap cached, direct; int adv = 0;
+      CHECK(readCached(glyphKey(0xC548), nullptr, &cached) && TitleFont::renderFrom(piece.data(), 0xC548, TITLE_EM, direct, adv));
+      CHECK(cached.alpha == direct.alpha && cached.w == direct.w && cached.yoff == direct.yoff && e.advance == adv); }   // stored losslessly
+    CHECK(isTitleDisplaying && titleText.cacheKey[0] == glyphKey(0xC548) && titleText.cacheKey[1] == glyphKey(0xC138) && titleText.cacheKey[3] == 0);
+    CHECK(titleText.advance[3] == (int)(TITLE_EM * 0.6f));                     // 你: a box for now
+    { bool drawn = false;                                                      // 안 drawn in the title colour
+      GlyphBitmap g; readCached(glyphKey(0xC548), nullptr, &g);
+      for(int k = 0; k < 200 && isTitleDisplaying && !drawn; k++){
+        loopNoUpdate(1);
+        const uint16_t* b = text_canvas.getBuffer();
+        for(int x = 0; x + g.w < CANVAS_W && !drawn; x++){
+          int same = 0, ink = 0;
+          for(int j = 0; j < g.h; j++) for(int i = 0; i < g.w; i++) if(g.alpha[j*g.w + i] == 255){ ink++; if(b[(TITLE_BASELINE + g.yoff + j)*CANVAS_W + x + g.xoff + i] == TITLE_COLOR) same++; }
+          if(ink > 50 && same == ink) drawn = true;
+        }
+      }
+      CHECK(drawn); }
+    runUntilTitleDone();
+    { size_t glyphs = 0; for(auto& e : cacheIndex) if(e.type == CACHE_GLYPH) glyphs++;
+      server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "emoji, " + std::to_string(glyphs) + " CJK characters,") && glyphs == glyphsBefore + 2); }
+
+    printf("    a character no font has: looked up in all three, then not again\n");
+    g_requests.clear(); setResponse({{0, "\xe4\xb8\x81"}}); twitchAnswer();      // 丁
+    for(int k = 0; k < 3; k++) g_responses.push_back({200, css({{1, "U+3041"}})});
+    loopWithUpdate(); runUntilTitleDone();
+    CHECK(cjkUrls().size() == 3 && cjkMissing.count(0x4E01));
+    g_requests.clear(); setResponse({{0, "\xe4\xb8\x81!"}}); twitchAnswer(); loopWithUpdate(); runUntilTitleDone();
+    CHECK(cjkUrls().empty());
+
+    printf("    not while the firmware is on probation, not while an update runs, not when switched off\n");
+    for(int mode = 0; mode < 3; mode++){
+      appPendingVerify = mode == 0; otaActive = false; config.cjk = mode != 2;
+      g_requests.clear(); setResponse({{0, "\xe4\xbd\xa0" + std::to_string(mode)}}); twitchAnswer();
+      if(mode == 1){ otaActive = true; fetchMissingCjk(std::vector<StreamInfo>{StreamInfo{"1", "x", "\xe4\xbd\xa0"}}); otaActive = false; }
+      else { loopWithUpdate(); runUntilTitleDone(); }
+      CHECK(cjkUrls().empty());
+    }
+    appPendingVerify = false; config.cjk = true;
+    printf("    updates wait for a piece download that uses the slot\n");
+    cjkSlotBusy = true; unsigned long t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 >= 20000);   // gives up after 20 s
+    cjkSlotBusy = false; t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 < 10);
+
+    printf("    setting\n");
+    auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
+    server.find("/settings", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<select name=\"cjk\"><option value=\"on\" selected>downloaded when a title needs them"));
+    rebootAt = 0; post({{"cjk", "off"}}); CHECK(g_nvs["config"]["cjk"] == "off"); rebootAt = 0;
+    loadConfig(); CHECK(!config.cjk);
+    g_nvs["config"].erase("cjk"); loadConfig(); CHECK(config.cjk);
     reset(); }
 
   printf("T23 new firmware confirmed only after 60 s online\n");
@@ -716,7 +798,7 @@ int main(){
   if(getenv("DUMP")){ std::ofstream("status.html") << g_lastBody; }
   CHECK(g_lastBody.find("flashed via USB") != std::string::npos || g_lastBody.find("confirmed") != std::string::npos);
   server.find("/update", HTTP_GET)->fn();
-  CHECK(g_lastCode == 200 && g_lastBody.find("const maxSize = 1966080;") != std::string::npos);
+  CHECK(g_lastCode == 200 && g_lastBody.find("const maxSize = 1638400;") != std::string::npos);
   if(getenv("DUMP")){ std::ofstream("update.html") << g_lastBody; }
   g_authOk = false; g_authChallenges = 0;
   server.find("/", HTTP_GET)->fn(); CHECK(g_lastCode == 401);

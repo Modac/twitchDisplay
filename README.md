@@ -106,9 +106,20 @@ about 60 of them in flash (the oldest are replaced). Flags, skin tones and
 combined emoji work too. Emoji without a colour image, or while a download
 fails, are drawn from a monochrome emoji font in the text colour (about 400
 common ones). Settings > **Emoji in titles** switches to monochrome only (no
-downloads). Characters the fonts do not have, e.g. Chinese, Japanese or
-Korean, show as a box for now. Without `font.bin` (see below) titles use the
-built-in 5×7 font, which knows umlauts but no emoji.
+downloads).
+
+Chinese, Japanese and Korean characters come from Noto Sans JP, KR and SC
+(SIL Open Font License), which [fontsource](https://fontsource.org) splits
+into about 100 pieces per language. For characters of a new title that are
+not cached yet, the display looks up the pieces in fontsource's CSS,
+downloads them (17-100 KB each) into the firmware slot that is not running
+(only after the running firmware has been confirmed; updates wait for such a
+download), renders the characters and caches them (about 1 KB each), so a
+title with many new ones can take half a minute to start. Hangul comes from
+the Korean font; other characters from the Japanese font first, then the
+Chinese one. Settings > **Chinese, Japanese, Korean** switches this off
+(boxes). Characters no font has show as a box. Without `font.bin` (see
+below) titles use the built-in 5×7 font, which knows umlauts but no emoji.
 
 The display looks the channels up on Twitch at the start and once a day and
 downloads each channel's avatar (the 70×70 version, about 10 KB) only when it
@@ -148,7 +159,7 @@ passwords stay hidden, uploads from PlatformIO still need the password).
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
 - **Settings**: WiFi, Twitch credentials, channel list, title repeat, emoji,
-  web password and login, reset to defaults
+  CJK characters, web password and login, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on
 probation" and only confirms itself after it has been online for 60 s. If it
@@ -165,9 +176,9 @@ support?)" after an update, flash once over USB.
 | 0x009000 | 20 KB | `nvs` | Settings, channel cache, logo index |
 | 0x00E000 | 8 KB | `otadata` | Which firmware slot boots, rollback state |
 | 0x010000 | 1600 KB | `app0` | Firmware slot 1 |
-| 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running) |
+| 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running; meanwhile it holds downloaded CJK font pieces) |
 | 0x330000 | 256 KB | `logos` | 32 channel logos, 64×64 pixels each |
-| 0x370000 | 512 KB | `font` | `font.bin` (about 260 KB) and the colour emoji cache |
+| 0x370000 | 512 KB | `font` | `font.bin` (about 260 KB) and the cache for colour emoji and CJK characters |
 | 0x3F0000 | 64 KB | `coredump` | Crash dump |
 
 The firmware knows which `font.bin` it was built with. If the `font`

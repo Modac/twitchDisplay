@@ -20,7 +20,8 @@ inline const esp_partition_t* esp_partition_find_first(int type, int subtype, co
   if(subtype == 0x40 && g_haveFontPartition && (!label || !strcmp(label, "font"))) return &g_fontPart;
   return nullptr;
 }
-inline std::vector<uint8_t>& partData(const esp_partition_t* p){ return p == &g_fontPart ? g_fontData : g_flashData; }
+extern esp_partition_t g_next; extern std::vector<uint8_t> g_nextData;   // the free firmware slot (CJK pieces)
+inline std::vector<uint8_t>& partData(const esp_partition_t* p){ return p == &g_fontPart ? g_fontData : p == &g_next ? g_nextData : g_flashData; }
 inline esp_err_t esp_partition_read(const esp_partition_t* p, size_t off, void* dst, size_t n){ auto& d = partData(p); if(off+n > d.size()) return -1; memcpy(dst, &d[off], n); return ESP_OK; }
 inline esp_err_t esp_partition_erase_range(const esp_partition_t* p, size_t off, size_t n){ auto& d = partData(p); if(g_flashFail || off%4096 || n%4096 || off+n > d.size()) return -1; memset(&d[off], 0xFF, n); g_flashErases++; return ESP_OK; }
 inline esp_err_t esp_partition_write(const esp_partition_t* p, size_t off, const void* src, size_t n){ auto& d = partData(p); if(g_flashFail || off+n > d.size()) return -1; const uint8_t* b=(const uint8_t*)src; for(size_t i=0;i<n;i++){ if((d[off+i] & b[i]) != b[i]) g_flashBadWrites++; d[off+i] &= b[i]; } g_flashWrites++; return ESP_OK; }

@@ -29,7 +29,7 @@ struct HTTPClient {
     ss.str(r.body); fs.data = r.body; fs.pos = 0; size = r.size == -2 ? (int)r.body.size() : r.size; return r.code; }
   void setUserAgent(const char* u){ req.userAgent = u; } void setUserAgent(const String& u){ req.userAgent = u; }
   void setFollowRedirects(int f){ req.follow = f; } void setTimeout(int){}
-  int getSize(){ return size; } FakeStream* getStreamPtr(){ return &fs; } bool connected(){ return true; }
+  int getSize(){ return size; } FakeStream* getStreamPtr(){ return &fs; } bool connected(){ return fs.pos < fs.data.size(); }   // the server closes after the body
   int GET(){ req.method="GET"; return respond(); }
   int POST(const char* b){ req.method="POST"; req.body=b; return respond(); }
   std::istream& getStream(){ return ss; }

@@ -29,6 +29,8 @@
 
 #include <deque>
 #include <set>
+#include <map>
+#include <functional>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -298,6 +300,7 @@ struct Config {
   uint16_t titleRepeatMinutes;  // show a live channel's title again after this many minutes without a title, 0 = off
   bool requireLogin;   // web interface needs the password (off: anyone on the network may use it)
   bool colourEmoji;    // emoji in titles: colour images downloaded from Twemoji (false: monochrome only)
+  bool cjk;            // Chinese/Japanese/Korean characters: rendered from downloaded font pieces (false: boxes)
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -319,6 +322,7 @@ void loadConfig(){
   config.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
   config.requireLogin = prefs.getString("login", "1") != "0";
   config.colourEmoji = prefs.getString("emoji", "colour") != "mono";
+  config.cjk = prefs.getString("cjk", "on") != "off";
   prefs.end();
 }
 
@@ -624,7 +628,7 @@ volatile bool isTitleDisplaying = false;
 struct TitleText {
   std::vector<uint32_t> chars;     // code points (font.bin) or CP437 codes (built-in font)
   std::vector<uint16_t> advance;   // pixels
-  std::vector<uint32_t> emojiKey;  // cached colour emoji to draw (0: draw chars[i] from the fonts)
+  std::vector<uint32_t> cacheKey;  // cached colour emoji or CJK character to draw (0: draw chars[i] from the fonts)
   uint32_t width = 0;              // of the text, without the gap
   bool builtin = true;             // drawn with the built-in font
 } titleText;
@@ -718,35 +722,47 @@ String fontUrl(){
   return "https://github.com/" GITHUB_REPO "/releases/latest/download/" FONT_ASSET;
 }
 
-// ---------- Colour emoji: Twemoji images (CC-BY 4.0), downloaded by the
-// network task before it hands a Twitch result to loop(), and kept in the
-// font partition after font.bin. Each emoji is stored as 54x54 RGB565,
-// run-length coded (about 2.4 KB), from the start of a 4 KB sector (one or
-// two sectors); when the cache is full the oldest ones are replaced.
+// ---------- Cache in the font partition after font.bin, filled by the
+// network task before it hands a Twitch result to loop():
+//  - colour emoji: Twemoji images (CC-BY 4.0) as 54x54 RGB565 (about 2.4 KB)
+//  - CJK characters rendered from downloaded font pieces (about 1 KB)
+// Entries are run-length coded and written one after another; one never
+// crosses into the next 4 KB sector unless it is larger than a sector (then
+// it starts at a sector). When the cache is full, the oldest sector is
+// erased (with all its entries). The index is rebuilt from the sectors at boot.
 #define EMOJI_SIZE           54
 #define EMOJI_ADVANCE        60     // pixels in the title
 #define EMOJI_TOP            (TITLE_BASELINE - 46)   // like the monochrome emoji
-#define EMOJI_CACHE_MAGIC    0x31454D43UL            // "CME1"
-#define EMOJI_SECTOR         4096
-#define EMOJI_MAX_SECTORS    2
+#define CACHE_MAGIC          0x32454D43UL            // "CME2"
+#define CACHE_SECTOR         4096
+#define CACHE_MAX_ENTRY      (2 * CACHE_SECTOR)
+#define CACHE_COLOUR         1      // RGB565 runs: (count, colour lo, colour hi)
+#define CACHE_GLYPH          2      // coverage runs: (count, alpha)
 #define EMOJI_MAX_PER_UPDATE 8      // downloads before a Twitch result goes to loop(); the rest next time
 #define EMOJI_MAX_DOWNLOAD   16384
 #define TWEMOJI_URL          "https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.3/assets/72x72/"
 
-struct EmojiEntryHeader {
-  uint32_t magic, key, seq;  // key: CRC-32 of the Twemoji file name; seq: increases with every entry
+struct CacheEntryHeader {
+  uint32_t magic, key, seq;  // key: CRC-32 of a name; seq: increases with every entry
   uint16_t len;              // bytes of run-length data after the header
-  uint8_t w, h;
+  uint8_t type, w, h;
+  int8_t xoff, yoff;         // glyphs: top-left pixel relative to the pen position on the baseline
+  uint8_t advance;
   uint32_t crc;              // of the run-length data
 };
-static_assert(sizeof(EmojiEntryHeader) == 20, "cache entry header");
-struct EmojiIndexEntry { uint32_t key, seq; uint16_t sector, sectors; };
+static_assert(sizeof(CacheEntryHeader) == 24, "cache entry header");
+struct CacheIndexEntry {
+  uint32_t key, seq, offset;  // offset from the cache start
+  uint16_t size;              // header + data, rounded up to 4 bytes
+  uint8_t type, w, h, advance;
+  int8_t xoff, yoff;
+};
 
 SemaphoreHandle_t emojiLock = nullptr;     // index and cache sectors (network task writes, loop/render read)
-std::vector<EmojiIndexEntry> emojiIndex;
+std::vector<CacheIndexEntry> cacheIndex;
 size_t emojiCacheStart = 0;                // offset in the font partition
-uint16_t emojiCacheSectors = 0, emojiNextSector = 0;
-uint32_t emojiSeq = 1;
+uint32_t cacheBytes = 0, cacheWriteOffset = 0;
+uint32_t cacheSeq = 1;
 bool emojiCacheReady = false;
 String emojiError;                         // last download problem, for the status page
 uint32_t emojiDownloads = 0;
@@ -754,82 +770,100 @@ uint32_t emojiDownloads = 0;
 uint32_t emojiKey(const std::string& name){
   return fontCrc32((const uint8_t*)name.data(), name.size());
 }
+uint32_t glyphKey(uint32_t cp){
+  char name[16];
+  snprintf(name, sizeof(name), "u+%lx", (unsigned long)cp);
+  return emojiKey(name);
+}
 
 void resetEmojiCache(){
   if(emojiLock) xSemaphoreTake(emojiLock, portMAX_DELAY);
   emojiCacheReady = false;
-  emojiIndex.clear();
+  cacheIndex.clear();
   if(emojiLock) xSemaphoreGive(emojiLock);
 }
 
 // Reads the cache index from the sectors after font.bin (fontLen bytes)
 void initEmojiCache(size_t fontLen){
   xSemaphoreTake(emojiLock, portMAX_DELAY);
-  emojiIndex.clear();
-  emojiCacheStart = (fontLen + EMOJI_SECTOR - 1) / EMOJI_SECTOR * EMOJI_SECTOR;
-  emojiCacheSectors = fontPartition->size > emojiCacheStart ? (fontPartition->size - emojiCacheStart) / EMOJI_SECTOR : 0;
-  emojiNextSector = 0;
-  emojiSeq = 1;
-  const EmojiIndexEntry* newest = nullptr;
-  for(uint16_t s = 0; s < emojiCacheSectors;){
-    const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + (size_t)s * EMOJI_SECTOR;
-    EmojiEntryHeader h;
-    memcpy(&h, p, sizeof(h));
-    uint16_t need = (sizeof(h) + h.len + EMOJI_SECTOR - 1) / EMOJI_SECTOR;
-    if(h.magic == EMOJI_CACHE_MAGIC && h.len && h.w == EMOJI_SIZE && h.h == EMOJI_SIZE && need <= EMOJI_MAX_SECTORS
-       && s + need <= emojiCacheSectors && fontCrc32(p + sizeof(h), h.len) == h.crc){
-      emojiIndex.push_back({h.key, h.seq, s, need});
-      s += need;
-    } else s++;
+  cacheIndex.clear();
+  emojiCacheStart = (fontLen + CACHE_SECTOR - 1) / CACHE_SECTOR * CACHE_SECTOR;
+  cacheBytes = fontPartition->size > emojiCacheStart ? (fontPartition->size - emojiCacheStart) / CACHE_SECTOR * CACHE_SECTOR : 0;
+  const uint8_t* base = (const uint8_t*)fontMap + emojiCacheStart;
+  const CacheIndexEntry* newest = nullptr;
+  for(uint32_t off = 0; off + sizeof(CacheEntryHeader) <= cacheBytes;){
+    CacheEntryHeader h;
+    memcpy(&h, base + off, sizeof(h));
+    uint32_t size = (sizeof(h) + h.len + 3) & ~3u;
+    bool fits = size <= CACHE_MAX_ENTRY && off + size <= cacheBytes
+             && (size > CACHE_SECTOR ? off % CACHE_SECTOR == 0 : off % CACHE_SECTOR + size <= CACHE_SECTOR);
+    if(h.magic == CACHE_MAGIC && h.len && fits && (h.type == CACHE_COLOUR || h.type == CACHE_GLYPH)
+       && fontCrc32(base + off + sizeof(h), h.len) == h.crc){
+      cacheIndex.push_back({h.key, h.seq, off, (uint16_t)size, h.type, h.w, h.h, h.advance, h.xoff, h.yoff});
+      off += size;
+      if(size > CACHE_SECTOR) off = (off + CACHE_SECTOR - 1) / CACHE_SECTOR * CACHE_SECTOR;   // nothing follows a large entry in its sector
+    } else off = (off / CACHE_SECTOR + 1) * CACHE_SECTOR;   // the rest of this sector is empty or stale
   }
-  for(const auto& e : emojiIndex) if(!newest || e.seq > newest->seq) newest = &e;
-  if(newest){
-    emojiSeq = newest->seq + 1;
-    emojiNextSector = newest->sector + newest->sectors;
-    if(emojiNextSector >= emojiCacheSectors) emojiNextSector = 0;
-  }
-  emojiCacheReady = emojiCacheSectors >= EMOJI_MAX_SECTORS;
+  for(const auto& e : cacheIndex) if(!newest || e.seq > newest->seq) newest = &e;
+  cacheSeq = newest ? newest->seq + 1 : 1;
+  // continue in a fresh sector after the newest entry (the rest of its sector may hold a broken write)
+  cacheWriteOffset = newest ? ((newest->offset + newest->size + CACHE_SECTOR - 1) / CACHE_SECTOR * CACHE_SECTOR) : 0;
+  if(cacheWriteOffset >= cacheBytes) cacheWriteOffset = 0;
+  emojiCacheReady = cacheBytes >= 4 * CACHE_SECTOR;
   xSemaphoreGive(emojiLock);
-  DEBUG_I.printf("[Emoji] Cache: %u emoji in %u sectors.\n", (unsigned)emojiIndex.size(), emojiCacheSectors);
+  DEBUG_I.printf("[Cache] %u entries in %lu KB.\n", (unsigned)cacheIndex.size(), (unsigned long)(cacheBytes / 1024));
 }
 
-const EmojiIndexEntry* findEmoji(uint32_t key){   // under emojiLock
-  const EmojiIndexEntry* found = nullptr;
-  for(const auto& e : emojiIndex) if(e.key == key && (!found || e.seq > found->seq)) found = &e;
+const CacheIndexEntry* findCached(uint32_t key){   // under emojiLock
+  const CacheIndexEntry* found = nullptr;
+  for(const auto& e : cacheIndex) if(e.key == key && (!found || e.seq > found->seq)) found = &e;
   return found;
 }
 
-bool emojiCached(uint32_t key){
+// Copies the index entry of a cached item (false: not cached)
+bool cacheLookup(uint32_t key, CacheIndexEntry* out = nullptr){
   if(!emojiLock) return false;
   xSemaphoreTake(emojiLock, portMAX_DELAY);
-  bool cached = emojiCacheReady && findEmoji(key);
+  const CacheIndexEntry* e = emojiCacheReady ? findCached(key) : nullptr;
+  if(e && out) *out = *e;
   xSemaphoreGive(emojiLock);
-  return cached;
+  return e != nullptr;
 }
+bool emojiCached(uint32_t key){ return cacheLookup(key); }
 
-// Decodes a cached emoji into px (EMOJI_SIZE x EMOJI_SIZE)
-bool readEmoji(uint32_t key, std::vector<uint16_t>& px){
+// Decodes a cached item: colour emoji into colour (EMOJI_SIZE x EMOJI_SIZE),
+// glyphs into glyph. False if it is not (any more) in the cache.
+bool readCached(uint32_t key, std::vector<uint16_t>* colour, GlyphBitmap* glyph){
   xSemaphoreTake(emojiLock, portMAX_DELAY);
-  const EmojiIndexEntry* e = emojiCacheReady ? findEmoji(key) : nullptr;
+  const CacheIndexEntry* e = emojiCacheReady ? findCached(key) : nullptr;
   bool ok = false;
   if(e){
-    const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + (size_t)e->sector * EMOJI_SECTOR;
-    EmojiEntryHeader h;
+    const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + e->offset;
+    CacheEntryHeader h;
     memcpy(&h, p, sizeof(h));
-    px.assign(EMOJI_SIZE * EMOJI_SIZE, 0);
-    size_t out = 0;
-    for(size_t i = 0; i + 3 <= h.len && out < px.size(); i += 3){
-      const uint8_t* run = p + sizeof(h) + i;
-      uint16_t color = run[1] | (run[2] << 8);
-      for(int k = 0; k < run[0] && out < px.size(); k++) px[out++] = color;
+    p += sizeof(h);
+    size_t out = 0, total = (size_t)h.w * h.h;
+    if(h.type == CACHE_COLOUR && colour){
+      colour->assign(total, 0);
+      for(size_t i = 0; i + 3 <= h.len && out < total; i += 3){
+        uint16_t c = p[i + 1] | (p[i + 2] << 8);
+        for(int k = 0; k < p[i] && out < total; k++) (*colour)[out++] = c;
+      }
+      ok = out == total;
+    } else if(h.type == CACHE_GLYPH && glyph){
+      glyph->w = h.w; glyph->h = h.h; glyph->xoff = h.xoff; glyph->yoff = h.yoff;
+      glyph->alpha.assign(total, 0);
+      for(size_t i = 0; i + 2 <= h.len && out < total; i += 2)
+        for(int k = 0; k < p[i] && out < total; k++) glyph->alpha[out++] = p[i + 1];
+      ok = out == total;
     }
-    ok = out == px.size();
   }
   xSemaphoreGive(emojiLock);
   return ok;
 }
+bool readEmoji(uint32_t key, std::vector<uint16_t>& px){ return readCached(key, &px, nullptr); }
 
-// Run-length coding: runs of (count 1..255, RGB565 little endian)
+// Run-length coding of RGB565 pixels: (count 1..255, colour little endian)
 std::vector<uint8_t> rleEncode(const uint16_t* px, size_t n){
   std::vector<uint8_t> out;
   for(size_t i = 0; i < n;){
@@ -843,29 +877,54 @@ std::vector<uint8_t> rleEncode(const uint16_t* px, size_t n){
   return out;
 }
 
-// Writes an emoji into the next sector(s), replacing the oldest entries there
-bool storeEmoji(uint32_t key, const std::vector<uint8_t>& rle){
-  uint16_t need = (sizeof(EmojiEntryHeader) + rle.size() + EMOJI_SECTOR - 1) / EMOJI_SECTOR;
-  if(rle.empty() || need > EMOJI_MAX_SECTORS) return false;
+// Run-length coding of coverage: (count 1..255, alpha)
+std::vector<uint8_t> rleEncodeAlpha(const uint8_t* a, size_t n){
+  std::vector<uint8_t> out;
+  for(size_t i = 0; i < n;){
+    size_t run = 1;
+    while(i + run < n && run < 255 && a[i + run] == a[i]) run++;
+    out.push_back((uint8_t)run);
+    out.push_back(a[i]);
+    i += run;
+  }
+  return out;
+}
+
+// Appends an entry, erasing the next sector(s) (and the entries in them) first
+bool storeCached(uint32_t key, uint8_t type, uint8_t w, uint8_t h, int8_t xoff, int8_t yoff, uint8_t advance, const std::vector<uint8_t>& data){
+  uint32_t size = (sizeof(CacheEntryHeader) + data.size() + 3) & ~3u;
+  if(data.empty() || data.size() > 0xFFFF || size > CACHE_MAX_ENTRY) return false;
   xSemaphoreTake(emojiLock, portMAX_DELAY);
   bool ok = false;
   if(emojiCacheReady){
-    if(emojiNextSector + need > emojiCacheSectors) emojiNextSector = 0;
-    uint16_t first = emojiNextSector;
-    emojiIndex.erase(std::remove_if(emojiIndex.begin(), emojiIndex.end(), [&](const EmojiIndexEntry& e){
-      return e.sector < first + need && first < e.sector + e.sectors; }), emojiIndex.end());
-    size_t offset = emojiCacheStart + (size_t)first * EMOJI_SECTOR;
-    EmojiEntryHeader h{EMOJI_CACHE_MAGIC, key, emojiSeq, (uint16_t)rle.size(), EMOJI_SIZE, EMOJI_SIZE, fontCrc32(rle.data(), rle.size())};
-    ok = esp_partition_erase_range(fontPartition, offset, (size_t)need * EMOJI_SECTOR) == ESP_OK
-      && esp_partition_write(fontPartition, offset + sizeof(h), rle.data(), rle.size()) == ESP_OK
-      && esp_partition_write(fontPartition, offset, &h, sizeof(h)) == ESP_OK;
+    uint32_t off = cacheWriteOffset;
+    if(size > CACHE_SECTOR ? off % CACHE_SECTOR != 0 : off % CACHE_SECTOR + size > CACHE_SECTOR)
+      off = (off / CACHE_SECTOR + 1) * CACHE_SECTOR;   // to the next sector
+    if(off + size > cacheBytes) off = 0;                // wrap around: the oldest sectors go
+    ok = true;
+    if(off % CACHE_SECTOR == 0){
+      uint32_t erase = (size + CACHE_SECTOR - 1) / CACHE_SECTOR * CACHE_SECTOR;
+      cacheIndex.erase(std::remove_if(cacheIndex.begin(), cacheIndex.end(), [&](const CacheIndexEntry& e){
+        return e.offset < off + erase && off < e.offset + e.size; }), cacheIndex.end());
+      ok = esp_partition_erase_range(fontPartition, emojiCacheStart + off, erase) == ESP_OK;
+    }
+    CacheEntryHeader hd{CACHE_MAGIC, key, cacheSeq, (uint16_t)data.size(), type, w, h, xoff, yoff, advance, fontCrc32(data.data(), data.size())};
+    ok = ok && esp_partition_write(fontPartition, emojiCacheStart + off + sizeof(hd), data.data(), data.size()) == ESP_OK
+            && esp_partition_write(fontPartition, emojiCacheStart + off, &hd, sizeof(hd)) == ESP_OK;
     if(ok){
-      emojiIndex.push_back({key, emojiSeq++, first, need});
-      emojiNextSector = first + need;
+      cacheIndex.push_back({key, cacheSeq++, off, (uint16_t)size, type, w, h, advance, xoff, yoff});
+      cacheWriteOffset = off + size;
+      // after an entry larger than a sector, continue in a fresh sector: otherwise replacing its
+      // first sector would leave its tail in front of the next entries, and the scan at boot would miss them
+      if(size > CACHE_SECTOR) cacheWriteOffset = (cacheWriteOffset + CACHE_SECTOR - 1) / CACHE_SECTOR * CACHE_SECTOR;
     }
   }
   xSemaphoreGive(emojiLock);
   return ok;
+}
+
+bool storeEmoji(uint32_t key, const std::vector<uint8_t>& rle){
+  return storeCached(key, CACHE_COLOUR, EMOJI_SIZE, EMOJI_SIZE, 0, 0, EMOJI_ADVANCE, rle);
 }
 
 // Green frame around the pic of the channel whose title is scrolling
@@ -929,17 +988,20 @@ void layoutTitle(const std::string& utf8){
   if(titleFont.ready()){
     titleText.builtin = false;
     for(const TitleChar& c : titleChars(utf8.c_str())){
-      uint32_t key = (!c.emoji.empty() && config.colourEmoji) ? emojiKey(c.emoji) : 0;
-      if(key && !emojiCached(key)) key = 0;
+      uint32_t key = 0;
+      if(!c.emoji.empty() && config.colourEmoji) key = emojiKey(c.emoji);
+      else if(c.emoji.empty() && config.cjk && titleFont.sourceFor(c.cp) == TitleFont::NONE) key = glyphKey(c.cp);   // a downloaded CJK character?
+      CacheIndexEntry cached;
+      if(key && !cacheLookup(key, &cached)) key = 0;
       if(!key && !c.cp) continue;        // a flag without its colour image: nothing to draw
       titleText.chars.push_back(c.cp);
-      titleText.emojiKey.push_back(key);
-      titleText.advance.push_back((uint16_t)(key ? EMOJI_ADVANCE : titleFont.advance(c.cp, TITLE_EM)));
+      titleText.cacheKey.push_back(key);
+      titleText.advance.push_back((uint16_t)(key ? cached.advance : titleFont.advance(c.cp, TITLE_EM)));
     }
   } else {
     for(char c : toDisplayText(utf8.c_str())){
       titleText.chars.push_back((uint8_t)c);
-      titleText.emojiKey.push_back(0);
+      titleText.cacheKey.push_back(0);
       titleText.advance.push_back(BUILTIN_ADVANCE);
     }
   }
@@ -957,7 +1019,7 @@ bool renderAheadStep(){
   size_t count = titleText.chars.size(), item = titleNextItem;
   bool gap = item >= count;
   uint32_t c = gap ? 0 : titleText.chars[item];
-  uint32_t key = gap ? 0 : titleText.emojiKey[item];
+  uint32_t key = gap ? 0 : titleText.cacheKey[item];
   bool builtin = titleText.builtin;
   int advance = gap ? TITLE_GAP : titleText.advance[item];
   // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
@@ -968,9 +1030,13 @@ bool renderAheadStep(){
   GlyphBitmap glyph;
   std::vector<uint16_t> colour;     // a colour emoji, if it is (still) in the cache
   bool box = false;
-  // a colour emoji needs a 5.8 KB buffer: without the RAM the monochrome one is drawn
-  if(key && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK || !readEmoji(key, colour))) colour.clear();
-  if(!gap && colour.empty() && (c || !key)){
+  // a cached colour emoji (5.8 KB buffer) or CJK character; without the RAM the fonts' version
+  bool cachedGlyph = false;
+  if(key && heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= GLYPH_MIN_FREE_BLOCK){
+    if(!readCached(key, &colour, &glyph)) colour.clear();
+    else cachedGlyph = colour.empty();
+  }
+  if(!gap && colour.empty() && !cachedGlyph && (c || !key)){
     if(builtin) renderBuiltinGlyph((uint8_t)c, glyph);
     else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) box = c != ' ';  // no RAM: a box instead of failing
     else box = !titleFont.render(c, TITLE_EM, glyph);
@@ -1157,6 +1223,7 @@ void confirmFirmwareWhenStable(bool wifiConnected);
 void setupModeLoop();
 void checkBootButton();
 void runInstall();
+void waitForCjkSlot();
 void runFontDownload();
 
 void loop(){
@@ -1451,6 +1518,230 @@ void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
   }
 }
 
+// ---------- CJK characters (network task): looked up in fontsource's CSS of
+// Noto Sans JP/KR/SC (which numbered piece has a character), the piece
+// (17-100 KB TrueType) downloaded into the firmware slot that is not running,
+// the characters rendered from it and kept in the cache. The slot is only
+// used when the running firmware is confirmed and no update runs; updates
+// wait for a running piece download (cjkSlotBusy).
+#define CJK_VERSION            "5.3.1"
+#define CJK_CSS_URL            "https://cdn.jsdelivr.net/npm/@fontsource/%s@" CJK_VERSION "/600.css"
+#define CJK_PIECE_URL          "https://cdn.jsdelivr.net/fontsource/fonts/%s@" CJK_VERSION "/%d-600-normal.ttf"
+#define CJK_MAX_PIECE          (256 * 1024)
+#define CJK_MAX_CHARS          48      // per update; the rest next time
+#define CJK_MAX_PIECES         8       // downloads per update
+enum { CJK_JP, CJK_KR, CJK_SC, CJK_FONTS };
+static const char* const CJK_FONT_NAMES[CJK_FONTS] = {"noto-sans-jp", "noto-sans-kr", "noto-sans-sc"};
+
+volatile bool cjkSlotBusy = false;
+std::set<uint32_t> cjkMissing;   // in none of the fonts: not looked up again until a restart
+uint32_t cjkDownloads = 0;
+
+bool isCjk(uint32_t cp){
+  return (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x2E80 && cp <= 0x9FFF) || (cp >= 0xA960 && cp <= 0xA97F)
+      || (cp >= 0xAC00 && cp <= 0xD7FF) || (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE4F)
+      || (cp >= 0xFF00 && cp <= 0xFFEF) || (cp >= 0x20000 && cp <= 0x3134F);
+}
+bool isHangul(uint32_t cp){
+  return (cp >= 0x1100 && cp <= 0x11FF) || (cp >= 0x3130 && cp <= 0x318F) || (cp >= 0xA960 && cp <= 0xA97F) || (cp >= 0xAC00 && cp <= 0xD7FF);
+}
+// Which fonts to ask, in order: Hangul from the Korean font, everything else Japanese, Chinese, Korean
+int cjkFontChoice(uint32_t cp, int round){
+  static const int hangul[] = {CJK_KR, CJK_JP, CJK_SC}, other[] = {CJK_JP, CJK_SC, CJK_KR};
+  return isHangul(cp) ? hangul[round] : other[round];
+}
+
+// GET url and hand each line (up to 4 KB) to onLine. Returns "" or the error.
+String httpGetLines(const String& url, const std::function<void(const char*)>& onLine){
+  HTTPClient http;
+  http.useHTTP10(true);   // no chunked transfer; the server closes the connection at the end
+  http.begin(tlsClient, url);
+  http.setUserAgent("twitchDisplay/" FW_VERSION);
+  http.setTimeout(DOWNLOAD_TIMEOUT);
+  int code = http.GET();
+  if(code != HTTP_CODE_OK){
+    String e = "download failed (" + (code <= 0 ? http.errorToString(code) : String(code)) + ")";
+    http.end();
+    return e;
+  }
+  int size = http.getSize();
+  auto* stream = http.getStreamPtr();
+  std::string line;
+  uint8_t buf[256];
+  size_t got = 0;
+  unsigned long lastData = millis();
+  String error;
+  while(size <= 0 || got < (size_t)size){
+    size_t avail = stream->available();
+    if(avail == 0){
+      if(size <= 0 && !http.connected()) break;
+      if(millis() - lastData > DOWNLOAD_TIMEOUT){ error = "download timed out"; break; }
+      delay(1);
+      continue;
+    }
+    size_t n = stream->readBytes(buf, std::min(avail, sizeof(buf)));
+    got += n;
+    lastData = millis();
+    for(size_t i = 0; i < n; i++){
+      if(buf[i] == '\n'){ onLine(line.c_str()); line.clear(); }
+      else if(line.size() < 4096) line += (char)buf[i];
+    }
+  }
+  if(error.isEmpty() && !line.empty()) onLine(line.c_str());
+  http.end();
+  tlsClient.stop();
+  return error;
+}
+
+// Finds the pieces of font f that contain the characters in cps (CSS lines:
+// "src: url(./files/noto-sans-jp-119-600-normal.woff2) ..." followed by
+// "unicode-range: U+3041-3096,U+4e00,U+4??;").
+String cjkLookup(int f, const std::vector<uint32_t>& cps, std::map<uint32_t, int>& pieceOf){
+  char url[128];
+  snprintf(url, sizeof(url), CJK_CSS_URL, CJK_FONT_NAMES[f]);
+  int piece = -1;
+  return httpGetLines(url, [&](const char* line){
+    if(const char* files = strstr(line, "files/")){
+      piece = -1;
+      const char* m = strstr(files, "-600-normal");
+      const char* d = m;
+      while(m && d > files && isdigit((unsigned char)d[-1])) d--;
+      if(m && d < m && d[-1] == '-') piece = atoi(d);    // numbered pieces only (not "latin", "cyrillic", ...)
+      return;
+    }
+    const char* p = strstr(line, "unicode-range:");
+    if(!p || piece < 0) return;
+    p += 14;
+    while(*p && *p != ';'){
+      while(*p == ' ' || *p == ',') p++;
+      if(*p == 'U' || *p == 'u') p += 2;
+      uint32_t a = 0, b = 0;
+      bool wild = false;
+      for(; isxdigit((unsigned char)*p) || *p == '?'; p++){
+        if(*p == '?'){ a = a << 4; b = (b << 4) | 0xF; wild = true; }
+        else { uint32_t v = isdigit((unsigned char)*p) ? *p - '0' : (tolower(*p) - 'a' + 10); a = (a << 4) | v; b = (b << 4) | v; }
+      }
+      if(*p == '-' && !wild){
+        p++; b = 0;
+        for(; isxdigit((unsigned char)*p); p++) b = (b << 4) | (isdigit((unsigned char)*p) ? *p - '0' : (tolower(*p) - 'a' + 10));
+      }
+      for(uint32_t cp : cps) if(cp >= a && cp <= b && !pieceOf.count(cp)) pieceOf[cp] = piece;
+      while(*p && *p != ',' && *p != ';') p++;
+    }
+  });
+}
+
+// Downloads a piece into the free firmware slot; size = its length
+String cjkDownloadPiece(int f, int piece, const esp_partition_t* slot, size_t& size){
+  char url[128];
+  snprintf(url, sizeof(url), CJK_PIECE_URL, CJK_FONT_NAMES[f], piece);
+  size = 0;
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.begin(tlsClient, url);
+  http.setUserAgent("twitchDisplay/" FW_VERSION);
+  http.setTimeout(DOWNLOAD_TIMEOUT);
+  int code = http.GET();
+  if(code != HTTP_CODE_OK){
+    String e = "download failed (" + (code <= 0 ? http.errorToString(code) : String(code)) + ")";
+    http.end();
+    return e;
+  }
+  int total = http.getSize();   // the CDN does not always send it: then until the server closes
+  if(total > CJK_MAX_PIECE){ http.end(); return "piece too large"; }
+  auto* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  size_t erased = 0;
+  unsigned long lastData = millis();
+  String error;
+  while(total <= 0 || size < (size_t)total){
+    if(otaActive){ error = "an update started"; break; }
+    size_t avail = stream->available();
+    if(avail == 0){
+      if(total <= 0 && !http.connected()) break;
+      if(millis() - lastData > DOWNLOAD_TIMEOUT){ error = "download timed out"; break; }
+      delay(1);
+      continue;
+    }
+    size_t n = stream->readBytes(buf, std::min(avail, sizeof(buf)));
+    lastData = millis();
+    if(size + n > CJK_MAX_PIECE){ error = "piece too large"; break; }
+    while(erased < size + n){
+      if(esp_partition_erase_range(slot, erased, CACHE_SECTOR) != ESP_OK){ error = "cannot erase the free firmware slot"; break; }
+      erased += CACHE_SECTOR;
+    }
+    if(error.length()) break;
+    if(esp_partition_write(slot, size, buf, n) != ESP_OK){ error = "cannot write the free firmware slot"; break; }
+    size += n;
+  }
+  http.end();
+  tlsClient.stop();
+  if(error.isEmpty() && (size == 0 || (total > 0 && size != (size_t)total))) error = "download incomplete";
+  return error;
+}
+
+// Renders the characters cps from the piece in the slot and caches them
+int cjkRenderPiece(const esp_partition_t* slot, size_t size, const std::vector<uint32_t>& cps){
+  const void* map = nullptr;
+  esp_partition_mmap_handle_t handle;
+  if(esp_partition_mmap(slot, 0, size, ESP_PARTITION_MMAP_DATA, &map, &handle) != ESP_OK) return 0;
+  int stored = 0;
+  for(uint32_t cp : cps){
+    if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) break;
+    GlyphBitmap g;
+    int advance = 0;
+    if(!TitleFont::renderFrom((const uint8_t*)map, cp, TITLE_EM, g, advance)) continue;
+    std::vector<uint8_t> rle = g.alpha.empty() ? std::vector<uint8_t>{0, 0} : rleEncodeAlpha(g.alpha.data(), g.alpha.size());
+    if(g.w > 255 || g.h > 255 || advance > 255 || g.xoff < -128 || g.xoff > 127 || g.yoff < -128 || g.yoff > 127) continue;
+    if(storeCached(glyphKey(cp), CACHE_GLYPH, g.w, g.h, g.xoff, g.yoff, advance, rle)) stored++;
+  }
+  esp_partition_munmap(handle);
+  return stored;
+}
+
+// The CJK characters of the live titles that are not cached yet (network task)
+void fetchMissingCjk(const std::vector<StreamInfo>& streams){
+  if(!config.cjk || !emojiCacheReady || !titleFont.ready() || appPendingVerify || otaActive) return;
+  const esp_partition_t* slot = esp_ota_get_next_update_partition(nullptr);
+  if(!slot) return;
+  std::vector<uint32_t> pending;
+  for(const auto& stream : streams)
+    for(uint32_t cp : titleCodepoints(stream.title.c_str()))
+      if(isCjk(cp) && titleFont.sourceFor(cp) == TitleFont::NONE && !cjkMissing.count(cp)
+         && std::find(pending.begin(), pending.end(), cp) == pending.end() && !cacheLookup(glyphKey(cp)))
+        if(pending.size() < CJK_MAX_CHARS) pending.push_back(cp);
+  if(pending.empty()) return;
+  cjkSlotBusy = true;
+  int pieces = 0;
+  for(int round = 0; round < CJK_FONTS && !pending.empty() && !otaActive; round++){
+    for(int f = 0; f < CJK_FONTS && !otaActive; f++){
+      std::vector<uint32_t> ask;
+      for(uint32_t cp : pending) if(cjkFontChoice(cp, round) == f) ask.push_back(cp);
+      if(ask.empty()) continue;
+      std::map<uint32_t, int> pieceOf;
+      String error = cjkLookup(f, ask, pieceOf);
+      if(error.length()){ emojiError = String(CJK_FONT_NAMES[f]) + " CSS: " + error; goto done; }
+      std::set<int> needed;
+      for(auto& kv : pieceOf) needed.insert(kv.second);
+      for(int piece : needed){
+        if(pieces++ >= CJK_MAX_PIECES || otaActive) goto done;
+        size_t size = 0;
+        error = cjkDownloadPiece(f, piece, slot, size);
+        if(error.length()){ emojiError = String(CJK_FONT_NAMES[f]) + " piece " + String(piece) + ": " + error; goto done; }
+        std::vector<uint32_t> chars;
+        for(auto& kv : pieceOf) if(kv.second == piece) chars.push_back(kv.first);
+        cjkRenderPiece(slot, size, chars);
+        cjkDownloads++;
+        DEBUG_I.printf("[CJK] %s piece %d: %u characters.\n", CJK_FONT_NAMES[f], piece, (unsigned)chars.size());
+        for(uint32_t cp : chars) pending.erase(std::remove(pending.begin(), pending.end(), cp), pending.end());
+      }
+    }
+  }
+  for(uint32_t cp : pending) cjkMissing.insert(cp);   // no font has them: boxes
+done:
+  cjkSlotBusy = false;
+}
+
 void runNetworkUpdate(){
   if (WiFi.status() != WL_CONNECTED) return; // handleWiFi() requests an update when it is back
   if (otaActive) return;                      // firmware upload in progress
@@ -1469,7 +1760,10 @@ void runNetworkUpdate(){
       update->result = fetchLiveChannels(*update);
     }
   }
-  if (update->result == FetchResult::Ok) fetchMissingEmoji(update->streams);
+  if (update->result == FetchResult::Ok){
+    fetchMissingEmoji(update->streams);
+    fetchMissingCjk(update->streams);
+  }
   if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
 }
 
@@ -2087,6 +2381,8 @@ void setupOTA(){
 
       // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
       DEBUG_I.println("Start updating " + type);
+      otaActive = true;    // pauses the network task; nothing is written before this returns
+      waitForCjkSlot();
     })
     .onEnd([]() {
       DEBUG_I.println("\nEnd");
@@ -2095,6 +2391,7 @@ void setupOTA(){
       DEBUG_I.printf("Progress: %u%%\r", (progress / (total / 100)));
     })
     .onError([](ota_error_t error) {
+      otaActive = false;
       DEBUG_E.printf("Error[%u]: ", error);
       if (error == OTA_AUTH_ERROR) {
         DEBUG_E.println("Auth Failed");
@@ -2269,6 +2566,7 @@ void handleUploadChunk(){
       upload.lastPieceAt = upload.pieces ? millis() : 0;
       DEBUG_I.printf("[OTA] Upload of %s started.\n", up.filename.c_str());
       otaActive = true;
+      waitForCjkSlot();
       restoreDisplayAt = 0;
       drawMessageScreen("Firmware update", ST77XX_CYAN, nullptr);
       drawUpdateProgress(0);
@@ -2459,19 +2757,17 @@ void handleStatus(){
       b += "<span class=\"err\">built-in font: font.bin " + htmlEscape(fontProblem.c_str()) + " (trying again later)</span>"; break;
   }
   b += "</td></tr>";
-  b += "<tr><td>Emoji</td><td>";
-  if(!config.colourEmoji) b += "monochrome only";
-  else if(!emojiCacheReady) b += "monochrome (colour needs font.bin)";
-  else {
+  b += "<tr><td>Emoji, CJK</td><td>";
+  b += String(config.colourEmoji ? "colour emoji (Twemoji, CC-BY 4.0)" : "monochrome emoji") + ", CJK " + (config.cjk ? "downloaded" : "off");
+  if(emojiCacheReady){
     xSemaphoreTake(emojiLock, portMAX_DELAY);
-    size_t used = 0;
-    for(const auto& e : emojiIndex) used += e.sectors;
-    size_t count = emojiIndex.size();
+    size_t used = 0, emoji = 0, glyphs = 0;
+    for(const auto& e : cacheIndex){ used += e.size; (e.type == CACHE_COLOUR ? emoji : glyphs)++; }
     xSemaphoreGive(emojiLock);
-    b += "colour (Twemoji, CC-BY 4.0): " + String((unsigned)count) + " stored, " + String((unsigned)(used * EMOJI_SECTOR / 1024))
-         + " of " + String((unsigned)(emojiCacheSectors * EMOJI_SECTOR / 1024)) + " KB";
-    if(emojiError.length()) b += "<br><span class=\"err\">last problem: " + htmlEscape(emojiError.c_str()) + "</span>";
-  }
+    b += "<br>cache: " + String((unsigned)emoji) + " emoji, " + String((unsigned)glyphs) + " CJK characters, "
+         + String((unsigned)(used / 1024)) + " of " + String((unsigned)(cacheBytes / 1024)) + " KB";
+  } else if(config.colourEmoji || config.cjk) b += " <span class=\"muted\">(needs font.bin)</span>";
+  if(emojiError.length()) b += "<br><span class=\"err\">last problem: " + htmlEscape(emojiError.c_str()) + "</span>";
   b += "</td></tr>";
   if(!config.requireLogin) b += "<tr><td>Web login</td><td class=\"err\">off: anyone on the network can use this page</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
@@ -2695,6 +2991,10 @@ void sendSettingsPage(const String& message, bool isError){
     b += String("<label>Emoji in titles<select name=\"emoji\"><option value=\"colour\"") + (colour ? " selected" : "") + ">colour (downloaded, monochrome when that fails)</option>"
          "<option value=\"mono\"" + (colour ? "" : " selected") + ">monochrome only (no downloads)</option></select></label>";
     b += "<p class=\"hint\">Colour emoji are Twemoji images (CC-BY 4.0), downloaded once from cdn.jsdelivr.net and kept on the display.</p>";
+    bool cjk = server.hasArg("cjk") ? server.arg("cjk") != "off" : config.cjk;
+    b += String("<label>Chinese, Japanese, Korean<select name=\"cjk\"><option value=\"on\"") + (cjk ? " selected" : "") + ">downloaded when a title needs them</option>"
+         "<option value=\"off\"" + (cjk ? "" : " selected") + ">not shown (boxes)</option></select></label>";
+    b += "<p class=\"hint\">Characters from Noto Sans JP, KR and SC (fontsource), downloaded once per character; a title with many new ones can take half a minute to start.</p>";
   }
   if(!unknownChannels.empty()){
     String names;
@@ -2782,6 +3082,7 @@ void handleSettingsSave(){
   if(repeatSubmitted) prefs.putString("repeatmin", String(repeatMinutes));
   if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
+  if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back
@@ -3161,10 +3462,21 @@ void runFontDownload(){
   restoreDisplay();
 }
 
+// Before an update writes the free firmware slot: wait until a CJK piece
+// download that uses it has stopped (it stops when it sees otaActive)
+void waitForCjkSlot(){
+  extern volatile bool cjkSlotBusy;
+  for(unsigned long t0 = millis(); cjkSlotBusy && millis() - t0 < 20000;){
+    feedLoopWDT();
+    delay(10);
+  }
+}
+
 // Runs a requested online update (called from loop())
 void runInstall(){
   DEBUG_I.printf("[OTA] Installing %s from %s\n", installVersion.c_str(), installUrl.c_str());
   otaActive = true; // pauses the network task
+  waitForCjkSlot();
   restoreDisplayAt = 0;
   String title = "Downloading " + installVersion;
   drawMessageScreen("Firmware update", ST77XX_CYAN, title.c_str());
