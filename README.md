@@ -153,8 +153,8 @@ Settings page; then anyone on your WiFi can use the web interface (stored
 passwords stay hidden, uploads from PlatformIO still need the password).
 
 - **Status**: live channels (with a button that scrolls all their titles once
-  more), last Twitch update, firmware version, uptime, WiFi, memory, restart
-  button
+  more), last Twitch update, firmware version, uptime, why it last restarted,
+  the last crash (see below), WiFi, memory, restart button
 - **Update**: *Online update* checks the newest GitHub release and installs
   it with one click; or upload a `firmware.bin` from the browser (phone or PC). The
   file is checked before anything is written (ESP32-C3 application image, not
@@ -171,6 +171,24 @@ firmware. This needs a bootloader with rollback support; updates never replace
 the bootloader, so if the status page shows "new (bootloader without rollback
 support?)" after an update, flash once over USB.
 
+**Crashes**: when the firmware crashes (or a watchdog fires), the system
+saves a core dump in the `coredump` partition. The Status page then shows
+*Last crash* with the reason, the task and the code addresses (PC, RA), marked
+"older firmware" if another version crashed. It stays until you press
+*Delete* (or the next crash replaces it). To see where it crashed, download
+the core dump and `firmware.elf` of the same version from its release:
+
+```bash
+pip install esp-coredump
+```
+
+```bash
+esp-coredump --chip esp32c3 info_corefile -t raw -c coredump-v0.7.8.bin firmware.elf
+```
+
+(or just the two addresses: `riscv32-esp-elf-addr2line -pfiaC -e firmware.elf 0x42001234 0x42005678`,
+the tool is in `~/.platformio/packages/toolchain-riscv32-esp/bin`).
+
 ## Flash layout
 
 | Offset | Size | Partition | Contents |
@@ -181,7 +199,7 @@ support?)" after an update, flash once over USB.
 | 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running; meanwhile it holds downloaded CJK font pieces) |
 | 0x330000 | 256 KB | `logos` | 32 channel logos, 64×64 pixels each |
 | 0x370000 | 512 KB | `font` | `font.bin` (about 295 KB) and the cache for colour emoji and CJK characters |
-| 0x3F0000 | 64 KB | `coredump` | Crash dump |
+| 0x3F0000 | 64 KB | `coredump` | Crash dump (Status page: *Last crash*) |
 
 The firmware knows which `font.bin` it was built with. If the `font`
 partition is empty, damaged or holds another version, the display downloads
@@ -233,6 +251,8 @@ The release contains
   address `0x0`, no installation needed
 - `font.bin`: the fonts, which the display downloads when its `font` partition
   lacks them
+- `firmware.elf`: the firmware with debug information, to decode a crash (see
+  *Crashes*)
 
 The firmware contains no secrets (settings are entered on the device), so the
 releases can be public. Tag versions as `vX.Y.Z` on this branch; the display

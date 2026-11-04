@@ -114,3 +114,8 @@ inline void enableLoopWDT(){} inline void feedLoopWDT(){ g_wdtFeeds++; }
 #define MALLOC_CAP_8BIT 4
 extern size_t g_largestBlock;
 inline size_t heap_caps_get_largest_free_block(int){ return g_largestBlock; }
+
+enum esp_reset_reason_t { ESP_RST_UNKNOWN, ESP_RST_POWERON, ESP_RST_EXT, ESP_RST_SW, ESP_RST_PANIC, ESP_RST_INT_WDT, ESP_RST_TASK_WDT,
+  ESP_RST_WDT, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT, ESP_RST_SDIO, ESP_RST_USB, ESP_RST_JTAG };
+inline esp_reset_reason_t g_resetReason = ESP_RST_POWERON;
+inline esp_reset_reason_t esp_reset_reason(){ return g_resetReason; }

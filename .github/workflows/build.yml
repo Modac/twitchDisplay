@@ -93,6 +93,7 @@ jobs:
           path: |
             .pio/build/twitchDisplay/firmware.bin
             .pio/build/twitchDisplay/firmware-merged.bin
+            .pio/build/twitchDisplay/firmware.elf
             fonts/font.bin
 
       - name: Check that the firmware version matches the tag
@@ -107,5 +108,6 @@ jobs:
           gh release create "$RELEASE" \
             .pio/build/twitchDisplay/firmware.bin \
             .pio/build/twitchDisplay/firmware-merged.bin \
+            .pio/build/twitchDisplay/firmware.elf \
             fonts/font.bin \
             --title "$RELEASE" --generate-notes --verify-tag

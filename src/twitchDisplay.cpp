@@ -25,6 +25,9 @@
 #include <esp_rom_crc.h>
 #include <spi_fast.h>
 #include <esp_partition.h>
+#include <esp_core_dump.h>
+#include <esp_flash.h>
+#include <esp_app_desc.h>
 #include <TitleFont.h>
 
 #include <deque>
@@ -407,6 +410,10 @@ uint16_t ldr_avg; // averaged LDR reading used for the backlight
 void redrawLiveChannelPics(int8_t row = -1);
 void setupOTA();
 void setupWeb();
+extern String crashInfo;
+extern bool crashThisFirmware;
+const char* resetReasonName(esp_reset_reason_t r);
+void readCrashInfo();
 void startSetupMode(const char* reason, bool retryLater);
 bool connectWiFi();
 void drawMessageScreen(const char* title, uint16_t color, const char* message);
@@ -596,6 +603,7 @@ void setup(void) {
   titleLock = xSemaphoreCreateMutex();
   emojiLock = xSemaphoreCreateMutex();
   openFont();
+  readCrashInfo();
 
   // New firmware from an OTA update starts "pending verify" and must confirm
   // itself (confirmFirmwareWhenStable()), otherwise the bootloader rolls back
@@ -2978,6 +2986,13 @@ void handleStatus(){
   b += "<tr><td>Flash</td><td>" + String((unsigned)(ESP.getFlashChipSize() / (1024 * 1024))) + " MB</td></tr>";
   b += "<tr><td>RAM</td><td>" + String((unsigned)(ESP.getHeapSize() / 1024)) + " KB heap</td></tr>";
   b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
+  b += String("<tr><td>Last restart</td><td>") + resetReasonName(esp_reset_reason()) + "</td></tr>";
+  if(crashInfo.length()){
+    b += "<tr><td>Last crash</td><td><span class=\"err\">" + crashInfo + "</span>";
+    if(!crashThisFirmware) b += " <span class=\"muted\">(older firmware)</span>";
+    b += "<p><form method=\"get\" action=\"/coredump\" style=\"display:inline\"><button>Download core dump</button></form> "
+         "<form method=\"post\" action=\"/coredump/clear\" style=\"display:inline\" onsubmit=\"return confirm('Delete the core dump?')\"><button>Delete</button></form></p></td></tr>";
+  }
   b += "<tr><td>Font</td><td>";
   switch(fontState){
     case FontState::Ready: {
@@ -3075,6 +3090,83 @@ void handleCacheClear(){
   server.send(303, "text/plain", "");
 }
 
+// ---------- Last crash: the core dump the system writes to the "coredump"
+// partition when the firmware crashes (panic, watchdog). Read once at boot
+// for the Status page; it stays in flash until it is deleted there (or the
+// next crash replaces it). The download is the raw image for
+//   esp-coredump --chip esp32c3 info_corefile -t raw -c coredump.bin firmware.elf
+// (firmware.elf of the same version is a release asset).
+String crashInfo;          // empty: no core dump
+bool crashThisFirmware = false;
+
+const char* resetReasonName(esp_reset_reason_t r){
+  switch(r){
+    case ESP_RST_POWERON:   return "power on";
+    case ESP_RST_EXT:       return "reset pin";
+    case ESP_RST_SW:        return "restart (software)";
+    case ESP_RST_PANIC:     return "crash";
+    case ESP_RST_INT_WDT:   return "crash (interrupt watchdog)";
+    case ESP_RST_TASK_WDT:  return "crash (task watchdog)";
+    case ESP_RST_WDT:       return "crash (watchdog)";
+    case ESP_RST_DEEPSLEEP: return "wake from deep sleep";
+    case ESP_RST_BROWNOUT:  return "brownout (supply voltage too low)";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    default:                return "unknown";
+  }
+}
+
+void readCrashInfo(){
+  crashInfo = "";
+  if(esp_core_dump_image_check() != ESP_OK) return;   // none, or damaged
+  esp_core_dump_summary_t* s = (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+  if(!s) return;
+  if(esp_core_dump_get_summary(s) == ESP_OK){
+    char line[160];
+    s->exc_task[sizeof(s->exc_task) - 1] = 0;
+    snprintf(line, sizeof(line), "task \"%s\", PC 0x%08lx, RA 0x%08lx, mcause %lu, mtval 0x%08lx",
+             s->exc_task, (unsigned long)s->exc_pc, (unsigned long)s->ex_info.ra,
+             (unsigned long)s->ex_info.mcause, (unsigned long)s->ex_info.mtval);
+    crashInfo = line;
+    char sha[APP_ELF_SHA256_SZ];
+    esp_app_get_elf_sha256(sha, sizeof(sha));
+    crashThisFirmware = strncmp(sha, (const char*)s->app_elf_sha256, sizeof(sha) - 1) == 0;
+  } else crashInfo = "(no summary)";
+  free(s);
+  char reason[120];
+  if(esp_core_dump_get_panic_reason(reason, sizeof(reason)) == ESP_OK) crashInfo = String(reason) + "<br>" + crashInfo;
+  DEBUG_I.printf("[Crash] Core dump found: %s\n", crashInfo.c_str());
+}
+
+// GET /coredump: the raw core dump image
+void handleCoredumpDownload(){
+  if(!checkAuth()) return;
+  size_t addr = 0, size = 0;
+  if(esp_core_dump_image_check() != ESP_OK || esp_core_dump_image_get(&addr, &size) != ESP_OK || !size){
+    server.send(404, "text/plain", "No core dump");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"coredump-" FW_VERSION ".bin\"");
+  server.setContentLength(size);
+  server.send(200, "application/octet-stream", "");
+  uint8_t buf[512];
+  for(size_t off = 0; off < size; off += sizeof(buf)){
+    size_t n = std::min(sizeof(buf), size - off);
+    if(esp_flash_read(nullptr, buf, addr + off, n) != ESP_OK) break;
+    server.sendContent((const char*)buf, n);
+    feedLoopWDT();
+  }
+}
+
+// POST /coredump/clear
+void handleCoredumpClear(){
+  if(!checkAuth()) return;
+  esp_core_dump_image_erase();
+  crashInfo = "";
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 // "Show all titles": every live channel's title scrolls once more, in the
 // order of the channel list (after a title that is scrolling right now)
 void handleShowTitles(){
@@ -3109,6 +3201,8 @@ void setupWeb(){
   server.on("/logos/reload", HTTP_POST, handleLogoReload);
   server.on("/titles/show", HTTP_POST, handleShowTitles);
   server.on("/cache/clear", HTTP_POST, handleCacheClear);
+  server.on("/coredump", HTTP_GET, handleCoredumpDownload);
+  server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);

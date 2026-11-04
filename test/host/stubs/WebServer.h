@@ -24,6 +24,8 @@ public:
   int clientContentLength() const { return g_contentLength; }
   bool hasArg(const char* n){ return g_args.count(n)>0; }
   String arg(const char* n){ auto it=g_args.find(n); return it==g_args.end()?String():String(it->second); }
+  void setContentLength(size_t){ g_lastBody.clear(); }
+  void sendContent(const char* d, size_t n){ g_lastBody.append(d, n); }
   void sendHeader(const std::string& k, const std::string& v, bool=false){ g_respHeaders[k]=v; }
   // test helper: call the handler for uri/method
   Route* find(const std::string& u, HTTPMethod m){ for(auto& r: routes) if(r.uri==u && r.method==m) return &r; return nullptr; }

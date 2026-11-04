@@ -920,6 +920,33 @@ int main(){
   CHECK(g_authChallenges == 2);
   g_authOk = true; server.find("/reboot", HTTP_POST)->fn(); CHECK(rebootAt != 0); rebootAt = 0;
 
+  printf("T54 last crash: core dump summary on the Status page, download, delete\n");
+  g_authOk = true;
+  server.find("/", HTTP_GET)->fn();
+  CHECK(contains(g_lastBody, "<td>Last restart</td><td>power on</td>") && !contains(g_lastBody, "Last crash"));
+  server.find("/coredump", HTTP_GET)->fn(); CHECK(g_lastCode == 404);
+  g_coredump.assign(3000, 0); for(size_t i = 0; i < g_coredump.size(); i++) g_coredump[i] = (uint8_t)(i * 7);
+  memset(&g_coredumpSummary, 0, sizeof(g_coredumpSummary));
+  strcpy(g_coredumpSummary.exc_task, "loopTask"); g_coredumpSummary.exc_pc = 0x42001234; g_coredumpSummary.ex_info.ra = 0x42005678;
+  g_coredumpSummary.ex_info.mcause = 7; g_coredumpSummary.ex_info.mtval = 0x10;
+  memcpy(g_coredumpSummary.app_elf_sha256, g_appElfSha, 64);
+  g_coredumpReason = "Store access fault";
+  g_resetReason = ESP_RST_PANIC;
+  readCrashInfo();
+  server.find("/", HTTP_GET)->fn();
+  CHECK(contains(g_lastBody, "<td>Last restart</td><td>crash</td>") && contains(g_lastBody, "Store access fault<br>task \"loopTask\", PC 0x42001234, RA 0x42005678, mcause 7, mtval 0x00000010"));
+  CHECK(!contains(g_lastBody, "older firmware") && contains(g_lastBody, "action=\"/coredump\""));
+  if(getenv("DUMP")){ std::ofstream("status_crash.html") << g_lastBody; }
+  server.find("/coredump", HTTP_GET)->fn();
+  CHECK(g_lastCode == 200 && g_lastBody.size() == 3000 && memcmp(g_lastBody.data(), g_coredump.data(), 3000) == 0);
+  g_coredumpSummary.app_elf_sha256[0] = 'f'; readCrashInfo();          // from a different firmware
+  server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "older firmware"));
+  g_authOk = false; server.find("/coredump", HTTP_GET)->fn(); CHECK(g_lastCode == 401);
+  server.find("/coredump/clear", HTTP_POST)->fn(); CHECK(g_lastCode == 401 && !g_coredump.empty());
+  g_authOk = true; server.find("/coredump/clear", HTTP_POST)->fn(); CHECK(g_lastCode == 303 && g_coredump.empty());
+  server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "Last crash"));
+  g_resetReason = ESP_RST_POWERON;
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";
