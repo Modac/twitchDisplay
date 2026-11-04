@@ -9,6 +9,10 @@
 #include <WiFiUdp.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+// Twitch and GitHub answers need neither 64-bit integers nor double
+// precision; leaving them out makes the firmware smaller
+#define ARDUINOJSON_USE_LONG_LONG 0
+#define ARDUINOJSON_USE_DOUBLE    0
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <WebServer.h>
