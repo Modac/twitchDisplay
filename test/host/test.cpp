@@ -518,6 +518,7 @@ int main(){
           && titleFont.sourceFor(0x1F525) == TitleFont::EMOJI && titleFont.sourceFor(0x65E5) == TitleFont::NONE);   // emoji, CJK (not yet)
     CHECK(titleFont.sourceFor(0x1EA1) == TitleFont::TEXT && titleFont.sourceFor(0x1EC7) == TitleFont::TEXT && titleFont.sourceFor(0x20AB) == TitleFont::TEXT
           && titleFont.sourceFor(0x0301) == TitleFont::TEXT);                     // Vietnamese: ạ ệ ₫, combining acute
+    CHECK(titleFont.sourceFor(0x0E2A) == TitleFont::TEXT && titleFont.sourceFor(0x0E35) == TitleFont::TEXT && titleFont.advance(0x0E35, TITLE_EM) == 0);   // Thai: ส, sara ii (a mark without advance)
     GlyphBitmap g;
     CHECK(titleFont.render('W', TITLE_EM, g) && g.w > 30 && g.h > 30 && g.yoff < -30);
     CHECK(titleFont.render(0xC4, TITLE_EM, g) && TITLE_BASELINE + g.yoff >= 0);                // "Ä" fits the row

@@ -99,7 +99,8 @@ a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
 
 Titles are drawn in Noto Sans SemiBold: Latin with all its extensions
-(including Vietnamese), Greek, Cyrillic, typographic quotes and dashes. Emoji appear in colour: the display
+(including Vietnamese), Greek, Cyrillic, Thai (vowel and tone marks without
+shaping, so stacked marks can overlap), typographic quotes and dashes. Emoji appear in colour: the display
 downloads each one once as a [Twemoji](https://github.com/jdecked/twemoji)
 image (CC-BY 4.0) from cdn.jsdelivr.net before the title starts, and keeps
 about 60 of them in flash (the oldest are replaced), from where they are drawn
@@ -179,7 +180,7 @@ support?)" after an update, flash once over USB.
 | 0x010000 | 1600 KB | `app0` | Firmware slot 1 |
 | 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running; meanwhile it holds downloaded CJK font pieces) |
 | 0x330000 | 256 KB | `logos` | 32 channel logos, 64×64 pixels each |
-| 0x370000 | 512 KB | `font` | `font.bin` (about 285 KB) and the cache for colour emoji and CJK characters |
+| 0x370000 | 512 KB | `font` | `font.bin` (about 295 KB) and the cache for colour emoji and CJK characters |
 | 0x3F0000 | 64 KB | `coredump` | Crash dump |
 
 The firmware knows which `font.bin` it was built with. If the `font`
