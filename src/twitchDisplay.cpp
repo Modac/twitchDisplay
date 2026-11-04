@@ -170,14 +170,14 @@ CrlfSerial debugSerial;
 #define CHAR_WIDTH          (6*8)  // text size 8: 6 px per character * 8
 // Panel refresh (ST7789V data sheet, FRCTRL2 C6h): 10 MHz / ((320 + FPA + BPA) * (250 + 16 * RTNA))
 // with the default porches FPA = BPA = 0x0C (B2h, not changed by the library).
-// RTNA 0x13 = 52.5 Hz, i.e. one refresh every 19057 us. A title frame takes
-// up to ~18 ms over SPI (no DMA), so a faster refresh (97.6 Hz with 0x03)
-// misses refreshes and the title moves in uneven steps; at 52.5 Hz every
-// refresh gets its frame. The module has no TE pin and does not answer reads,
-// so frames cannot be synchronised exactly.
-#define PANEL_FRAME_RATE    0x13
+// RTNA 0x04 = 92.6 Hz, i.e. one refresh every 10801 us. A title frame takes
+// ~6 ms (at most ~9.3 ms measured) over SPI, so every refresh gets its frame
+// with some margin; with less margin (97.6 Hz, 0x03) a slow frame would miss
+// a refresh and the title would jump by two steps. The module has no TE pin
+// and does not answer reads, so frames cannot be synchronised exactly.
+#define PANEL_FRAME_RATE    0x04
 #define FRAME_INTERVAL_US   ((320 + 0x0C + 0x0C) * (250 + 16 * PANEL_FRAME_RATE) / 10)
-#define SCROLL_STEP         6      // px per frame (= 315 px/s)
+#define SCROLL_STEP         3      // px per frame (= 278 px/s)
 
 // Logo grid layout: 4 columns x 2 rows of 64x64 pics
 #define PIC_SIZE    64
