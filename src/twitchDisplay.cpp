@@ -31,6 +31,7 @@
 #endif
 
 #include "MovingAverage.h"
+#include "LogoImage.h"
 #include "web_pages.h"
 
 static const char DEBUG_TAG[] = "TwitchDisplay";
