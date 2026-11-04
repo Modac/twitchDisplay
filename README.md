@@ -37,7 +37,9 @@ dimmed automatically via an LDR.
 | `examples/displayTest/` | Display and smooth text-scrolling test (with its own `pics.h`) |
 | `examples/ldrTest/` | LDR backlight dimming test |
 | `test/host/` | Simulation of the firmware on the PC (`test/host/run.sh`, see its README) |
-| `C3_partition_minimalSPIFFS.csv` | Partition table with two OTA slots; the `spiffs` partition stores the channel logos |
+| `partitions.csv` | Partition table, see [Flash layout](#flash-layout) |
+| `lib/TitleFont/` | Reads `font.bin` and renders the title characters (stb_truetype) |
+| `fonts/font.bin` | Fonts for the titles (Noto Sans, Noto Emoji; SIL Open Font License, `fonts/OFL.txt`), built by `tools/make_fonts.py` |
 
 Each program has its own environment in `platformio.ini`:
 `twitchDisplay` builds `src/`, and `twitchDisplay_apiTest`,
@@ -87,7 +89,7 @@ firmware built with it.
 ## Channels and logos
 
 Enter the channels on the **Settings** page, one name per line (as in
-`twitch.tv/name`; pasted links work too), at most 16. They are shown in this
+`twitch.tv/name`; pasted links work too), at most 32. They are shown in this
 order; up to 8 live channels get a tile, more are counted on a "+N" tile.
 Without a saved list the display uses the ten channels it always had.
 
@@ -95,6 +97,12 @@ A channel's title scrolls when it goes live or changes its title or game. In
 addition, after some minutes without a title (Settings, default 5, 0 = off)
 a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
+
+Titles are drawn in Noto Sans SemiBold: Latin with all its extensions, Greek,
+Cyrillic, typographic quotes and dashes, and about 400 common emoji (in the
+text colour). Characters the fonts do not have, e.g. Chinese, Japanese or
+Korean, show as a box for now. Without `font.bin` (see below) titles use the
+built-in 5×7 font, which knows umlauts but no emoji.
 
 The display looks the channels up on Twitch at the start and once a day and
 downloads each channel's avatar (the 70×70 version, about 10 KB) only when it
@@ -144,6 +152,42 @@ firmware. This needs a bootloader with rollback support; updates never replace
 the bootloader, so if the status page shows "new (bootloader without rollback
 support?)" after an update, flash once over USB.
 
+## Flash layout
+
+| Offset | Size | Partition | Contents |
+|---|---|---|---|
+| 0x009000 | 20 KB | `nvs` | Settings, channel cache, logo index |
+| 0x00E000 | 8 KB | `otadata` | Which firmware slot boots, rollback state |
+| 0x010000 | 1600 KB | `app0` | Firmware slot 1 |
+| 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running) |
+| 0x330000 | 256 KB | `logos` | 32 channel logos, 64×64 pixels each |
+| 0x370000 | 512 KB | `font` | `font.bin` (about 260 KB); the rest is reserved for a cache |
+| 0x3F0000 | 64 KB | `coredump` | Crash dump |
+
+The firmware knows which `font.bin` it was built with. If the `font`
+partition is empty, damaged or holds another version, the display downloads
+`font.bin` from the GitHub release (development builds: from the newest
+release) and shows the progress; until then titles use the built-in font.
+The Status page shows the font state.
+
+**Updating from v0.4.x or older:** that firmware used a different layout, and
+the partition table can only be changed over USB. Either
+
+- with PlatformIO (keeps the settings; the display downloads `font.bin` from
+  the release, so publish the release first):
+
+  ```bash
+  pio run -e twitchDisplay_usb -t upload --upload-port COM5
+  ```
+
+- or flash `firmware-merged.bin` at `0x0` (e.g. esptool-js in the browser).
+  It contains everything including `font.bin`, but also erases the settings:
+  the display starts the setup hotspot and they have to be entered again.
+
+The logos are downloaded again in both cases. A new firmware installed by
+online update on the old layout keeps working with the built-in font and 16
+logos, and its Status page says that the USB flash is needed.
+
 ## Releases and online update
 
 GitHub builds the firmware on every push to this branch (download it from the
@@ -161,9 +205,12 @@ The release contains
 
 - `firmware.bin`: what the display's **Online update** installs (and what the
   Update page's upload expects)
-- `firmware-merged.bin`: everything for the first flash over USB, e.g. with
+- `firmware-merged.bin`: everything for the first flash over USB (bootloader,
+  partition table, firmware and `font.bin`), e.g. with
   [esptool-js](https://espressif.github.io/esptool-js/) in Chrome or Edge at
   address `0x0`, no installation needed
+- `font.bin`: the fonts, which the display downloads when its `font` partition
+  lacks them
 
 The firmware contains no secrets (settings are entered on the device), so the
 releases can be public. Tag versions as `vX.Y.Z` on this branch; the display

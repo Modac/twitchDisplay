@@ -48,7 +48,10 @@ int g_analogReads = 0; int g_notifies = 0; int g_tasksCreated = 0;
 bool g_wifiUp = true;
 std::map<std::string,std::string> g_args, g_respHeaders; std::map<std::string, std::map<std::string, std::string>> g_nvs;
 std::string g_serialOut;
-esp_partition_t g_spiffs{"spiffs", 0x20000}; std::vector<uint8_t> g_flashData(0x20000, 0xFF); int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
+esp_partition_t g_spiffs{"logos", 0x40000}; std::vector<uint8_t> g_flashData(0x40000, 0xFF);
+esp_partition_t g_fontPart{"font", 0x80000}; std::vector<uint8_t> g_fontData(0x80000, 0xFF); bool g_haveFontPartition = true; int g_mmaps = 0;
+size_t g_largestBlock = 61440;
+void (*g_delayHook)() = nullptr; int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
 std::vector<TextBox> g_textBoxes;
 int g_spiFastPieces = 0;
 int g_panelFrameRate = -1; uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
@@ -122,7 +125,22 @@ bool tileIsFill(int slot, uint16_t c){
   return true;
 }
 uint16_t frame(int slot){ uint16_t x,y; slotXY(slot,x,y); return g_fb[y+32][x-3]; }
-bool titleInRow(int row){ return g_fb[rowY(row)+32][GRID_X0+150]==0x1234; }
+// true if the row shows the visible part of the title canvas (and some text)
+#define ROW_HEIGHT_FOR_TEST 64
+int xSemaphoreTakeCount(SemaphoreHandle_t m){ return m->taken; }
+bool titleInRow(int row){
+  const uint16_t* b = text_canvas.getBuffer(); int y0 = rowY(row); bool text = false;
+  for(int j = 0; j < 64; j++) for(int i = 0; i < TITLE_WIDTH; i++){
+    uint16_t v = b[j*CANVAS_W + o_X + i];
+    if(g_fb[y0+j][GRID_X0+i] != v) return false;
+    if(v) text = true;
+  }
+  return text;
+}
+// the render task's work, done while loop() sleeps
+void renderHook(){ for(int n = 0; n < 64 && renderAheadStep(); n++) {} }
+std::vector<uint8_t> readFile(const char* path){ std::ifstream f(path, std::ios::binary); return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {}); }
+std::vector<uint8_t> g_fontBin;
 
 uint16_t statusDot(){ return g_fb[STATUS_Y+2][STATUS_X+2]; }
 std::string helix(std::string body){ return body; }
@@ -130,11 +148,15 @@ std::string helix(std::string body){ return body; }
 void spiFastPixels(const uint16_t* p, uint32_t n){ tft.writePixels((uint16_t*)p, n); }
 
 int main(){
+  g_fontBin = readFile("../../fonts/font.bin");
+  std::copy(g_fontBin.begin(), g_fontBin.end(), g_fontData.begin());
+  g_delayHook = renderHook;
 #ifdef VARIANT_NOSECRETS
   return setupModeTests();
 #endif
   setup();
-  CHECK(g_bundleUsed); CHECK(g_tasksCreated==1 && netTask!=nullptr && updateQueue!=nullptr);
+  CHECK(g_bundleUsed); CHECK(g_tasksCreated==2 && netTask!=nullptr && updateQueue!=nullptr);   // network and render task
+  CHECK(fontState == FontState::Ready && titleFont.ready() && fontCrc == FONT_BIN_CRC);
   printf("T1 boot with 3 live channels\n");
   reset(); setResponse({{0,"A"},{1,"B"},{2,"C"}}); loopWithUpdate();
   CHECK(tileIsPic(0,0)); CHECK(tileIsPic(1,1)); CHECK(tileIsPic(2,2)); CHECK(tileIsFill(3,0));
@@ -169,7 +191,7 @@ int main(){
   CHECK(frame(4)==ST77XX_GREEN); CHECK(titleInRow(0));
   setResponse({{1,"B"},{2,"C"},{3,"D"},{4,"E2"}}); loopWithUpdate();
   CHECK(isTitleDisplaying && channelTitleInfo.channel==&channels[4] && channelTitleInfo.slot==3);
-  CHECK(channelTitleInfo.textOffset==0 && channelTitleInfo.repeats==0 && titleFrames==1); // restarted from the first character
+  CHECK(titlePixels==0 && titleFrames==1); // restarted from the first character
   CHECK(tileIsPic(0,1)); CHECK(tileIsPic(1,2)); CHECK(tileIsPic(2,3)); CHECK(tileIsPic(3,4));
   CHECK(frame(3)==ST77XX_GREEN); CHECK(frame(4)==ST77XX_BLACK); CHECK(titleInRow(1));
 
@@ -195,7 +217,7 @@ int main(){
   g_response = "{\"data\":[{\"id\":\"1\",\"user_id\":\"21991090\",\"user_login\":\"pietsmiet\",\"user_name\":\"PietSmiet\",\"game_id\":\"27471\",\"game_name\":\"Minecraft\",\"type\":\"live\",\"title\":\"Hallo Welt\",\"viewer_count\":1234,\"started_at\":\"2026-11-03T10:00:00Z\",\"language\":\"de\",\"thumbnail_url\":\"https://x/{width}x{height}.jpg\",\"tag_ids\":[],\"tags\":[\"Deutsch\",\"Gaming\"],\"is_mature\":false}],\"pagination\":{\"cursor\":\"abc\"}}";
   loopWithUpdate();
   CHECK(channels[1].isLive && channels[1].slotNum==0);
-  CHECK(channels[1].streamTitle=="    Hallo Welt | Minecraft   ");
+  CHECK(channels[1].streamTitle=="Hallo Welt | Minecraft");
   CHECK(statusDot()==STATUS_OK);
   { auto& r = g_requests.back(); CHECK(r.method=="GET" && r.tls); CHECK(r.url.find("https://api.twitch.tv/helix/streams?user_id=761017145&")==0); }
 
@@ -260,11 +282,11 @@ int main(){
   CHECK(toDisplayText(nullptr) == "");
   CHECK(toDisplayText("\xc3\x80\xc3\x89\xc3\xa3") == "A\x90" "a");                             // no glyph -> base letter
 
-  printf("T14 titles from the API are converted\n");
+  printf("T14 titles from the API are kept as UTF-8\n");
   reset();
   g_response = "{\"data\":[{\"user_id\":\"12875057\",\"user_name\":\"Gronkh\",\"title\":\"Gr\\u00fc\\u00dfe \xf0\x9f\x8e\xae\",\"game_name\":\"Just Chatting\"}]}";
   loopWithUpdate();
-  CHECK(channels[4].isLive); CHECK(channels[4].streamTitle == "    Gr\x81\xe1" "e  | Just Chatting   ");
+  CHECK(channels[4].isLive); CHECK(channels[4].streamTitle == "Gr\xc3\xbc\xc3\x9f" "e \xf0\x9f\x8e\xae | Just Chatting");   // UTF-8, as Twitch sends it
 
   printf("T15 network task result is only applied by loop()\n");
   reset(); setResponse({{0,"A"}});
@@ -479,6 +501,113 @@ int main(){
     CHECK(titleChangeQueue.size() == 2 && titleChangeQueue[0] == &channels[2] && titleChangeQueue[1] == &channels[5]);
     reset(); }
 
+  printf("T49 fonts: code points, font.bin, glyphs, boxes\n");
+  { auto cps = titleCodepoints("A\xc3\xa9\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd\xe2\x9d\xa4\xef\xb8\x8f\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x92\xbb\n\xff");
+    CHECK(cps == std::vector<uint32_t>({'A', 0xE9, 0x1F44D, 0x2764, 0x1F468, 0x1F4BB, ' '}));   // skin tone, VS16, flag, ZWJ dropped
+    FontBin bin;
+    CHECK(parseFontBin(g_fontBin.data(), g_fontBin.size(), bin) == nullptr && bin.crc == FONT_BIN_CRC && bin.textLen > 50000 && bin.emojiLen > 150000);
+    auto bad = g_fontBin; bad[1000] ^= 1;
+    CHECK(contains(parseFontBin(bad.data(), bad.size(), bin), "checksum"));
+    CHECK(contains(parseFontBin((const uint8_t*)"nothing here, really......", 26, bin), "no font.bin"));
+    CHECK(parseFontBin(g_fontBin.data(), g_fontBin.size() - 1, bin) != nullptr);              // cut off
+    CHECK(titleFont.sourceFor('A') == TitleFont::TEXT && titleFont.sourceFor(0x416) == TitleFont::TEXT   // Latin, Cyrillic
+          && titleFont.sourceFor(0x1F525) == TitleFont::EMOJI && titleFont.sourceFor(0x65E5) == TitleFont::NONE);   // emoji, CJK (not yet)
+    GlyphBitmap g;
+    CHECK(titleFont.render('W', TITLE_EM, g) && g.w > 30 && g.h > 30 && g.yoff < -30);
+    CHECK(titleFont.render(0xC4, TITLE_EM, g) && TITLE_BASELINE + g.yoff >= 0);                // "Ä" fits the row
+    CHECK(titleFont.render('g', TITLE_EM, g) && TITLE_BASELINE + g.yoff + g.h <= ROW_HEIGHT_FOR_TEST);   // descender fits
+    CHECK(titleFont.render(0x1F525, TITLE_EM, g) && g.w > 30);
+    CHECK(!titleFont.render(0x65E5, TITLE_EM, g) && titleFont.advance(0x65E5, TITLE_EM) == (int)(TITLE_EM * 0.6f));
+
+    printf("    a title with emoji and a character no font has (box)\n");
+    reset(); setResponse({{0,"Stream \xf0\x9f\x94\xa5 \xe6\x97\xa5 \xd0\x96"}}); loopWithUpdate();
+    CHECK(isTitleDisplaying && !titleText.builtin && titleText.chars.size() == 16);   // "Stream 🔥 日 Ж | g"
+    CHECK(titleText.chars[7] == 0x1F525 && titleText.chars[9] == 0x65E5 && titleText.advance[9] == 32);
+    { // the box: a vertical line 37 px high at its left edge, somewhere on the canvas while it passes
+      bool box = false;
+      for(int k = 0; k < 400 && isTitleDisplaying && !box; k++){
+        loopNoUpdate(1);
+        const uint16_t* b = text_canvas.getBuffer();
+        for(int x = 0; x < CANVAS_W && !box; x++){
+          int n = 0; for(int y = TITLE_BASELINE - 37; y < TITLE_BASELINE; y++) if(b[y*CANVAS_W + x] == TITLE_COLOR) n++;
+          if(n == 37) box = true;
+        }
+      }
+      CHECK(box); }
+    runUntilTitleDone(); CHECK(titleWaits == 0 && xSemaphoreTakeCount(titleLock) == 0);   // render task always ahead, lock released
+    printf("    no RAM for a character: boxes instead\n");
+    g_largestBlock = 4096;
+    reset(); setResponse({{0,"Hallo"}}); loopWithUpdate();
+    { const uint16_t* b = text_canvas.getBuffer();
+      auto column = [&](int x){ int n = 0; for(int y = 0; y < 64; y++) if(b[y*CANVAS_W + x] == TITLE_COLOR) n++; return n; };
+      CHECK(column(TITLE_LEAD + 3) == 37 && column(TITLE_LEAD + 10) == 2); }  // "H" as a box outline: left edge, top and bottom
+    runUntilTitleDone(); g_largestBlock = 61440;
+    server.find("/", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "<tr><td>Font</td><td>Noto Sans (font.bin ") && !contains(g_lastBody, "built-in font"));
+    reset(); }
+
+  printf("T50 font.bin missing or damaged: built-in font, then downloaded from the release\n");
+  { config.titleRepeatMinutes = 0;                                            // no repeated titles in between (downloads wait for titles)
+    g_fontData[1000] ^= 1; openFont();
+    CHECK(fontState == FontState::Missing && !titleFont.ready() && fontDownloadWanted && contains(fontProblem.c_str(), "checksum") && g_mmaps == 0);
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "built-in font: font.bin damaged (checksum), downloading font.bin"));
+    reset(); fontRetryAt = millis() + 3600000;                                 // not yet: titles in the built-in font meanwhile
+    setResponse({{0,"Gr\xc3\xbc\xc3\x9f" "e"}}); loopWithUpdate();
+    CHECK(isTitleDisplaying && titleText.builtin && titleText.chars.size() == 9 && titleText.chars[2] == 0x81 && titleText.advance[0] == BUILTIN_ADVANCE);
+    CHECK(titleInRow(1));
+    runUntilTitleDone(); CHECK(!isTitleDisplaying);
+    printf("    download (the newest release's font.bin for a development build)\n");
+    fontRetryAt = 0; g_requests.clear();
+    g_responses.push_back({200, std::string(g_fontBin.begin(), g_fontBin.end())});
+    loop();
+    CHECK(!g_requests.empty() && g_requests.back().url == "https://github.com/Modac/twitchDisplay/releases/latest/download/font.bin"
+          && g_requests.back().follow == HTTPC_STRICT_FOLLOW_REDIRECTS && g_requests.back().tls);
+    CHECK(fontState == FontState::Ready && titleFont.ready() && fontCrc == FONT_BIN_CRC && !fontDownloadWanted && !otaActive);
+    CHECK(std::equal(g_fontBin.begin(), g_fontBin.end(), g_fontData.begin()) && g_mmaps == 1);
+    reset(); setResponse({{0,"A"}}); loopWithUpdate(); CHECK(isTitleDisplaying && !titleText.builtin); runUntilTitleDone();
+
+    printf("    download fails: built-in font, next try in an hour\n");
+    g_fontData[1000] ^= 1; openFont();
+    g_responses.push_back({404, "Not Found"}); loop();
+    CHECK(fontState == FontState::Failed && contains(fontProblem.c_str(), "404") && fontDownloadWanted && !otaActive);
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "built-in font: font.bin download failed (404) (trying again later)"));
+    size_t n = g_requests.size(); loop(); g_millis += 30 * 60000; loop(); CHECK(g_requests.size() == n);   // waits
+    g_responses.push_back({200, std::string(g_fontBin.begin(), g_fontBin.end() - 100), (int)g_fontBin.size()});   // breaks off
+    g_millis += 31 * 60000; loop();
+    CHECK(g_requests.size() == n + 1 && fontState == FontState::Failed && contains(fontProblem.c_str(), "timed out"));
+    g_millis += 61 * 60000; g_responses.push_back({200, std::string(g_fontBin.begin(), g_fontBin.end())}); loop();
+    CHECK(fontState == FontState::Ready && !fontDownloadWanted);
+
+    printf("    a valid font.bin of another version: used, the right one fetched once\n");
+    { auto other = g_fontBin; other.insert(other.end(), 4, 0);
+      uint32_t total = other.size(); memcpy(&other[8], &total, 4);
+      uint32_t crc = fontCrc32(other.data() + 16, other.size() - 16); memcpy(&other[12], &crc, 4);
+      std::fill(g_fontData.begin(), g_fontData.end(), 0xFF); std::copy(other.begin(), other.end(), g_fontData.begin());
+      openFont(); fontRetryAt = 0;
+      CHECK(fontState == FontState::Ready && titleFont.ready() && fontCrc == crc && fontDownloadWanted);
+      server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "not this firmware's version, update pending"));
+      g_responses.push_back({200, std::string(g_fontBin.begin(), g_fontBin.end())}); loop();
+      CHECK(fontState == FontState::Ready && fontCrc == FONT_BIN_CRC && !fontDownloadWanted); }
+
+    printf("    old partition layout: built-in font, no downloads, 16 logo slots\n");
+    g_haveFontPartition = false; g_spiffs.size = 0x20000; openFont();
+    CHECK(fontState == FontState::NoPartition && !titleFont.ready() && logoSlotCount() == 16);
+    size_t before = g_requests.size(); loop(); CHECK(g_requests.size() == before);
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "old partition layout, flash firmware-merged.bin over USB once"));
+    reset(); setResponse({{0,"A"}}); loopWithUpdate(); CHECK(isTitleDisplaying && titleText.builtin); runUntilTitleDone();
+    g_haveFontPartition = true; g_spiffs.size = 0x40000;
+    std::fill(g_fontData.begin(), g_fontData.end(), 0xFF); std::copy(g_fontBin.begin(), g_fontBin.end(), g_fontData.begin()); openFont();
+    CHECK(fontState == FontState::Ready && logoSlotCount() == 32 && !fontDownloadWanted);
+    config.titleRepeatMinutes = 5;
+    printf("    the logo partition moved (new layout): stored logos are forgotten\n");
+    saveLogoIndexEntry(3, LogoSlot{"12875057", 0x1234});
+    checkLogoPartition(); CHECK(g_nvs["logos"].count("s3"));                   // same place: kept
+    g_spiffs.address = 0x330000; checkLogoPartition();
+    CHECK(!g_nvs["logos"].count("s3") && g_nvs["logos"]["part"] == "330000:40000");
+    assignLogoSlots(); for(auto& c : channels) CHECK(c.logoSlot == -1);
+    g_spiffs.address = 0;
+    reset(); }
+
   printf("T23 new firmware confirmed only after 60 s online\n");
   appPendingVerify = true; g_otaState = ESP_OTA_IMG_PENDING_VERIFY; g_markedValid = 0; g_wifiUp = true;
   for(int i=0;i<3000;i++) loop();              // ~30 s
@@ -674,13 +803,14 @@ int main(){
     CHECK(writeLogo(0, logoB.data()));                                   // rewrite: erased before writing
     CHECK(readLogo(0, back.data()) && back == logoB && readLogo(15, back.data()) && back == logoB);
     CHECK(g_flashBadWrites == 0);
-    CHECK(!writeLogo(16, logoA.data()) && !readLogo(-1, back.data()) && !readLogo(16, back.data()));
+    CHECK(logoSlotCount() == 32 && writeLogo(31, logoA.data()) && readLogo(31, back.data()) && back == logoA);   // 32 slots in the new layout
+    CHECK(!writeLogo(32, logoA.data()) && !readLogo(-1, back.data()) && !readLogo(32, back.data()));
     g_flashFail = true; CHECK(!writeLogo(1, logoA.data())); g_flashFail = false;
 
     CHECK(writeLogo(3, logoA.data()));
     saveLogoIndexEntry(3, LogoSlot{"12875057", 0xdeadbeef});
     saveLogoIndexEntry(5, LogoSlot{"99999999", 0x00000001});
-    std::array<LogoSlot, LOGO_SLOTS> idx; loadLogoIndex(idx);
+    std::array<LogoSlot, MAX_LOGO_SLOTS> idx; loadLogoIndex(idx);
     CHECK(idx[3].channelId == "12875057" && idx[3].urlHash == 0xdeadbeef && idx[5].channelId == "99999999" && idx[5].urlHash == 1 && idx[0].channelId.empty());
     saveLogoIndexEntry(5, LogoSlot{}); loadLogoIndex(idx); CHECK(idx[5].channelId.empty() && g_nvs["logos"].size() == 1);
 
@@ -695,9 +825,14 @@ int main(){
     { uint16_t x0,y0,x1,y1; slotXY(0,x0,y0); slotXY(1,x1,y1);
       uint16_t bg0 = g_fb[y0+2][x0+2], bg1 = g_fb[y1+2][x1+2];
       CHECK(bg0 != 0 && bg1 != 0 && bg0 != bg1);                         // coloured, differs per channel
-      CHECK(g_fb[y0+32][x0+32] == 0x1234 && g_fb[y0+10][x0+32] == bg0);   // initials in the middle rows
-      CHECK(pic_canvas.lastText == "N2"); }                               // initials of the name from Twitch ("n2"), last placeholder drawn
-    { channelInfo anon; anon.id = "123"; drawPlaceholder(anon); CHECK(pic_canvas.lastText == "?"); }
+      auto white = [&](int x, int y){ int n = 0; for(int j = 20; j < 46; j++) for(int i = 6; i < 58; i++) if(g_fb[y+j][x+i] == ST77XX_WHITE) n++; return n; };
+      CHECK(white(x0, y0) > 60 && g_fb[y0+10][x0+32] == bg0 && g_fb[y0+50][x0+32] == bg0); }   // initials (Noto Sans) in the middle rows
+    CHECK(placeholderInitials("n2") == std::vector<uint32_t>({'N', '2'}) && placeholderInitials("N2xyz") == std::vector<uint32_t>({'N', '2'}));
+    CHECK(placeholderInitials("\xc3\xa4x") == std::vector<uint32_t>({0xC4, 'X'}));        // "äx" -> "ÄX"
+    CHECK(placeholderInitials("_\xf0\x9f\x8e\xae z") == std::vector<uint32_t>({'Z'}) && placeholderInitials("") == std::vector<uint32_t>({'?'}));
+    { channelInfo anon; anon.id = "123"; drawPlaceholder(anon); int n = 0;  // no name: "?"
+      for(int i = 0; i < 64*64; i++) if(pic_canvas.getBuffer()[i] == ST77XX_WHITE) n++;
+      CHECK(n > 20); }
     channels[0].name = channels[2].name = "";
     g_nvs.erase("logos"); for(auto& c : channels) c.logoSlot = -1;
     std::fill(g_flashData.begin(), g_flashData.end(), 0xFF);
@@ -739,8 +874,8 @@ int main(){
     rebootAt = 0;
     post({{"channels", "bad-name!"}});                        CHECK(contains(g_lastBody, "Invalid channel name: bad-name!") && rebootAt == 0);
     post({{"channels", "  \n "}});                            CHECK(contains(g_lastBody, "at least one channel"));
-    { std::string many; for(int i=0;i<17;i++) many += "ch" + std::to_string(i) + "\n";
-      post({{"channels", many}});                             CHECK(contains(g_lastBody, "At most 16 channels")); }
+    { std::string many; for(int i=0;i<33;i++) many += "ch" + std::to_string(i) + "\n";
+      post({{"channels", many}});                             CHECK(contains(g_lastBody, "At most 32 channels")); }
     CHECK(!g_nvs["config"].count("channels"));
     post({{"channels", "PietSmiet\nhttps://www.twitch.tv/Bonjwa, gronkh\ngronkh\nnewguy;12875057"}});
     CHECK(rebootAt != 0 && g_nvs["config"]["channels"] == "pietsmiet,bonjwa,gronkh,newguy,12875057");
@@ -804,7 +939,7 @@ int main(){
     CHECK(slotOf("761017145") == -1 && slotOf("21991090") == -1);
     CHECK(slotData(slotOf("12875057")) == expectLogo("gronkh"));
     CHECK(slotData(slotOf("73437396")) == expectLogo("bonjwa"));
-    { std::array<LogoSlot, LOGO_SLOTS> idx; loadLogoIndex(idx); int n = 0; for(auto& e : idx) if(!e.channelId.empty()) n++; CHECK(n == 2); }
+    { std::array<LogoSlot, MAX_LOGO_SLOTS> idx; loadLogoIndex(idx); int n = 0; for(auto& e : idx) if(!e.channelId.empty()) n++; CHECK(n == 2); }
     CHECK(g_flashBadWrites == 0);
 
     printf("    the tile shows the downloaded logo\n");
@@ -842,7 +977,7 @@ int main(){
     g_responses.push_back({200, file("bonjwa")});
     g_flashFail = true; CHECK(runChannelSync()); drain(); g_flashFail = false;
     CHECK(statusOf("21991090") == "could not write flash" && slotOf("21991090") == -1);
-    { std::array<LogoSlot, LOGO_SLOTS> idx; loadLogoIndex(idx); for(auto& e : idx) CHECK(e.channelId != "21991090"); }
+    { std::array<LogoSlot, MAX_LOGO_SLOTS> idx; loadLogoIndex(idx); for(auto& e : idx) CHECK(e.channelId != "21991090"); }
 
     printf("    'Reload logos' downloads all again\n");
     g_authOk = false; server.find("/logos/reload", HTTP_POST)->fn(); CHECK(g_lastCode == 401 && !logoReloadRequested); g_authOk = true;
@@ -854,7 +989,7 @@ int main(){
     CHECK(g_requests.size() >= n0 + 2 && contains(g_requests.back().url, "bonjwa-profile_image-70x70.png") && !logoReloadRequested);
 
     printf("    a new channel reuses the slot of a removed one\n");
-    for(int i = 0; i < LOGO_SLOTS; i++) if(netLogoIndex[i].channelId.empty()){ netLogoIndex[i].channelId = "gone" + std::to_string(i); netLogoIndex[i].urlHash = 1; saveLogoIndexEntry(i, netLogoIndex[i]); }
+    for(int i = 0; i < logoSlotCount(); i++) if(netLogoIndex[i].channelId.empty()){ netLogoIndex[i].channelId = "gone" + std::to_string(i); netLogoIndex[i].urlHash = 1; saveLogoIndexEntry(i, netLogoIndex[i]); }
     g_responses.push_back({200, usersJson({{"21991090","pietsmiet","PietSmiet"}}, "")});
     g_responses.push_back({200, file("maxim")});
     CHECK(runChannelSync()); drain();
@@ -946,7 +1081,7 @@ int main(){
     printf("    the title takes as long as the speed says\n");
     reset(); setResponse({{0,"Exactly twenty chars"}}); loopWithUpdate();
     t0 = g_millis; runUntilTitleDone();
-    unsigned long expectMs = (unsigned long)((uint64_t)(channels[0].streamTitle.length() - 5) * CHAR_WIDTH * MAX_TITLE_REPEAT * FRAME_INTERVAL_US / SCROLL_STEP / 1000);
+    unsigned long expectMs = (unsigned long)((uint64_t)MAX_TITLE_REPEAT * (titleText.width + TITLE_GAP) * FRAME_INTERVAL_US / SCROLL_STEP / 1000);
     CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
     CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
     server.find("/", HTTP_GET)->fn();
@@ -994,7 +1129,7 @@ int setupModeTests(){
 
   printf("S3 web password is required in setup mode\n");
   g_args = {{"ssid","homewifi"},{"wifipw","wifipassword"}}; server.find("/settings", HTTP_POST)->fn();
-  CHECK(contains(g_lastBody, "Choose a password") && g_nvs.empty() && rebootAt == 0);
+  CHECK(contains(g_lastBody, "Choose a password") && g_nvs["config"].empty() && rebootAt == 0);   // nothing saved (only the logo partition marker exists)
 
   printf("S4 saving restarts, secrets are not echoed\n");
   g_args = {{"ssid","homewifi"},{"wifipw","wifipassword"},{"clientid","cid"},{"secret","sec123"},{"webpw","webpassword"},{"webpw2","webpassword"}};
@@ -1006,7 +1141,7 @@ int setupModeTests(){
   printf("S5 after the restart: normal mode with the saved settings\n");
   simulateReboot(); g_wifiUp = true; g_authOk = true;
   setup();
-  CHECK(!setupMode && g_beginSsid == "homewifi" && g_beginPw == "wifipassword" && g_tasksCreated == 1);
+  CHECK(!setupMode && g_beginSsid == "homewifi" && g_beginPw == "wifipassword" && g_tasksCreated == 2);
   CHECK(config.clientSecret == "sec123" && std::string(config.effectiveClientId()) == "cid" && config.webPassword == "webpassword");
   CHECK(server.find("/", HTTP_GET) != nullptr && server.find("/settings", HTTP_GET) != nullptr);
 

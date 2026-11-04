@@ -24,6 +24,8 @@
 #include <DNSServer.h>
 #include <esp_rom_crc.h>
 #include <spi_fast.h>
+#include <esp_partition.h>
+#include <TitleFont.h>
 
 #include <deque>
 #include <string>
@@ -167,7 +169,16 @@ CrlfSerial debugSerial;
 
 // Title scrolling: one frame per panel refresh, position from the elapsed
 // time, so the speed stays even when a frame is late (the next one catches up)
-#define CHAR_WIDTH          (6*8)  // text size 8: 6 px per character * 8
+#define TITLE_EM            54.0f  // Noto Sans size: accents and descenders fit the 64 px row
+#define TITLE_BASELINE      51     // baseline within the row
+#define TITLE_LEAD          192    // empty space before the text when a title starts
+#define TITLE_GAP           96     // space between the end of the text and its repetition
+#define TITLE_MARGIN        96     // canvas columns right of the visible title, where new characters are drawn
+#define TITLE_SHIFT         8      // move the canvas content left once this much has scrolled out
+#define BUILTIN_ADVANCE     (6*8)  // built-in font (no font.bin): text size 8, 6 px per character * 8
+#define TITLE_COLOR         ST77XX_CYAN
+#define TITLE_RENDER_STACK  6144   // bytes, stb_truetype rasterizer
+#define GLYPH_MIN_FREE_BLOCK 12288 // render a character only with this much RAM in one block, else a box
 // Panel refresh (ST7789V data sheet, FRCTRL2 C6h): 10 MHz / ((320 + FPA + BPA) * (250 + 16 * RTNA))
 // with the default porches FPA = BPA = 0x0C (B2h, not changed by the library).
 // RTNA 0x04 = 92.6 Hz, i.e. one refresh every 10801 us. A title frame takes
@@ -331,14 +342,19 @@ void setupWeb();
 void startSetupMode(const char* reason, bool retryLater);
 bool connectWiFi();
 void drawMessageScreen(const char* title, uint16_t color, const char* message);
+void openFont();
+extern SemaphoreHandle_t titleLock;
+void titleRenderTask(void*);
+std::string toDisplayText(const char* utf8);
 void assignLogoSlots();
 void buildChannels();
+void checkLogoPartition();
 void networkTask(void*);
 
 struct channelInfo {
   std::string id;           // Twitch user id, empty until the name is resolved
   bool isLive = false;
-  std::string streamTitle;  // display charset, used for the scrolling title
+  std::string streamTitle;  // "<title> | <game>" (UTF-8), the scrolling title
   int8_t slotNum = -1;
   std::string name;         // display name (UTF-8)
   std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
@@ -348,7 +364,7 @@ struct channelInfo {
   uint32_t titleShownSeq = 0; // when its title was shown last (titleShowCount then), 0 = never
 };
 
-#define MAX_CHANNELS 16
+#define MAX_CHANNELS 32
 
 // Channels until a list is saved on the Settings page (Twitch user ids):
 // lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
@@ -370,8 +386,9 @@ struct ChannelRef {
   bool found = false;    // Twitch knows this channel (set by fetchUsers())
 };
 
-#define LOGO_SLOTS      16
+#define MAX_LOGO_SLOTS  32   // one per channel
 #define LOGO_SLOT_BYTES (LOGO_SIZE*LOGO_SIZE*2)
+int logoSlotCount();       // as many as the logo partition holds (16 with the old partition layout)
 #define LOGO_NAMESPACE  "logos"
 
 struct LogoSlot {
@@ -381,11 +398,11 @@ struct LogoSlot {
 
 bool readLogo(int slot, uint16_t* pixels);
 bool writeLogo(int slot, const uint16_t* pixels);
-void loadLogoIndex(std::array<LogoSlot, LOGO_SLOTS>& index);
+void loadLogoIndex(std::array<LogoSlot, MAX_LOGO_SLOTS>& index);
 void saveLogoIndexEntry(int slot, const LogoSlot& entry);
 
 std::vector<ChannelRef> netChannels;      // network task's copy of the channel list
-std::array<LogoSlot, LOGO_SLOTS> netLogoIndex; // network task's copy of the logo index
+std::array<LogoSlot, MAX_LOGO_SLOTS> netLogoIndex; // network task's copy of the logo index
 std::vector<std::string> unknownChannels; // loop(): configured names Twitch does not know
 
 uint16_t live_num = 0;
@@ -397,7 +414,7 @@ enum class FetchResult { Ok, Unauthorized, Failed, NoCredentials };
 struct StreamInfo {
   std::string id;
   std::string name;
-  std::string title;  // "    <title> | <game>   " in the display charset
+  std::string title;  // "<title> | <game>" (UTF-8)
   std::string webTitle; // "<title> | <game>" in UTF-8
 };
 
@@ -470,9 +487,11 @@ FetchResult lastFetchResult = FetchResult::Ok;
 unsigned long lastFetchMillis = 0; // 0 = no update yet
 
 GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
-// one character (6*8 px at text size 8) wider than the visible title so it can scroll smoothly
-#define TITLE_CANVAS_CHARS ((TITLE_WIDTH + CHAR_WIDTH + CHAR_WIDTH - 1) / CHAR_WIDTH)  // characters that fit on the canvas
-GFXcanvas16 text_canvas(TITLE_WIDTH+CHAR_WIDTH, PIC_SIZE);
+// The visible title plus a margin on the right, where the render task draws
+// the next characters before they scroll into view
+#define CANVAS_W (TITLE_WIDTH + TITLE_MARGIN)
+GFXcanvas16 text_canvas(CANVAS_W, PIC_SIZE);
+GFXcanvas1 builtinGlyph(BUILTIN_ADVANCE, PIC_SIZE);  // one character of the built-in font (render task)
 
 void setup(void) {
 
@@ -495,13 +514,12 @@ void setup(void) {
   
   tft.fillScreen(ST77XX_BLACK);
 
-  text_canvas.setCursor(0,0);
-  text_canvas.setTextWrap(false);
-  text_canvas.setTextColor(ST77XX_CYAN);
-  text_canvas.setTextSize(8);
-  text_canvas.cp437(true); // titles are converted to CP437, see toDisplayText()
+  builtinGlyph.setTextWrap(false);
+  builtinGlyph.cp437(true); // without font.bin titles are converted to CP437, see toDisplayText()
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
+  titleLock = xSemaphoreCreateMutex();
+  openFont();
 
   // New firmware from an OTA update starts "pending verify" and must confirm
   // itself (confirmFirmwareWhenStable()), otherwise the bootloader rolls back
@@ -517,6 +535,7 @@ void setup(void) {
   loadConfig();
   twitchToken = config.token;
   buildChannels();
+  checkLogoPartition();
   assignLogoSlots();
 
   if(setupRequested == SETUP_REQUEST_MAGIC){
@@ -552,6 +571,8 @@ void setup(void) {
   // results come back to loop() through updateQueue
   updateQueue = xQueueCreate(8, sizeof(NetMessage*));
   loadLogoIndex(netLogoIndex);
+  // titles: characters are rendered ahead in their own task, below loop() like the network task
+  xTaskCreate(titleRenderTask, "render", TITLE_RENDER_STACK, nullptr, NET_TASK_PRIORITY, nullptr);
   xTaskCreate(networkTask, "network", NET_TASK_STACK, nullptr, NET_TASK_PRIORITY, &netTask);
 
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
@@ -582,29 +603,107 @@ void drawThickRect(int16_t x, int16_t y, int16_t w, int16_t h,
   tft.fillRect(x+w-1, y+h-1, -w, -t, color);
 }
 
-#define MAX_TITLE_REPEAT 2
-
+#define MAX_TITLE_REPEAT 2   // the text scrolls by this many times
 
 struct {
   channelInfo* channel;
   int8_t slot;              // slot of the channel when the title was (re)drawn
-  std::string displayTitle;
-  uint16_t textOffset;
-  uint8_t repeats;
 } channelTitleInfo;
 
-bool isTitleDisplaying = false;
+volatile bool isTitleDisplaying = false;
 
-uint8_t o_X = 0;                     // pixel offset within the first visible character
-unsigned long titleStartedUs = 0;    // micros() of the first frame
+// The title being shown, laid out by loop() when it starts. The render task
+// reads it (under titleLock) while isTitleDisplaying.
+struct TitleText {
+  std::vector<uint32_t> chars;     // code points (font.bin) or CP437 codes (built-in font)
+  std::vector<uint16_t> advance;   // pixels
+  uint32_t width = 0;              // of the text, without the gap
+  bool builtin = true;             // drawn with the built-in font
+} titleText;
+
+// Canvas state shared by loop() and the render task, under titleLock:
+// text_canvas columns [o_X, o_X + TITLE_WIDTH) are visible, the next
+// character goes to titleNextX.
+SemaphoreHandle_t titleLock = nullptr;
+uint32_t titleGeneration = 0;        // changes with every start/stop: stale renders are dropped
+size_t titleNextItem = 0;            // next character (chars.size() = the gap)
+int titleNextX = 0;
+uint16_t o_X = 0;                    // first visible canvas column
+uint32_t titleScrollTotal = 0;       // pixels until the title ends
+
+unsigned long titleStartedUs = 0;    // micros() of the first frame (moved on while waiting for characters)
 uint32_t titlePixels = 0;            // pixels scrolled since the start
 unsigned long nextFrameUs = 0;       // micros() of the next frame
-bool titleCanvasValid = false;       // text_canvas shows the text from textOffset
 
 // statistics of the current / last title for the status page
 uint32_t titleFrames = 0;
 unsigned long titleLastFrameUs = 0, titleMaxGapUs = 0;
 uint64_t titleDrawUsSum = 0, titleXferUsSum = 0; unsigned long titleDrawUsMax = 0;  // time per frame for rendering + transfer, transfer alone
+uint32_t titleWaits = 0;             // frames that waited for the render task
+
+// Fonts from the font partition (see openFont())
+TitleFont titleFont;
+
+// ---------- Font partition ("font", data subtype 0x40): font.bin from
+// tools/make_fonts.py. Without it (old partition layout, or font.bin missing
+// or damaged) titles use the built-in font.
+#define FONT_PARTITION_SUBTYPE ((esp_partition_subtype_t)0x40)
+#define FONT_ASSET             "font.bin"
+#define FONT_RETRY_INTERVAL    (60UL * 60 * 1000)   // ms between download attempts after a failure
+#ifndef FONT_BIN_CRC
+#define FONT_BIN_CRC 0                              // set by tools/version.py
+#endif
+
+enum class FontState { NoPartition, Missing, Ready, Failed };
+FontState fontState = FontState::NoPartition;
+String fontProblem;                       // why font.bin is missing / the download failed
+uint32_t fontCrc = 0;                     // CRC of the installed font.bin
+const esp_partition_t* fontPartition = nullptr;
+const void* fontMap = nullptr;
+esp_partition_mmap_handle_t fontMapHandle;
+bool fontDownloadWanted = false;          // loop() downloads font.bin when nothing else runs
+unsigned long fontRetryAt = 0;            // millis() of the next attempt
+
+void closeFont(){
+  titleFont.end();
+  if(fontMap){ esp_partition_munmap(fontMapHandle); fontMap = nullptr; }
+}
+
+// Maps the font partition and reads font.bin from it
+void openFont(){
+  closeFont();
+  fontPartition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, FONT_PARTITION_SUBTYPE, "font");
+  if(!fontPartition){ fontState = FontState::NoPartition; return; }
+  FontBin bin;
+  const char* err = "cannot read the font partition";
+  if(esp_partition_mmap(fontPartition, 0, fontPartition->size, ESP_PARTITION_MMAP_DATA, &fontMap, &fontMapHandle) == ESP_OK){
+    err = parseFontBin((const uint8_t*)fontMap, fontPartition->size, bin);
+    if(!err && !titleFont.begin(bin)) err = "font.bin has an unreadable font";
+  } else fontMap = nullptr;
+  if(err){
+    closeFont();
+    fontState = FontState::Missing;
+    fontProblem = err;
+    fontCrc = 0;
+    fontDownloadWanted = true;
+    DEBUG_W.printf("[Font] %s, using the built-in font.\n", err);
+    return;
+  }
+  fontState = FontState::Ready;
+  fontCrc = bin.crc;
+  fontProblem = "";
+  DEBUG_I.printf("[Font] font.bin %08lx loaded.\n", (unsigned long)fontCrc);
+  // an older/newer font.bin than this firmware's: fetch the right one once
+  if(FONT_BIN_CRC && fontCrc != FONT_BIN_CRC) fontDownloadWanted = true;
+}
+
+// font.bin of this firmware's release; development builds take the newest release's
+String fontUrl(){
+  String v = FW_VERSION;
+  bool release = v.startsWith("v") && v.indexOf('-') < 0 && v.length() > 1 && isdigit((unsigned char)v[1]);
+  if(release) return "https://github.com/" GITHUB_REPO "/releases/download/" + v + "/" FONT_ASSET;
+  return "https://github.com/" GITHUB_REPO "/releases/latest/download/" FONT_ASSET;
+}
 
 // Green frame around the pic of the channel whose title is scrolling
 void drawTitleIndicator(){
@@ -616,67 +715,185 @@ void drawTitleIndicator(){
 uint32_t titleShowCount = 0;          // titles shown since boot
 unsigned long lastTitleEndAt = 0;     // millis() when the last title ended
 
+// true if a stream title has something to show (not just the " | " separator)
+bool hasTitleText(const std::string& title){
+  return title.find_first_not_of(" |") != std::string::npos;
+}
+
+static inline uint16_t blend565(uint16_t bg, uint16_t fg, uint8_t a){
+  if(a == 255) return fg;
+  if(a == 0) return bg;
+  uint32_t r = (((fg >> 11) & 31) * a + ((bg >> 11) & 31) * (255 - a) + 127) / 255;
+  uint32_t g = (((fg >> 5) & 63) * a + ((bg >> 5) & 63) * (255 - a) + 127) / 255;
+  uint32_t b = ((fg & 31) * a + (bg & 31) * (255 - a) + 127) / 255;
+  return (uint16_t)(r << 11 | g << 5 | b);
+}
+
+// Draws a rendered character into a canvas with its pen position at (x, baseline)
+void blitGlyph(GFXcanvas16& canvas, const GlyphBitmap& g, int x, int baseline, uint16_t color){
+  uint16_t* buf = canvas.getBuffer();
+  int cw = canvas.width(), ch = canvas.height();
+  for(int j = 0; j < g.h; j++){
+    int py = baseline + g.yoff + j;
+    if(py < 0 || py >= ch) continue;
+    const uint8_t* src = &g.alpha[(size_t)j * g.w];
+    uint16_t* dst = &buf[py * cw];
+    for(int i = 0; i < g.w; i++){
+      int px = x + g.xoff + i;
+      if(px >= 0 && px < cw && src[i]) dst[px] = blend565(dst[px], color, src[i]);
+    }
+  }
+}
+
+// Outline box for a character no font has
+void drawGlyphBox(GFXcanvas16& canvas, int x, int advance, uint16_t color){
+  int h = (int)(TITLE_EM * 0.7f);
+  canvas.drawRect(x + 3, TITLE_BASELINE - h, advance - 6, h, color);
+}
+
+// A character of the built-in 5x7 font at text size 8 (48x64, top at row 0)
+void renderBuiltinGlyph(uint8_t c, GlyphBitmap& g){
+  builtinGlyph.fillScreen(0);
+  builtinGlyph.drawChar(0, 0, c, 1, 0, 8);
+  g.w = BUILTIN_ADVANCE; g.h = PIC_SIZE; g.xoff = 0; g.yoff = -TITLE_BASELINE;
+  g.alpha.assign((size_t)g.w * g.h, 0);
+  for(int y = 0; y < g.h; y++) for(int x = 0; x < g.w; x++) if(builtinGlyph.getPixel(x, y)) g.alpha[y * g.w + x] = 255;
+}
+
+// Lays out the title text: with font.bin as code points, else in CP437
+void layoutTitle(const std::string& utf8){
+  titleText = TitleText();
+  if(titleFont.ready()){
+    titleText.builtin = false;
+    for(uint32_t cp : titleCodepoints(utf8.c_str())){
+      titleText.chars.push_back(cp);
+      titleText.advance.push_back((uint16_t)titleFont.advance(cp, TITLE_EM));
+    }
+  } else {
+    for(char c : toDisplayText(utf8.c_str())){
+      titleText.chars.push_back((uint8_t)c);
+      titleText.advance.push_back(BUILTIN_ADVANCE);
+    }
+  }
+  for(uint16_t a : titleText.advance) titleText.width += a;
+}
+
+// Draws the next character into the canvas margin, if there is room. Runs in
+// the render task (and in startTitle() for the first characters); rendering
+// happens without the lock, so loop() keeps drawing frames meanwhile.
+// Returns false when there is nothing to do.
+bool renderAheadStep(){
+  if(!isTitleDisplaying || !titleLock) return false;
+  xSemaphoreTake(titleLock, portMAX_DELAY);
+  uint32_t generation = titleGeneration;
+  size_t count = titleText.chars.size(), item = titleNextItem;
+  bool gap = item >= count;
+  uint32_t c = gap ? 0 : titleText.chars[item];
+  bool builtin = titleText.builtin;
+  int advance = gap ? TITLE_GAP : titleText.advance[item];
+  // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
+  bool room = isTitleDisplaying && (gap ? titleNextX <= CANVAS_W : titleNextX + advance + 8 <= CANVAS_W);
+  xSemaphoreGive(titleLock);
+  if(!room) return false;
+
+  GlyphBitmap glyph;
+  bool box = false;
+  if(!gap){
+    if(builtin) renderBuiltinGlyph((uint8_t)c, glyph);
+    else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) box = c != ' ';  // no RAM: a box instead of failing
+    else box = !titleFont.render(c, TITLE_EM, glyph);
+  }
+
+  xSemaphoreTake(titleLock, portMAX_DELAY);
+  if(generation == titleGeneration && isTitleDisplaying){
+    if(box) drawGlyphBox(text_canvas, titleNextX, advance, TITLE_COLOR);
+    else if(!gap) blitGlyph(text_canvas, glyph, titleNextX, TITLE_BASELINE, TITLE_COLOR);
+    titleNextX += advance;
+    titleNextItem = (item + 1) % (count + 1);
+  }
+  xSemaphoreGive(titleLock);
+  return true;
+}
+
+void titleRenderTask(void*){
+  for(;;){
+    if(!renderAheadStep()) vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+// Moves the canvas content left by n columns (under titleLock)
+void shiftTitleCanvas(int n){
+  uint16_t* buf = text_canvas.getBuffer();
+  for(int y = 0; y < PIC_SIZE; y++){
+    uint16_t* row = &buf[y * CANVAS_W];
+    memmove(row, row + n, (CANVAS_W - n) * sizeof(uint16_t));
+    memset(row + CANVAS_W - n, 0, n * sizeof(uint16_t));
+  }
+  titleNextX -= n;
+  o_X -= n;
+}
+
 void startTitle(channelInfo* channel){
   channel->titleShownSeq = ++titleShowCount;
   channelTitleInfo.channel = channel;
   channelTitleInfo.slot = channel->slotNum;
-  channelTitleInfo.displayTitle = channel->streamTitle;
-  channelTitleInfo.textOffset = 0;
-  channelTitleInfo.repeats = 0;
+  xSemaphoreTake(titleLock, portMAX_DELAY);
+  titleGeneration++;
+  layoutTitle(channel->streamTitle);
+  text_canvas.fillScreen(ST77XX_BLACK);
+  titleNextItem = 0;
+  titleNextX = TITLE_LEAD;
   o_X = 0;
+  titleScrollTotal = MAX_TITLE_REPEAT * (titleText.width + TITLE_GAP);
+  isTitleDisplaying = true;
+  xSemaphoreGive(titleLock);
+  // the first characters right away, so the title does not start with gaps
+  while(titleNextX < TITLE_WIDTH + TITLE_SHIFT && renderAheadStep()) {}
   titlePixels = 0;
   titleStartedUs = nextFrameUs = micros();
-  titleCanvasValid = false;
   titleFrames = 0;
   titleMaxGapUs = 0;
   titleDrawUsSum = 0;
   titleXferUsSum = 0;
   titleDrawUsMax = 0;
-  isTitleDisplaying = true;
+  titleWaits = 0;
   drawTitleIndicator();
 }
 
 void stopTitle();
-
-// Next character: the canvas is drawn from it on the next frame. After the
-// whole text has passed MAX_TITLE_REPEAT times the title ends.
-void advanceTitleCharacter(){
-  channelTitleInfo.textOffset = (channelTitleInfo.textOffset + 1) % (channelTitleInfo.displayTitle.length() - 5);
-  titleCanvasValid = false;
-  if(channelTitleInfo.textOffset == 0 && ++channelTitleInfo.repeats == MAX_TITLE_REPEAT) stopTitle();
-}
 
 // Draws the title frame for the current time (called from loop() when a frame is due)
 void drawTitleFrame(){
   unsigned long now = micros();
   bool first = titleFrames == 0;
   uint32_t target = (uint32_t)((uint64_t)(now - titleStartedUs) * SCROLL_STEP / FRAME_INTERVAL_US);
-  uint32_t step = target - titlePixels;
-  titlePixels = target;
-  for(uint32_t moved = o_X + step; moved >= CHAR_WIDTH && isTitleDisplaying; moved -= CHAR_WIDTH){
-    advanceTitleCharacter();
-    o_X = (uint8_t)(moved - CHAR_WIDTH);
-    step = 0;
-  }
-  if(!isTitleDisplaying) return;
-  o_X += step;
+  if(target > titleScrollTotal) target = titleScrollTotal;
   // next frame on the fixed raster; after a long stall start a new one
   nextFrameUs += FRAME_INTERVAL_US;
   if((long)(now - nextFrameUs) > FRAME_INTERVAL_US) nextFrameUs = now + FRAME_INTERVAL_US;
-  if(!first && step == 0 && titleCanvasValid) return; // nothing moved
-  if(!titleCanvasValid){
-    // only the characters that fit on the canvas (one byte each, CP437)
-    char visible[TITLE_CANVAS_CHARS + 1];
-    strncpy(visible, &channelTitleInfo.displayTitle[channelTitleInfo.textOffset], TITLE_CANVAS_CHARS);
-    visible[TITLE_CANVAS_CHARS] = 0;
-    text_canvas.fillScreen(ST77XX_BLACK);
-    text_canvas.setCursor(0,0);
-    text_canvas.print(visible);
-    titleCanvasValid = true;
+
+  xSemaphoreTake(titleLock, portMAX_DELAY);
+  if(o_X >= TITLE_SHIFT) shiftTitleCanvas(o_X);
+  // never scroll past what the render task has drawn: wait (and keep the speed) instead
+  int ready = titleNextX - o_X - TITLE_WIDTH;
+  uint32_t step = target - titlePixels;
+  if(titlePixels + step < titleScrollTotal && (int)step > ready){
+    step = ready > 0 ? ready : 0;
+    titleStartedUs = now - (unsigned long)((uint64_t)(titlePixels + step) * FRAME_INTERVAL_US / SCROLL_STEP);
+    titleWaits++;
   }
+  titlePixels += step;
+  o_X += step;
+  if(titlePixels >= titleScrollTotal){
+    xSemaphoreGive(titleLock);
+    stopTitle();
+    return;
+  }
+  if(!first && step == 0){ xSemaphoreGive(titleLock); return; }  // nothing moved
   unsigned long xferStart = micros();
   // the title scrolls over the row that does not contain the channel's pic
-  tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
+  tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W);
+  xSemaphoreGive(titleLock);
   unsigned long drawUs = micros() - now;
   titleDrawUsSum += drawUs;
   titleXferUsSum += micros() - xferStart;
@@ -688,7 +905,10 @@ void drawTitleFrame(){
 
 // Ends the title display and restores all pics (the title covers one row)
 void stopTitle(){
+  xSemaphoreTake(titleLock, portMAX_DELAY);
   isTitleDisplaying = false;
+  titleGeneration++;
+  xSemaphoreGive(titleLock);
   lastTitleEndAt = millis();
   redrawLiveChannelPics();
 }
@@ -702,7 +922,7 @@ void repeatTitleWhenDue(){
   channelInfo* pick = nullptr;
   uint32_t equals = 0;
   for(auto& c : channels){
-    if(!c.isLive || c.slotNum < 0 || c.streamTitle.length() <= 5) continue;
+    if(!c.isLive || c.slotNum < 0 || !hasTitleText(c.streamTitle)) continue;
     if(!pick || c.titleShownSeq < pick->titleShownSeq){ pick = &c; equals = 1; }
     else if(c.titleShownSeq == pick->titleShownSeq && esp_random() % ++equals == 0) pick = &c;  // each equal one with the same chance
   }
@@ -756,6 +976,7 @@ void confirmFirmwareWhenStable(bool wifiConnected);
 void setupModeLoop();
 void checkBootButton();
 void runInstall();
+void runFontDownload();
 
 void loop(){
   if(setupMode){
@@ -779,6 +1000,10 @@ void loop(){
   if(installRequested){
     installRequested = false;
     runInstall();
+  }
+  if(fontDownloadWanted && fontPartition && WiFi.status() == WL_CONNECTED && !isTitleDisplaying && !otaActive
+     && !rebootAt && !restoreDisplayAt && (long)(millis() - fontRetryAt) >= 0){
+    runFontDownload();
   }
 
   static unsigned long lastLdr = 0;
@@ -1002,7 +1227,7 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
     StreamInfo info;
     info.id = id;
     info.name = stream["user_name"] | "";
-    info.title = "    " + toDisplayText(stream["title"]) + " | " + toDisplayText(stream["game_name"]) + "   ";
+    info.title = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
     info.webTitle = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
     update.streams.push_back(std::move(info));
   }
@@ -1154,17 +1379,17 @@ void syncLogos(const std::vector<ChannelRef>& refs){
     std::string url = smallAvatarUrl(ref.avatarUrl);
     uint32_t hash = esp_rom_crc32_le(0, (const uint8_t*)url.data(), url.size());
     int slot = -1;
-    for (int i = 0; i < LOGO_SLOTS; i++) if (netLogoIndex[i].channelId == ref.id) slot = i;
+    for (int i = 0; i < logoSlotCount(); i++) if (netLogoIndex[i].channelId == ref.id) slot = i;
     if (slot >= 0 && netLogoIndex[slot].urlHash == hash && !force) continue; // up to date
     if (slot < 0) {
       // a free slot, or one of a channel that is no longer in the list
-      for (int i = 0; i < LOGO_SLOTS && slot < 0; i++) {
+      for (int i = 0; i < logoSlotCount() && slot < 0; i++) {
         const std::string& owner = netLogoIndex[i].channelId;
         bool inUse = false;
         for (const auto& r : refs) if (!owner.empty() && r.id == owner) inUse = true;
         if (!inUse) slot = i;
       }
-      if (slot < 0) continue; // cannot happen with at most LOGO_SLOTS channels
+      if (slot < 0) continue; // more channels than slots (old partition layout): this one keeps its placeholder
     }
 
     DEBUG_I.printf("[%s] Downloading logo of %s: %s\n", DEBUG_TAG, ref.login.c_str(), url.c_str());
@@ -1256,19 +1481,25 @@ void networkTask(void*){
 // slot is only listed there after it has been written completely.
 
 const esp_partition_t* logoPartition(){
+  // "logos" (old partition layout: "spiffs"), written without a file system
   static const esp_partition_t* partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
-  return (partition && partition->size >= LOGO_SLOTS * LOGO_SLOT_BYTES) ? partition : nullptr;
+  return partition;
+}
+
+int logoSlotCount(){
+  const esp_partition_t* p = logoPartition();
+  return p ? (int)std::min<size_t>(MAX_LOGO_SLOTS, p->size / LOGO_SLOT_BYTES) : 0;
 }
 
 bool readLogo(int slot, uint16_t* pixels){
   const esp_partition_t* p = logoPartition();
-  return p && slot >= 0 && slot < LOGO_SLOTS
+  return p && slot >= 0 && slot < logoSlotCount()
       && esp_partition_read(p, slot * LOGO_SLOT_BYTES, pixels, LOGO_SLOT_BYTES) == ESP_OK;
 }
 
 bool writeLogo(int slot, const uint16_t* pixels){
   const esp_partition_t* p = logoPartition();
-  return p && slot >= 0 && slot < LOGO_SLOTS
+  return p && slot >= 0 && slot < logoSlotCount()
       && esp_partition_erase_range(p, slot * LOGO_SLOT_BYTES, LOGO_SLOT_BYTES) == ESP_OK
       && esp_partition_write(p, slot * LOGO_SLOT_BYTES, pixels, LOGO_SLOT_BYTES) == ESP_OK;
 }
@@ -1277,10 +1508,10 @@ String logoIndexKey(int slot){
   return "s" + String(slot);
 }
 
-void loadLogoIndex(std::array<LogoSlot, LOGO_SLOTS>& index){
+void loadLogoIndex(std::array<LogoSlot, MAX_LOGO_SLOTS>& index){
   Preferences prefs;
   prefs.begin(LOGO_NAMESPACE, true);
-  for(int i = 0; i < LOGO_SLOTS; i++){
+  for(int i = 0; i < logoSlotCount(); i++){
     String v = prefs.getString(logoIndexKey(i).c_str(), "");   // "<channel id>:<url hash>"
     int colon = v.indexOf(':');
     index[i] = LogoSlot();
@@ -1304,15 +1535,49 @@ void saveLogoIndexEntry(int slot, const LogoSlot& entry){
   prefs.end();
 }
 
+// The logo index belongs to one place in flash: after a new partition layout
+// (USB flash) the slots hold something else, so the index is cleared and the
+// logos are downloaded again. Called at boot, before the index is read.
+void checkLogoPartition(){
+  const esp_partition_t* p = logoPartition();
+  if(!p) return;
+  char where[24];
+  snprintf(where, sizeof(where), "%lx:%lx", (unsigned long)p->address, (unsigned long)p->size);
+  Preferences prefs;
+  prefs.begin(LOGO_NAMESPACE, false);
+  if(prefs.getString("part", "") != where){
+    if(prefs.getString("part", "").length() || prefs.isKey("s0")) DEBUG_I.printf("[%s] Logo partition moved, downloading the logos again.\n", DEBUG_TAG);
+    prefs.clear();
+    prefs.putString("part", where);
+  }
+  prefs.end();
+}
+
 // Gives every channel its stored logo, if there is one (at boot, before the network task runs)
 void assignLogoSlots(){
-  std::array<LogoSlot, LOGO_SLOTS> index;
+  std::array<LogoSlot, MAX_LOGO_SLOTS> index;
   loadLogoIndex(index);
   for(channelInfo& ch : channels){
     ch.logoSlot = -1;
-    for(int i = 0; i < LOGO_SLOTS; i++) if(!ch.id.empty() && index[i].channelId == ch.id) ch.logoSlot = i;
+    for(int i = 0; i < logoSlotCount(); i++) if(!ch.id.empty() && index[i].channelId == ch.id) ch.logoSlot = i;
     if(ch.logoStatus.empty() || ch.logoStatus == "stored" || ch.logoStatus == "missing") ch.logoStatus = ch.logoSlot >= 0 ? "stored" : "missing";
   }
+}
+
+// Initials for a placeholder: the first two letters or digits the font has,
+// upper case where it is simple (ASCII and Latin-1), "?" without any
+std::vector<uint32_t> placeholderInitials(const std::string& name){
+  std::vector<uint32_t> label;
+  for(uint32_t cp : titleCodepoints(name.c_str())){
+    bool letter = cp < 0x80 ? isalnum((int)cp) != 0 : (cp >= 0xC0 && cp != 0xD7 && cp != 0xF7);
+    if(!letter || titleFont.sourceFor(cp) != TitleFont::TEXT) continue;
+    if(cp < 0x80) cp = toupper((int)cp);
+    else if(cp >= 0xE0 && cp <= 0xFE && cp != 0xF7) cp -= 0x20;
+    label.push_back(cp);
+    if(label.size() == 2) break;
+  }
+  if(label.empty()) label.push_back('?');
+  return label;
 }
 
 // Placeholder while a channel has no logo: coloured tile with its initials
@@ -1321,13 +1586,26 @@ void drawPlaceholder(const channelInfo& channel){
   const std::string& key = channel.name.empty() ? channel.id : channel.name;
   uint32_t hash = 0;
   for(char c : key) hash = hash * 31 + (uint8_t)c;
+  pic_canvas.fillScreen(colors[hash % (sizeof(colors) / sizeof(colors[0]))]);
+  if(titleFont.ready()){
+    std::vector<uint32_t> label = placeholderInitials(channel.name);
+    const float em = 30;
+    int width = 0;
+    for(uint32_t cp : label) width += titleFont.advance(cp, em);
+    int x = (PIC_SIZE - width) / 2;
+    for(uint32_t cp : label){
+      GlyphBitmap g;
+      if(titleFont.render(cp, em, g)) blitGlyph(pic_canvas, g, x, 43, ST77XX_WHITE);
+      x += titleFont.advance(cp, em);
+    }
+    return;
+  }
   std::string label;
   for(char c : channel.name){
     if(isalnum((unsigned char)c)) label += (char)toupper((unsigned char)c);
     if(label.size() == 2) break;
   }
   if(label.empty()) label = "?";
-  pic_canvas.fillScreen(colors[hash % (sizeof(colors) / sizeof(colors[0]))]);
   pic_canvas.setTextSize(3);
   pic_canvas.setTextColor(ST77XX_WHITE);
   pic_canvas.setCursor((PIC_SIZE - (int)label.size() * 18 + 3) / 2, (PIC_SIZE - 21) / 2);
@@ -1948,6 +2226,22 @@ void handleStatus(){
   b += "<tr><td>Built</td><td>" __DATE__ " " __TIME__ "</td></tr>";
   b += String("<tr><td>Partition</td><td>") + (running ? running->label : "?") + ", " + otaStateName() + "</td></tr>";
   b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
+  b += "<tr><td>Font</td><td>";
+  switch(fontState){
+    case FontState::Ready: {
+      char crc[9]; snprintf(crc, sizeof(crc), "%08lx", (unsigned long)fontCrc);
+      b += String("Noto Sans (font.bin ") + crc + ")";
+      if(FONT_BIN_CRC && fontCrc != FONT_BIN_CRC) b += " <span class=\"muted\">- not this firmware's version" + String(fontDownloadWanted ? ", update pending" : "") + "</span>";
+      break;
+    }
+    case FontState::NoPartition:
+      b += "<span class=\"err\">built-in font: old partition layout, flash firmware-merged.bin over USB once</span>"; break;
+    case FontState::Missing:
+      b += "<span class=\"err\">built-in font: " + htmlEscape(fontProblem.c_str()) + ", downloading font.bin</span>"; break;
+    case FontState::Failed:
+      b += "<span class=\"err\">built-in font: font.bin " + htmlEscape(fontProblem.c_str()) + " (trying again later)</span>"; break;
+  }
+  b += "</td></tr>";
   if(!config.requireLogin) b += "<tr><td>Web login</td><td class=\"err\">off: anyone on the network can use this page</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
   b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
@@ -1999,7 +2293,7 @@ void handleLogoReload(){
 void handleShowTitles(){
   if(!checkAuth()) return;
   for(auto& ch : channels){
-    if(!ch.isLive || ch.slotNum < 0 || ch.streamTitle.length() <= 5) continue;
+    if(!ch.isLive || ch.slotNum < 0 || !hasTitleText(ch.streamTitle)) continue;
     if(isTitleDisplaying && channelTitleInfo.channel == &ch) continue;
     if(std::find(titleChangeQueue.begin(), titleChangeQueue.end(), &ch) == titleChangeQueue.end()) titleChangeQueue.push_back(&ch);
   }
@@ -2553,6 +2847,80 @@ String downloadAndInstall(const String& url){
   // end() verifies the checksum and the image before switching the boot partition
   if(!Update.end(true)) return Update.errorString();
   return "";
+}
+
+// Downloads font.bin into the font partition (titles must not be showing)
+String downloadFontBin(const String& url){
+  WiFiClientSecure client;
+  client.useBuiltinCACertBundle();
+  HTTPClient http;
+  http.begin(client, url);
+  http.setUserAgent("twitchDisplay/" FW_VERSION);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // GitHub redirects to its file server
+  http.setTimeout(DOWNLOAD_TIMEOUT);
+  int code = http.GET();
+  feedLoopWDT();
+  if(code != HTTP_CODE_OK){
+    String e = "download failed (" + httpError(http, code) + ")";
+    http.end();
+    return e;
+  }
+  int size = http.getSize();
+  if(size < 20 || (size_t)size > fontPartition->size){ http.end(); return "download failed: unexpected size " + String(size); }
+  closeFont();
+  esp_err_t err = esp_partition_erase_range(fontPartition, 0, ((size_t)size + 4095) & ~(size_t)4095);
+  feedLoopWDT();
+  if(err != ESP_OK){ http.end(); return "cannot erase the font partition"; }
+  auto* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  size_t total = size, written = 0;
+  int lastPercent = -1;
+  unsigned long lastData = millis();
+  String error;
+  while(written < total){
+    feedLoopWDT();
+    size_t avail = stream->available();
+    if(avail == 0){
+      if(millis() - lastData > DOWNLOAD_TIMEOUT){ error = "download timed out"; break; }
+      delay(1);
+      continue;
+    }
+    size_t n = stream->readBytes(buf, std::min(std::min(avail, sizeof(buf)), total - written));
+    if(n == 0) continue;
+    lastData = millis();
+    if(esp_partition_write(fontPartition, written, buf, n) != ESP_OK){ error = "cannot write the font partition"; break; }
+    written += n;
+    int percent = (int)((uint64_t)written * 100 / total);
+    if(percent != lastPercent){
+      lastPercent = percent;
+      drawUpdateProgress(percent);
+    }
+  }
+  http.end();
+  if(error.isEmpty() && written != total) error = "download incomplete";
+  return error;
+}
+
+// Fetches font.bin when it is missing or not this firmware's (called from loop())
+void runFontDownload(){
+  fontDownloadWanted = false;
+  String url = fontUrl();
+  DEBUG_I.printf("[Font] Downloading %s\n", url.c_str());
+  otaActive = true; // pauses the network task
+  drawMessageScreen("Font update", ST77XX_CYAN, "Downloading font.bin");
+  drawUpdateProgress(0);
+  String error = downloadFontBin(url);
+  otaActive = false;
+  openFont();   // whatever is in the partition now (on failure: the old font.bin, if it is still intact)
+  fontDownloadWanted = false;
+  if(error.isEmpty() && fontState != FontState::Ready) error = fontProblem;
+  if(error.length()){
+    DEBUG_W.printf("[Font] Download failed: %s\n", error.c_str());
+    if(fontState != FontState::Ready){ fontState = FontState::Failed; fontProblem = error; }
+    fontRetryAt = millis() + FONT_RETRY_INTERVAL;
+    fontDownloadWanted = true;
+  }
+  restoreDisplay();
 }
 
 // Runs a requested online update (called from loop())

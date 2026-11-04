@@ -12,4 +12,5 @@ public:
   size_t putString(const char* k, const char* v){ return putString(k, String(v)); }
   bool remove(const char* k){ if(!started || ro) return false; return g_nvs[ns].erase(k) > 0; }
   bool clear(){ if(!started || ro) return false; g_nvs[ns].clear(); return true; }
+  bool isKey(const char* k){ return started && g_nvs[ns].count(k) > 0; }
 };

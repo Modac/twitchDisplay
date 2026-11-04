@@ -13,7 +13,8 @@ extern bool g_quiet;
 inline unsigned long millis(){ return g_millis; }
 extern unsigned long g_usFrac; // microseconds below g_millis
 inline unsigned long micros(){ return g_millis*1000UL + g_usFrac; }
-inline void delay(unsigned long ms){ g_millis += ms; }
+extern void (*g_delayHook)();   // runs while loop() sleeps (the render task's work)
+inline void delay(unsigned long ms){ g_millis += ms; if(g_delayHook) g_delayHook(); }
 inline void delayMicroseconds(unsigned long us){ unsigned long t = g_usFrac + us; g_millis += t / 1000; g_usFrac = t % 1000; }
 extern int g_analogReads;
 inline int analogRead(int){ g_analogReads++; return 2000; }
@@ -97,13 +98,19 @@ extern int g_notifies; extern int g_tasksCreated;
 inline QueueHandle_t xQueueCreate(int, size_t sz){ return new FakeQueue{sz,{}}; }
 inline int xQueueSend(QueueHandle_t q, const void* item, unsigned long){ const uint8_t* b=(const uint8_t*)item; q->items.emplace_back(b,b+q->itemSize); return pdTRUE; }
 inline int xQueueReceive(QueueHandle_t q, void* item, unsigned long){ if(q->items.empty()) return pdFALSE; memcpy(item,q->items.front().data(),q->itemSize); q->items.pop_front(); return pdTRUE; }
-inline int xTaskCreate(void(*)(void*), const char*, int, void*, int, TaskHandle_t* h){ g_tasksCreated++; *h=(void*)1; return pdTRUE; }
+inline int xTaskCreate(void(*)(void*), const char*, int, void*, int, TaskHandle_t* h){ g_tasksCreated++; if(h) *h=(void*)1; return pdTRUE; }
 inline void xTaskNotifyGive(TaskHandle_t){ g_notifies++; }
 inline uint32_t ulTaskNotifyTake(int, unsigned long){ return 0; }
 inline void vTaskDelay(uint32_t ms){ g_millis += ms; }
+struct FakeMutex { int taken = 0; };
+typedef FakeMutex* SemaphoreHandle_t;
+inline SemaphoreHandle_t xSemaphoreCreateMutex(){ return new FakeMutex(); }
+inline int xSemaphoreTake(SemaphoreHandle_t m, unsigned long){ m->taken++; return pdTRUE; }
+inline int xSemaphoreGive(SemaphoreHandle_t m){ m->taken--; return pdTRUE; }
 
 extern int g_wdtFeeds;
 inline void enableLoopWDT(){} inline void feedLoopWDT(){ g_wdtFeeds++; }
 
 #define MALLOC_CAP_8BIT 4
-inline size_t heap_caps_get_largest_free_block(int){ return 61440; }
+extern size_t g_largestBlock;
+inline size_t heap_caps_get_largest_free_block(int){ return g_largestBlock; }
