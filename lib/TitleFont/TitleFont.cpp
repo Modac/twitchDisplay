@@ -92,6 +92,25 @@ bool TitleFont::render(uint32_t cp, float em, GlyphBitmap& out) const {
   return true;
 }
 
+bool TitleFont::renderFrom(const uint8_t* ttf, uint32_t cp, float em, GlyphBitmap& out, int& advance){
+  out = GlyphBitmap();
+  stbtt_fontinfo f;
+  if(!ttf || !stbtt_InitFont(&f, ttf, 0)) return false;
+  int gi = stbtt_FindGlyphIndex(&f, (int)cp);
+  if(!gi) return false;
+  float scale = stbtt_ScaleForMappingEmToPixels(&f, em);
+  int adv, lsb, x0, y0, x1, y1;
+  stbtt_GetGlyphHMetrics(&f, gi, &adv, &lsb);
+  advance = (int)lroundf(adv * scale);
+  stbtt_GetGlyphBitmapBox(&f, gi, scale, scale, &x0, &y0, &x1, &y1);
+  out.xoff = (int16_t)x0; out.yoff = (int16_t)y0;
+  if(x1 <= x0 || y1 <= y0) return true;
+  out.w = (int16_t)(x1 - x0); out.h = (int16_t)(y1 - y0);
+  out.alpha.assign((size_t)out.w * out.h, 0);
+  stbtt_MakeGlyphBitmap(&f, out.alpha.data(), out.w, out.h, out.w, scale, scale, gi);
+  return true;
+}
+
 static std::vector<uint32_t> decodeUtf8(const char* utf8){
   std::vector<uint32_t> out;
   if(!utf8) return out;

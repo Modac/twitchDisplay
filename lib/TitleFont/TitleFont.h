@@ -53,6 +53,10 @@ public:
   int advance(uint32_t cp, float em) const;         // pixels; a box (0.6 em) without glyph
   bool render(uint32_t cp, float em, GlyphBitmap& out) const;  // false: no glyph (draw a box)
 
+  // Renders cp from any TrueType font in memory (e.g. a downloaded CJK
+  // piece); advance in pixels. False if the font has no glyph for cp.
+  static bool renderFrom(const uint8_t* ttf, uint32_t cp, float em, GlyphBitmap& out, int& advance);
+
 private:
   void* textInfo;    // stbtt_fontinfo
   void* emojiInfo;
