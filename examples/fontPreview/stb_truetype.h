@@ -2775,7 +2775,10 @@ static void *stbtt__hheap_alloc(stbtt__hheap *hh, size_t size, void *userdata)
       return p;
    } else {
       if (hh->num_remaining_in_head_chunk == 0) {
-         int count = (size < 32 ? 2000 : size < 128 ? 800 : 100);
+         // twitchDisplay: 2000/800 active edges per chunk asked for one 56 KB
+         // block, more than the ESP32-C3's fragmented heap has; a glyph needs
+         // far fewer, and more chunks are added when needed
+         int count = (size < 32 ? 200 : size < 128 ? 100 : 50);
          stbtt__hheap_chunk *c = (stbtt__hheap_chunk *) STBTT_malloc(sizeof(stbtt__hheap_chunk) + size * count, userdata);
          if (c == NULL)
             return NULL;
