@@ -177,6 +177,12 @@ Glyph renderGlyph(const stbtt_fontinfo* f, uint32_t cp, float em, uint32_t* us =
   int gi = stbtt_FindGlyphIndex(f, cp);
   float s = stbtt_ScaleForMappingEmToPixels(f, em);
   if(gi == 0){ g.missing = true; g.advance = (int)(em * 0.6f); return g; }
+  // stb_truetype stops the firmware (assert) when it gets no memory: draw a box instead
+  if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 16384){
+    g.missing = true; g.advance = (int)(em * 0.6f);
+    stats.lastError = "low memory while rendering";
+    return g;
+  }
   int adv, lsb;
   stbtt_GetGlyphHMetrics(f, gi, &adv, &lsb);
   g.advance = (int)lroundf(adv * s);
@@ -252,7 +258,24 @@ void oldFontText(const char* text, int x){
 // ---------- downloads
 
 // Downloads url into data (at most maxLen bytes). Returns "" or an error.
-String download(const String& url, std::vector<uint8_t>& data, size_t maxLen, uint32_t* ms){
+// Download buffer (malloc/realloc, so that a buffer reserved for an unknown
+// length can be shrunk in place to what arrived)
+struct Buffer {
+  uint8_t* p = nullptr;
+  size_t n = 0;
+  Buffer() = default;
+  Buffer(const Buffer&) = delete;
+  Buffer& operator=(const Buffer&) = delete;
+  ~Buffer(){ clear(); }
+  void clear(){ free(p); p = nullptr; n = 0; }
+  bool reserve(size_t len){ clear(); p = (uint8_t*)malloc(len); n = p ? len : 0; return p != nullptr; }
+  void shrink(size_t len){ uint8_t* q = (uint8_t*)realloc(p, len); if(q) p = q; n = len; }
+  uint8_t* data(){ return p; }
+  size_t size() const { return n; }
+  bool empty() const { return n == 0; }
+};
+
+String download(const String& url, Buffer& data, size_t maxLen, uint32_t* ms){
   data.clear();
   if(!wifiOk) return "no WiFi";
   unsigned long t0 = millis();
@@ -277,7 +300,7 @@ String download(const String& url, std::vector<uint8_t>& data, size_t maxLen, ui
     http.end();
     return "no RAM for " + String((size > 0 ? size : (int)maxLen) / 1024) + " KB";
   }
-  data.resize(room);
+  if(!data.reserve(room)){ http.end(); return "no RAM for " + String(room / 1024) + " KB"; }
   size_t got = 0;
   auto* stream = http.getStreamPtr();
   unsigned long last = millis();
@@ -297,7 +320,7 @@ String download(const String& url, std::vector<uint8_t>& data, size_t maxLen, ui
   if(ms) *ms = millis() - t0;
   if(more){ data.clear(); return "larger than " + String(room / 1024) + " KB"; }
   if((size > 0 && got != (size_t)size) || got == 0){ data.clear(); return "incomplete"; }
-  data.resize(got);
+  data.shrink(got);   // give the unused end back
   return "";
 }
 
@@ -446,7 +469,7 @@ void pageEmoji(int first){
   static uint16_t logo[LOGO_SIZE * LOGO_SIZE], small[54 * 54];
   for(int k = 0; k < 5; k++){
     const Emoji& e = EMOJI[first + k];
-    std::vector<uint8_t> png;
+    Buffer png;
     uint32_t ms = 0;
     String err = download(String(CDN "/gh/jdecked/twemoji@latest/assets/72x72/") + e.file + ".png", png, 16384, &ms);
     const char* perr = err.length() ? nullptr : pngToLogo(png.data(), png.size(), logo);
@@ -478,7 +501,7 @@ void pageCjk(){
   tft.fillScreen(ST77XX_BLACK);
   for(int line = 0; line < 3; line++){
     row.fillScreen(ST77XX_BLACK);
-    std::vector<uint8_t> piece;
+    Buffer piece;
     String loaded;
     stbtt_fontinfo info;
     int x = 0;
@@ -487,7 +510,7 @@ void pageCjk(){
       if(!c.text) break;
       String url = String(CDN "/fontsource/fonts/") + c.font + "@latest/" + c.piece + "-600-normal.ttf";
       if(url != loaded){
-        piece.clear(); piece.shrink_to_fit();
+        piece.clear();
         uint32_t ms = 0;
         String err = download(url, piece, 200000, &ms);
         loaded = url;
