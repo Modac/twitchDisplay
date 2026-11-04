@@ -92,7 +92,7 @@ bool TitleFont::render(uint32_t cp, float em, GlyphBitmap& out) const {
   return true;
 }
 
-std::vector<uint32_t> titleCodepoints(const char* utf8){
+static std::vector<uint32_t> decodeUtf8(const char* utf8){
   std::vector<uint32_t> out;
   if(!utf8) return out;
   const uint8_t* p = (const uint8_t*)utf8;
@@ -109,11 +109,87 @@ std::vector<uint32_t> titleCodepoints(const char* utf8){
     if(k < len){ p++; continue; }
     p += len;
     if(cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) cp = ' ';
-    if(cp == 0xFE0E || cp == 0xFE0F || cp == 0x200D || cp == 0x20E3) continue;   // variation selectors, joiner, keycap
-    if(cp >= 0x1F3FB && cp <= 0x1F3FF) continue;                                // skin tones
-    if(cp >= 0xE0020 && cp <= 0xE007F) continue;                                // tags (subdivision flags)
-    if(cp >= 0x1F1E6 && cp <= 0x1F1FF) continue;                                // regional indicators (flags)
     out.push_back(cp);
   }
+  return out;
+}
+
+static bool isRegional(uint32_t c){ return c >= 0x1F1E6 && c <= 0x1F1FF; }
+static bool isModifier(uint32_t c){ return c >= 0x1F3FB && c <= 0x1F3FF; }
+static bool isTag(uint32_t c){ return c >= 0xE0020 && c <= 0xE007F; }
+static bool isKeycapBase(uint32_t c){ return (c >= '0' && c <= '9') || c == '#' || c == '*'; }
+
+// Emoji by default (no variation selector needed)
+static bool isEmojiDefault(uint32_t c){
+  return (c >= 0x1F000 && c <= 0x1FAFF && !isRegional(c) && !isModifier(c))
+      || (c >= 0x2300 && c <= 0x23FF) || (c >= 0x2600 && c <= 0x27BF) || (c >= 0x2B00 && c <= 0x2BFF)
+      || (c >= 0x25AA && c <= 0x25FE) || c == 0x24C2 || c == 0x3030 || c == 0x303D || c == 0x3297 || c == 0x3299;
+}
+// Text by default, emoji only with U+FE0F
+static bool isEmojiWithSelector(uint32_t c){
+  return c == 0xA9 || c == 0xAE || c == 0x203C || c == 0x2049 || c == 0x2122 || c == 0x2139
+      || (c >= 0x2190 && c <= 0x21FF) || c == 0x2934 || c == 0x2935;
+}
+
+static std::string twemojiName(const std::vector<uint32_t>& seq){
+  bool zwj = false;
+  for(uint32_t c : seq) if(c == 0x200D) zwj = true;
+  std::string name;
+  char hex[12];
+  for(uint32_t c : seq){
+    if(c == 0xFE0F && !zwj) continue;   // Twemoji's file names keep U+FE0F only in joiner sequences
+    snprintf(hex, sizeof(hex), "%s%x", name.empty() ? "" : "-", (unsigned)c);
+    name += hex;
+  }
+  return name;
+}
+
+std::vector<TitleChar> titleChars(const char* utf8){
+  std::vector<uint32_t> in = decodeUtf8(utf8);
+  std::vector<TitleChar> out;
+  size_t n = in.size();
+  auto at = [&](size_t i){ return i < n ? in[i] : 0; };
+  for(size_t i = 0; i < n; i++){
+    uint32_t c = in[i];
+    TitleChar tc;
+    std::vector<uint32_t> seq;
+    if(isRegional(c) && isRegional(at(i + 1))){                 // flag
+      seq = {c, in[i + 1]}; i++;
+      tc.cp = 0;
+    } else if(isKeycapBase(c) && (at(i + 1) == 0x20E3 || (at(i + 1) == 0xFE0F && at(i + 2) == 0x20E3))){
+      seq.push_back(c);
+      if(at(i + 1) == 0xFE0F){ seq.push_back(0xFE0F); i++; }
+      seq.push_back(0x20E3); i++;
+      tc.cp = c;
+    } else if((isEmojiDefault(c) && at(i + 1) != 0xFE0E) || (isEmojiWithSelector(c) && at(i + 1) == 0xFE0F)){
+      tc.cp = c;
+      seq.push_back(c);
+      for(;;){
+        if(at(i + 1) == 0xFE0F){ seq.push_back(0xFE0F); i++; }
+        if(isModifier(at(i + 1))){ seq.push_back(in[i + 1]); i++; }
+        while(isTag(at(i + 1))){ seq.push_back(in[i + 1]); i++; }
+        uint32_t next = at(i + 2);
+        if(at(i + 1) == 0x200D && (isEmojiDefault(next) || isEmojiWithSelector(next))){
+          seq.push_back(0x200D); seq.push_back(next); i += 2;
+          continue;
+        }
+        break;
+      }
+    } else {
+      // stray selectors, joiners, keycap marks, modifiers, tags and single regional indicators
+      if(c == 0xFE0E || c == 0xFE0F || c == 0x200D || c == 0x20E3 || isModifier(c) || isTag(c) || isRegional(c)) continue;
+      tc.cp = c;
+      out.push_back(tc);
+      continue;
+    }
+    tc.emoji = twemojiName(seq);
+    out.push_back(tc);
+  }
+  return out;
+}
+
+std::vector<uint32_t> titleCodepoints(const char* utf8){
+  std::vector<uint32_t> out;
+  for(const TitleChar& c : titleChars(utf8)) if(c.cp) out.push_back(c.cp);
   return out;
 }

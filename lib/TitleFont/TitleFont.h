@@ -60,8 +60,21 @@ private:
   bool isReady = false;
 };
 
-// UTF-8 text -> code points for the title. Control characters become spaces;
-// variation selectors, zero width joiners, skin tone modifiers, tag
-// characters, keycap marks and regional indicators (flags) are dropped, so an
-// emoji sequence shows as its single emoji. Invalid bytes are skipped.
+// A character of a title: a code point, or an emoji (sequence) with the file
+// name of its Twemoji image ("1f468-200d-1f4bb") and, for the monochrome
+// fallback, its first code point (0 for flags: nothing to draw without colour).
+struct TitleChar {
+  uint32_t cp = 0;
+  std::string emoji;    // empty: not an emoji
+};
+
+// UTF-8 text -> title characters. Control characters become spaces; emoji
+// sequences (flags, keycaps, skin tones, zero width joiner sequences, tag
+// sequences) are kept together; stray variation selectors, joiners,
+// modifiers, tags and regional indicators are dropped. Invalid bytes are
+// skipped.
+std::vector<TitleChar> titleChars(const char* utf8);
+
+// The code points to draw without colour emoji: titleChars() with each emoji
+// as its first code point (flags left out)
 std::vector<uint32_t> titleCodepoints(const char* utf8);
