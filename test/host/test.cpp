@@ -767,32 +767,32 @@ int main(){
   { CHECK(g_panelFrameRate == PANEL_FRAME_RATE);                        // panel refresh set at boot
     reset(); setResponse({{0,"A long title to scroll over the display"}}); loopWithUpdate();
     CHECK(isTitleDisplaying && titleFrames == 1);
-    CHECK(FRAME_INTERVAL_US == 10251);                                     // 97.6 Hz panel refresh (data sheet formula)
-    // one second: ~97.6 frames of 3 px each
+    CHECK(FRAME_INTERVAL_US == 19057);                                     // 52.5 Hz panel refresh (data sheet formula)
+    // one second: ~52.5 frames of 6 px each
     std::vector<uint32_t> steps; uint32_t lastPixels = titlePixels, framesBefore = titleFrames;
     unsigned long t0 = g_millis;
     while(g_millis - t0 < 1000){ loopNoUpdate(1); if(titleFrames != framesBefore + steps.size()){ steps.push_back(titlePixels - lastPixels); lastPixels = titlePixels; } }
-    CHECK(steps.size() >= 96 && steps.size() <= 99);
-    bool even = true; for(auto st : steps) if(st != 3) even = false;
-    CHECK(even);                                                           // 3 px per frame, no 6 px jumps
-    CHECK(titlePixels >= 289 && titlePixels <= 296);                       // 3 px per panel refresh = 293 px/s
+    CHECK(steps.size() >= 51 && steps.size() <= 54);
+    bool even = true; for(auto st : steps) if(st != 6) even = false;
+    CHECK(even);                                                           // 6 px per frame, no 12 px jumps
+    CHECK(titlePixels >= 309 && titlePixels <= 320);                       // 6 px per panel refresh = 315 px/s
     printf("    a late frame catches up, the speed stays the same\n");
     uint32_t p0 = titlePixels; unsigned long tStall = g_millis;
     g_millis += 47;                                                        // e.g. a slow web request
     loopNoUpdate(1);
-    CHECK(titlePixels - p0 >= 15 && titlePixels - p0 <= 18);              // (~10 ms frame + 47 ms stall) * 293 px/s
+    CHECK(titlePixels - p0 >= 14 && titlePixels - p0 <= 21);              // (0..19 ms since the last frame + 47 ms stall) * 315 px/s
     t0 = g_millis; p0 = titlePixels;
     while(g_millis - t0 < 500) loopNoUpdate(1);
-    CHECK(titlePixels - p0 >= 143 && titlePixels - p0 <= 150);
+    CHECK(titlePixels - p0 >= 152 && titlePixels - p0 <= 162);
     (void)tStall;
     printf("    the title takes as long as the speed says\n");
     reset(); setResponse({{0,"Exactly twenty chars"}}); loopWithUpdate();
     t0 = g_millis; runUntilTitleDone();
     unsigned long expectMs = (unsigned long)((uint64_t)(channels[0].streamTitle.length() - 5) * CHAR_WIDTH * MAX_TITLE_REPEAT * FRAME_INTERVAL_US / SCROLL_STEP / 1000);
     CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
-    CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
+    CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 21000);
     server.find("/", HTTP_GET)->fn();
-    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 10.3 ms, SPI clock 80 MHz") && contains(g_lastBody, ", transfer "));
+    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 19.1 ms, SPI clock 80 MHz") && contains(g_lastBody, ", transfer "));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");
