@@ -38,6 +38,7 @@ std::map<std::string,std::string> g_args, g_respHeaders; std::map<std::string, s
 std::string g_serialOut;
 esp_partition_t g_spiffs{"spiffs", 0x20000}; std::vector<uint8_t> g_flashData(0x20000, 0xFF); int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
 std::vector<TextBox> g_textBoxes;
+int g_spiFastPieces = 0;
 int g_panelFrameRate = -1; uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
 int g_dnsStarted = 0; bool g_bootPressed = false; std::vector<std::string> g_scan; std::string g_beginSsid, g_beginPw, g_apSsid, g_apPw; int g_apStations = 0;
 bool contains(const std::string& h, const std::string& n){ return h.find(n) != std::string::npos; }
@@ -113,6 +114,8 @@ bool titleInRow(int row){ return g_fb[rowY(row)+32][GRID_X0+150]==0x1234; }
 
 uint16_t statusDot(){ return g_fb[STATUS_Y+2][STATUS_X+2]; }
 std::string helix(std::string body){ return body; }
+
+void spiFastPixels(const uint16_t* p, uint32_t n){ tft.writePixels((uint16_t*)p, n); }
 
 int main(){
 #ifdef VARIANT_NOSECRETS
@@ -726,19 +729,29 @@ int main(){
     std::vector<uint16_t> bm(346 * 64);
     for(size_t i = 0; i < bm.size(); i++) bm[i] = (uint16_t)(i * 7 + 1);
     for(int rowTop : {14, 92}){
-      g_writeOrder.clear(); g_recordWrites = true;
+      g_writeOrder.clear(); g_recordWrites = true; g_spiFastPieces = 0;
       tft.drawColumnwise(GRID_X0, rowTop, bm.data(), 6, TITLE_WIDTH, 64, 346);
       g_recordWrites = false;
       bool same = true;
       for(int j = 0; j < 64; j++) for(int i = 0; i < TITLE_WIDTH; i++) if(g_fb[rowTop + j][GRID_X0 + i] != bm[j * 346 + 6 + i]) same = false;
       CHECK(same);                                                          // right place, not mirrored or shifted
       CHECK(g_writeOrder.size() == (size_t)TITLE_WIDTH * 64);
+      CHECK(g_spiFastPieces == (TITLE_WIDTH * 64 + 31) / 32);              // whole title in 32 pixel pieces
       bool columnwise = true;                                               // top to bottom, then the next column to the left
       for(size_t k = 0; k < g_writeOrder.size(); k++)
         if(g_writeOrder[k] != std::make_pair(GRID_X0 + TITLE_WIDTH - 1 - (int)(k / 64), rowTop + (int)(k % 64))) { columnwise = false; break; }
       CHECK(columnwise);
       CHECK(319 - g_writeOrder.front().first < 319 - g_writeOrder.back().first);  // ascending memory rows = panel refresh direction (ML = 0)
       CHECK(g_madctl == (ST77XX_MADCTL_MY | ST77XX_MADCTL_MV));            // back to rotation 1
+    }
+    { // odd sizes: a piece spans columns, the last piece is short
+      std::vector<uint16_t> small(9 * 7);
+      for(size_t i = 0; i < small.size(); i++) small[i] = (uint16_t)(0x1234 + i * 13);
+      g_spiFastPieces = 0;
+      tft.drawColumnwise(40, 30, small.data(), 2, 5, 7, 9);
+      bool same = true;
+      for(int j = 0; j < 7; j++) for(int i = 0; i < 5; i++) if(g_fb[30 + j][40 + i] != small[j * 9 + 2 + i]) same = false;
+      CHECK(same && g_spiFastPieces == 2 && g_fb[30][45] != small[7]);
     }
 
     // the scrolling title in loop() uses it, and the tiles are still drawn correctly afterwards
@@ -779,7 +792,7 @@ int main(){
     CHECK(!isTitleDisplaying && g_millis - t0 >= expectMs - 20 && g_millis - t0 <= expectMs + 30);
     CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
     server.find("/", HTTP_GET)->fn();
-    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 10.3 ms"));
+    CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 10.3 ms, SPI clock 80 MHz") && contains(g_lastBody, ", transfer "));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");

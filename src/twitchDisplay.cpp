@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <esp_rom_crc.h>
+#include <spi_fast.h>
 
 #include <deque>
 #include <string>
@@ -226,7 +227,6 @@ public:
   // Draws a w x h section of bitmap (row-major, bitmapWidth wide, starting at
   // column offsetX) at (x, y)
   void drawColumnwise(int16_t x, int16_t y, const uint16_t* bitmap, int16_t offsetX, int16_t w, int16_t h, int16_t bitmapWidth){
-    static uint16_t column[PIC_SIZE];
     startWrite();
     if(!TITLE_COLUMNWISE || rotation != 1 || h > PIC_SIZE){
       // row by row (the display's normal order)
@@ -242,10 +242,21 @@ public:
     writeCommand(ST77XX_RASET);
     SPI_WRITE32(((uint32_t)(319 - (x + _xstart + w - 1)) << 16) | (uint32_t)(319 - (x + _xstart)));
     writeCommand(ST77XX_RAMWR);
-    for(int16_t i = w - 1; i >= 0; i--){
-      for(int16_t j = 0; j < h; j++) column[j] = bitmap[j * bitmapWidth + offsetX + i];
-      writePixels(column, h);
+    // all columns as one stream in pieces of 32 pixels (the SPI's 64 byte
+    // buffer); the next piece is gathered while the previous one is sent
+    uint32_t piece[16];
+    uint32_t left = (uint32_t)w * h, n = 0;
+    int16_t i = w - 1, j = 0;
+    const uint16_t* col = bitmap + offsetX + i;
+    while(left){
+      uint16_t p = col[j * bitmapWidth];
+      p = (uint16_t)(p >> 8 | p << 8);                // high byte first on the wire
+      if(n & 1) piece[n >> 1] |= (uint32_t)p << 16; else piece[n >> 1] = p;
+      n++; left--;
+      if(++j == h){ j = 0; col--; }
+      if(n == 32 || !left){ spiFastSend(piece, n * 2); n = 0; }
     }
+    spiFastWait();
     // back to the landscape order of rotation 1
     writeCommand(ST77XX_MADCTL);
     spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB);
@@ -429,7 +440,8 @@ unsigned long lastFetchMillis = 0; // 0 = no update yet
 
 GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 // one character (6*8 px at text size 8) wider than the visible title so it can scroll smoothly
-GFXcanvas16 text_canvas(TITLE_WIDTH+(6*8), PIC_SIZE);
+#define TITLE_CANVAS_CHARS ((TITLE_WIDTH + CHAR_WIDTH + CHAR_WIDTH - 1) / CHAR_WIDTH)  // characters that fit on the canvas
+GFXcanvas16 text_canvas(TITLE_WIDTH+CHAR_WIDTH, PIC_SIZE);
 
 void setup(void) {
 
@@ -561,7 +573,7 @@ bool titleCanvasValid = false;       // text_canvas shows the text from textOffs
 // statistics of the current / last title for the status page
 uint32_t titleFrames = 0;
 unsigned long titleLastFrameUs = 0, titleMaxGapUs = 0;
-uint64_t titleDrawUsSum = 0; unsigned long titleDrawUsMax = 0;  // time per frame for rendering + transfer
+uint64_t titleDrawUsSum = 0, titleXferUsSum = 0; unsigned long titleDrawUsMax = 0;  // time per frame for rendering + transfer, transfer alone
 
 // Green frame around the pic of the channel whose title is scrolling
 void drawTitleIndicator(){
@@ -583,6 +595,7 @@ void startTitle(channelInfo* channel){
   titleFrames = 0;
   titleMaxGapUs = 0;
   titleDrawUsSum = 0;
+  titleXferUsSum = 0;
   titleDrawUsMax = 0;
   isTitleDisplaying = true;
   drawTitleIndicator();
@@ -617,15 +630,21 @@ void drawTitleFrame(){
   if((long)(now - nextFrameUs) > FRAME_INTERVAL_US) nextFrameUs = now + FRAME_INTERVAL_US;
   if(!first && step == 0 && titleCanvasValid) return; // nothing moved
   if(!titleCanvasValid){
+    // only the characters that fit on the canvas (one byte each, CP437)
+    char visible[TITLE_CANVAS_CHARS + 1];
+    strncpy(visible, &channelTitleInfo.displayTitle[channelTitleInfo.textOffset], TITLE_CANVAS_CHARS);
+    visible[TITLE_CANVAS_CHARS] = 0;
     text_canvas.fillScreen(ST77XX_BLACK);
     text_canvas.setCursor(0,0);
-    text_canvas.print(&channelTitleInfo.displayTitle[channelTitleInfo.textOffset]);
+    text_canvas.print(visible);
     titleCanvasValid = true;
   }
+  unsigned long xferStart = micros();
   // the title scrolls over the row that does not contain the channel's pic
   tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
   unsigned long drawUs = micros() - now;
   titleDrawUsSum += drawUs;
+  titleXferUsSum += micros() - xferStart;
   if(drawUs > titleDrawUsMax) titleDrawUsMax = drawUs;
   if(!first && now - titleLastFrameUs > titleMaxGapUs) titleMaxGapUs = now - titleLastFrameUs;
   titleLastFrameUs = now;
@@ -1849,9 +1868,10 @@ void handleStatus(){
     char fps[16];
     snprintf(fps, sizeof(fps), "%.1f", span ? (titleFrames - 1) * 1e6 / span : 0.0);
     b += String(fps) + " fps, longest frame gap " + String((unsigned)(titleMaxGapUs / 1000)) + " ms";
-    char draw[96];
-    snprintf(draw, sizeof(draw), "<br>drawing a frame takes %.1f ms (max %.1f ms), panel refresh %.1f ms",
-             titleDrawUsSum / 1000.0 / titleFrames, titleDrawUsMax / 1000.0, FRAME_INTERVAL_US / 1000.0);
+    char draw[192];
+    snprintf(draw, sizeof(draw), "<br>drawing a frame takes %.1f ms (max %.1f ms, transfer %.1f ms), panel refresh %.1f ms, SPI clock %lu MHz",
+             titleDrawUsSum / 1000.0 / titleFrames, titleDrawUsMax / 1000.0, titleXferUsSum / 1000.0 / titleFrames,
+             FRAME_INTERVAL_US / 1000.0, (unsigned long)(spiFastClockHz() / 1000000));
     b += draw;
   }
   b += "</td></tr>";
