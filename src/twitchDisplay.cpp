@@ -2767,7 +2767,7 @@ void handleStatus(){
   b += "<tr><td>Built</td><td>" __DATE__ " " __TIME__ "</td></tr>";
   b += String("<tr><td>Partition</td><td>") + (running ? running->label : "?") + ", " + otaStateName() + "</td></tr>";
   if(running){
-    uint32_t app = ESP.getSketchSize();
+    static uint32_t app = ESP.getSketchSize();   // verifies the whole image (SHA-256 of ~1.4 MB): once
     b += "<tr><td>Firmware size</td><td>" + String((unsigned)(app / 1024)) + " KB of " + String((unsigned)(running->size / 1024)) + " KB ("
          + String((unsigned)((uint64_t)app * 100 / running->size)) + " %)</td></tr>";
   }
