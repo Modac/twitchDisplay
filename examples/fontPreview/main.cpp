@@ -267,26 +267,37 @@ String download(const String& url, std::vector<uint8_t>& data, size_t maxLen, ui
     http.end();
     return e;
   }
+  // the CDN does not always send a length: then read until it closes the
+  // connection (HTTP/1.0), into a buffer as large as the limit or free RAM allow
   int size = http.getSize();
-  if(size <= 0 || size > (int)maxLen){ http.end(); return "size " + String(size); }
-  if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < (size_t)size + 4096){
+  if(size > (int)maxLen){ http.end(); return "too large: " + String(size / 1024) + " KB"; }
+  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  size_t room = size > 0 ? (size_t)size : std::min(maxLen, largest > 16384 ? largest - 16384 : 0);
+  if(largest < room + 4096 || room == 0){
     http.end();
-    return "no RAM for " + String(size / 1024) + " KB";
+    return "no RAM for " + String((size > 0 ? size : (int)maxLen) / 1024) + " KB";
   }
-  data.resize(size);
+  data.resize(room);
   size_t got = 0;
   auto* stream = http.getStreamPtr();
   unsigned long last = millis();
-  while(got < (size_t)size && millis() - last < 10000){
+  while(got < room && millis() - last < 10000){
     size_t n = stream->available();
-    if(!n){ delay(1); continue; }
-    got += stream->readBytes(data.data() + got, std::min(n, (size_t)size - got));
+    if(!n){
+      if(size <= 0 && !http.connected()) break;   // no length: the end is when the server closes
+      delay(1);
+      continue;
+    }
+    got += stream->readBytes(data.data() + got, std::min(n, room - got));
     last = millis();
   }
+  bool more = size <= 0 && got == room && (stream->available() || http.connected());
   http.end();
   tls.stop();
   if(ms) *ms = millis() - t0;
-  if(got != (size_t)size){ data.clear(); return "incomplete"; }
+  if(more){ data.clear(); return "larger than " + String(room / 1024) + " KB"; }
+  if((size > 0 && got != (size_t)size) || got == 0){ data.clear(); return "incomplete"; }
+  data.resize(got);
   return "";
 }
 
