@@ -2,8 +2,9 @@
 """Builds fonts/font.bin, the font data of the display's "font" partition.
 
 Contents (see lib/TitleFont/TitleFont.h for the layout):
-  1  Noto Sans SemiBold: Latin-1, Latin Extended-A/B, Greek, Cyrillic,
-     general punctuation, euro and trademark signs
+  1  Noto Sans SemiBold: Latin-1, Latin Extended-A/B, Latin Extended
+     Additional (Vietnamese), combining diacritics, Greek, Cyrillic, general
+     punctuation, euro, dong and trademark signs
   2  Noto Emoji SemiBold (monochrome): the emoji listed in
      tools/emoji_common.txt (the most used ones, about 200 KB)
 
@@ -40,7 +41,8 @@ def r(a, b):
 
 
 TEXT_CHARS = (r(0x20, 0x7E) + r(0xA0, 0xFF) + r(0x100, 0x24F) + r(0x370, 0x3FF) + r(0x400, 0x4FF)
-              + r(0x2010, 0x2027) + r(0x2030, 0x203A) + [0x20AC, 0x2122])
+              + r(0x2010, 0x2027) + r(0x2030, 0x203A) + [0x20AC, 0x2122]
+              + r(0x1E00, 0x1EFF) + r(0x300, 0x36F) + [0x20AB])   # Vietnamese (and other Latin) letters, diacritics, dong
 
 
 def subset_font(font, unicodes):
@@ -61,7 +63,7 @@ def subset_font(font, unicodes):
 def text_font():
     with tempfile.TemporaryDirectory() as tmp:
         paths = []
-        for piece in ("latin", "latin-ext", "greek", "cyrillic"):
+        for piece in ("latin", "latin-ext", "greek", "cyrillic", "vietnamese"):
             path = os.path.join(tmp, piece + ".ttf")
             with open(path, "wb") as f:
                 f.write(fetch(f"noto-sans@latest/{piece}-600-normal.ttf").getvalue())

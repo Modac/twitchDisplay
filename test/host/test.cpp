@@ -516,6 +516,8 @@ int main(){
     CHECK(parseFontBin(g_fontBin.data(), g_fontBin.size() - 1, bin) != nullptr);              // cut off
     CHECK(titleFont.sourceFor('A') == TitleFont::TEXT && titleFont.sourceFor(0x416) == TitleFont::TEXT   // Latin, Cyrillic
           && titleFont.sourceFor(0x1F525) == TitleFont::EMOJI && titleFont.sourceFor(0x65E5) == TitleFont::NONE);   // emoji, CJK (not yet)
+    CHECK(titleFont.sourceFor(0x1EA1) == TitleFont::TEXT && titleFont.sourceFor(0x1EC7) == TitleFont::TEXT && titleFont.sourceFor(0x20AB) == TitleFont::TEXT
+          && titleFont.sourceFor(0x0301) == TitleFont::TEXT);                     // Vietnamese: ạ ệ ₫, combining acute
     GlyphBitmap g;
     CHECK(titleFont.render('W', TITLE_EM, g) && g.w > 30 && g.h > 30 && g.yoff < -30);
     CHECK(titleFont.render(0xC4, TITLE_EM, g) && TITLE_BASELINE + g.yoff >= 0);                // "Ä" fits the row
@@ -620,7 +622,7 @@ int main(){
     CHECK(names("\xf0\x9f\x91\xa9\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\x91\xa8") == std::vector<std::string>({"1f469-200d-2764-fe0f-200d-1f468"}));   // joiner sequence keeps VS16
     CHECK(names("\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xa5\xf3\xa0\x81\xae\xf3\xa0\x81\xa7\xf3\xa0\x81\xbf") == std::vector<std::string>({"1f3f4-e0067-e0062-e0065-e006e-e0067-e007f"}));   // England
     emojiMissing.clear(); emojiError = "";                                    // earlier tests' titles had emoji too (with no images to get)
-    CHECK(emojiCacheReady && cacheIndex.empty() && cacheBytes == 62 * 4096);
+    CHECK(emojiCacheReady && cacheIndex.empty() && cacheBytes == (0x80000 - (g_fontBin.size() + 4095) / 4096 * 4096));
     std::string fire = avatar("bonjwa"), flag = avatar("gronkh"), heart = avatar("x");
     auto twitchAnswer = [](){ g_responses.push_back({200, g_response}); };
     reset(); g_requests.clear();
@@ -688,7 +690,7 @@ int main(){
     { std::vector<std::string> u; for(auto& r : g_requests) if(contains(r.url, "twemoji")) u.push_back(r.url);
       CHECK(u == std::vector<std::string>({TWEMOJI_URL "1f47e.png"})); }      // 🎮 not again, 👾 now
     CHECK(emojiCached(emojiKey("1f47e")) && titleText.cacheKey[4] == emojiKey("1f47e"));
-    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji, CJK</td><td>colour emoji (Twemoji, CC-BY 4.0), CJK downloaded<br>cache: 4 emoji, 0 CJK characters, ") && contains(g_lastBody, " of 248 KB"));
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji, CJK</td><td>colour emoji (Twemoji, CC-BY 4.0), CJK downloaded<br>cache: 4 emoji, 0 CJK characters, ") && contains(g_lastBody, " of " + std::to_string(cacheBytes / 1024) + " KB"));
     runUntilTitleDone();
 
     printf("    monochrome only: no downloads, flags left out\n");
