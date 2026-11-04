@@ -241,6 +241,7 @@ void setupWeb();
 void startSetupMode(const char* reason, bool retryLater);
 bool connectWiFi();
 void drawMessageScreen(const char* title, uint16_t color, const char* message);
+void assignLogoSlots();
 void networkTask(void*);
 
 struct channelInfo {
@@ -251,6 +252,7 @@ struct channelInfo {
   const uint16_t* pic;
   std::string name;         // display name (UTF-8) for the web interface
   std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
+  int8_t logoSlot = -1;     // slot of the downloaded logo in flash, -1 = none
 };
 
 // lidi, pietsmiet, bonjwa, bonjwachill, gronkh, dhalucard, trilluxe, dracon, maxim, finanzfluss
@@ -362,6 +364,7 @@ void setup(void) {
 
   loadConfig();
   twitchToken = config.token;
+  assignLogoSlots();
 
   if(setupRequested == SETUP_REQUEST_MAGIC){
     setupRequested = 0;
@@ -801,15 +804,112 @@ void networkTask(void*){
 // ---------- Drawing and channel state (loop() only)
 
 
+// ---------- Logo storage
+// Logos are kept ready to draw (64x64 RGB565 = 8 KB, two flash sectors) in
+// fixed slots of the otherwise unused "spiffs" partition (128 KB = 16 slots).
+// An index in NVS says which channel and which avatar URL each slot holds; a
+// slot is only listed there after it has been written completely.
+#define LOGO_SLOTS      16
+#define LOGO_SLOT_BYTES (LOGO_SIZE*LOGO_SIZE*2)
+#define LOGO_NAMESPACE  "logos"
+
+struct LogoSlot {
+  std::string channelId; // empty: free
+  uint32_t urlHash = 0;  // CRC32 of the avatar URL the logo was made from
+};
+
+const esp_partition_t* logoPartition(){
+  static const esp_partition_t* partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+  return (partition && partition->size >= LOGO_SLOTS * LOGO_SLOT_BYTES) ? partition : nullptr;
+}
+
+bool readLogo(int slot, uint16_t* pixels){
+  const esp_partition_t* p = logoPartition();
+  return p && slot >= 0 && slot < LOGO_SLOTS
+      && esp_partition_read(p, slot * LOGO_SLOT_BYTES, pixels, LOGO_SLOT_BYTES) == ESP_OK;
+}
+
+bool writeLogo(int slot, const uint16_t* pixels){
+  const esp_partition_t* p = logoPartition();
+  return p && slot >= 0 && slot < LOGO_SLOTS
+      && esp_partition_erase_range(p, slot * LOGO_SLOT_BYTES, LOGO_SLOT_BYTES) == ESP_OK
+      && esp_partition_write(p, slot * LOGO_SLOT_BYTES, pixels, LOGO_SLOT_BYTES) == ESP_OK;
+}
+
+String logoIndexKey(int slot){
+  return "s" + String(slot);
+}
+
+void loadLogoIndex(std::array<LogoSlot, LOGO_SLOTS>& index){
+  Preferences prefs;
+  prefs.begin(LOGO_NAMESPACE, true);
+  for(int i = 0; i < LOGO_SLOTS; i++){
+    String v = prefs.getString(logoIndexKey(i).c_str(), "");   // "<channel id>:<url hash>"
+    int colon = v.indexOf(':');
+    index[i] = LogoSlot();
+    if(colon > 0){
+      index[i].channelId = v.substring(0, colon).c_str();
+      index[i].urlHash = strtoul(v.substring(colon + 1).c_str(), nullptr, 16);
+    }
+  }
+  prefs.end();
+}
+
+void saveLogoIndexEntry(int slot, const LogoSlot& entry){
+  Preferences prefs;
+  prefs.begin(LOGO_NAMESPACE, false);
+  if(entry.channelId.empty()) prefs.remove(logoIndexKey(slot).c_str());
+  else {
+    char hash[9];
+    snprintf(hash, sizeof(hash), "%08lx", (unsigned long)entry.urlHash);
+    prefs.putString(logoIndexKey(slot).c_str(), String(entry.channelId.c_str()) + ":" + hash);
+  }
+  prefs.end();
+}
+
+// Gives every channel its stored logo, if there is one (at boot, before the network task runs)
+void assignLogoSlots(){
+  std::array<LogoSlot, LOGO_SLOTS> index;
+  loadLogoIndex(index);
+  for(channelInfo& ch : channels){
+    ch.logoSlot = -1;
+    for(int i = 0; i < LOGO_SLOTS; i++) if(!ch.id.empty() && index[i].channelId == ch.id) ch.logoSlot = i;
+  }
+}
+
+// Placeholder while a channel has no logo: coloured tile with its initials
+void drawPlaceholder(const channelInfo& channel){
+  static const uint16_t colors[] = {0x8000, 0x0410, 0x6010, 0x8400, 0x0013, 0x0400, 0x8200, 0x4208};
+  const std::string& key = channel.name.empty() ? channel.id : channel.name;
+  uint32_t hash = 0;
+  for(char c : key) hash = hash * 31 + (uint8_t)c;
+  std::string label;
+  for(char c : channel.name){
+    if(isalnum((unsigned char)c)) label += (char)toupper((unsigned char)c);
+    if(label.size() == 2) break;
+  }
+  if(label.empty()) label = "?";
+  pic_canvas.fillScreen(colors[hash % (sizeof(colors) / sizeof(colors[0]))]);
+  pic_canvas.setTextSize(3);
+  pic_canvas.setTextColor(ST77XX_WHITE);
+  pic_canvas.setCursor((PIC_SIZE - (int)label.size() * 18 + 3) / 2, (PIC_SIZE - 21) / 2);
+  pic_canvas.print(label.c_str());
+}
+
 void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
   if(pic_slot_index<MAX_NUM_PICS){
     DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
-    pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
+    // downloaded logo, else built-in picture, else placeholder
+    if(!(channel.logoSlot >= 0 && readLogo(channel.logoSlot, pic_canvas.getBuffer()))){
+      if(channel.pic) pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
+      else drawPlaceholder(channel);
+    }
   } else {
     // more live channels than slots: the last slot shows how many are hidden
     pic_canvas.fillScreen(ST77XX_BLACK);
     pic_canvas.setCursor(4, 14);
+    pic_canvas.setTextColor(ST77XX_WHITE);
     pic_canvas.setTextSize(5);
     pic_canvas.printf("+%d", pic_slot_index-(MAX_NUM_PICS-2));
   }
