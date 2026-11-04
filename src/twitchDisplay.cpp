@@ -28,6 +28,8 @@
 #include <TitleFont.h>
 
 #include <deque>
+#include <set>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -295,6 +297,7 @@ struct Config {
   String channelList;  // comma separated logins (or numeric ids), empty = default channels
   uint16_t titleRepeatMinutes;  // show a live channel's title again after this many minutes without a title, 0 = off
   bool requireLogin;   // web interface needs the password (off: anyone on the network may use it)
+  bool colourEmoji;    // emoji in titles: colour images downloaded from Twemoji (false: monochrome only)
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -315,6 +318,7 @@ void loadConfig(){
   config.channelList  = prefs.getString("channels", "");
   config.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
   config.requireLogin = prefs.getString("login", "1") != "0";
+  config.colourEmoji = prefs.getString("emoji", "colour") != "mono";
   prefs.end();
 }
 
@@ -344,6 +348,8 @@ bool connectWiFi();
 void drawMessageScreen(const char* title, uint16_t color, const char* message);
 void openFont();
 extern SemaphoreHandle_t titleLock;
+extern SemaphoreHandle_t emojiLock;
+String downloadToMemory(const std::string& url, std::vector<uint8_t>& data, size_t maxLen);
 void titleRenderTask(void*);
 std::string toDisplayText(const char* utf8);
 void assignLogoSlots();
@@ -519,6 +525,7 @@ void setup(void) {
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
   titleLock = xSemaphoreCreateMutex();
+  emojiLock = xSemaphoreCreateMutex();
   openFont();
 
   // New firmware from an OTA update starts "pending verify" and must confirm
@@ -617,6 +624,7 @@ volatile bool isTitleDisplaying = false;
 struct TitleText {
   std::vector<uint32_t> chars;     // code points (font.bin) or CP437 codes (built-in font)
   std::vector<uint16_t> advance;   // pixels
+  std::vector<uint32_t> emojiKey;  // cached colour emoji to draw (0: draw chars[i] from the fonts)
   uint32_t width = 0;              // of the text, without the gap
   bool builtin = true;             // drawn with the built-in font
 } titleText;
@@ -664,7 +672,11 @@ esp_partition_mmap_handle_t fontMapHandle;
 bool fontDownloadWanted = false;          // loop() downloads font.bin when nothing else runs
 unsigned long fontRetryAt = 0;            // millis() of the next attempt
 
+void resetEmojiCache();
+void initEmojiCache(size_t fontLen);
+
 void closeFont(){
+  resetEmojiCache();
   titleFont.end();
   if(fontMap){ esp_partition_munmap(fontMapHandle); fontMap = nullptr; }
 }
@@ -692,6 +704,7 @@ void openFont(){
   fontState = FontState::Ready;
   fontCrc = bin.crc;
   fontProblem = "";
+  initEmojiCache(bin.totalLen);
   DEBUG_I.printf("[Font] font.bin %08lx loaded.\n", (unsigned long)fontCrc);
   // an older/newer font.bin than this firmware's: fetch the right one once
   if(FONT_BIN_CRC && fontCrc != FONT_BIN_CRC) fontDownloadWanted = true;
@@ -703,6 +716,156 @@ String fontUrl(){
   bool release = v.startsWith("v") && v.indexOf('-') < 0 && v.length() > 1 && isdigit((unsigned char)v[1]);
   if(release) return "https://github.com/" GITHUB_REPO "/releases/download/" + v + "/" FONT_ASSET;
   return "https://github.com/" GITHUB_REPO "/releases/latest/download/" FONT_ASSET;
+}
+
+// ---------- Colour emoji: Twemoji images (CC-BY 4.0), downloaded by the
+// network task before it hands a Twitch result to loop(), and kept in the
+// font partition after font.bin. Each emoji is stored as 54x54 RGB565,
+// run-length coded (about 2.4 KB), from the start of a 4 KB sector (one or
+// two sectors); when the cache is full the oldest ones are replaced.
+#define EMOJI_SIZE           54
+#define EMOJI_ADVANCE        60     // pixels in the title
+#define EMOJI_TOP            (TITLE_BASELINE - 46)   // like the monochrome emoji
+#define EMOJI_CACHE_MAGIC    0x31454D43UL            // "CME1"
+#define EMOJI_SECTOR         4096
+#define EMOJI_MAX_SECTORS    2
+#define EMOJI_MAX_PER_UPDATE 8      // downloads before a Twitch result goes to loop(); the rest next time
+#define EMOJI_MAX_DOWNLOAD   16384
+#define TWEMOJI_URL          "https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.3/assets/72x72/"
+
+struct EmojiEntryHeader {
+  uint32_t magic, key, seq;  // key: CRC-32 of the Twemoji file name; seq: increases with every entry
+  uint16_t len;              // bytes of run-length data after the header
+  uint8_t w, h;
+  uint32_t crc;              // of the run-length data
+};
+static_assert(sizeof(EmojiEntryHeader) == 20, "cache entry header");
+struct EmojiIndexEntry { uint32_t key, seq; uint16_t sector, sectors; };
+
+SemaphoreHandle_t emojiLock = nullptr;     // index and cache sectors (network task writes, loop/render read)
+std::vector<EmojiIndexEntry> emojiIndex;
+size_t emojiCacheStart = 0;                // offset in the font partition
+uint16_t emojiCacheSectors = 0, emojiNextSector = 0;
+uint32_t emojiSeq = 1;
+bool emojiCacheReady = false;
+String emojiError;                         // last download problem, for the status page
+uint32_t emojiDownloads = 0;
+
+uint32_t emojiKey(const std::string& name){
+  return fontCrc32((const uint8_t*)name.data(), name.size());
+}
+
+void resetEmojiCache(){
+  if(emojiLock) xSemaphoreTake(emojiLock, portMAX_DELAY);
+  emojiCacheReady = false;
+  emojiIndex.clear();
+  if(emojiLock) xSemaphoreGive(emojiLock);
+}
+
+// Reads the cache index from the sectors after font.bin (fontLen bytes)
+void initEmojiCache(size_t fontLen){
+  xSemaphoreTake(emojiLock, portMAX_DELAY);
+  emojiIndex.clear();
+  emojiCacheStart = (fontLen + EMOJI_SECTOR - 1) / EMOJI_SECTOR * EMOJI_SECTOR;
+  emojiCacheSectors = fontPartition->size > emojiCacheStart ? (fontPartition->size - emojiCacheStart) / EMOJI_SECTOR : 0;
+  emojiNextSector = 0;
+  emojiSeq = 1;
+  const EmojiIndexEntry* newest = nullptr;
+  for(uint16_t s = 0; s < emojiCacheSectors;){
+    const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + (size_t)s * EMOJI_SECTOR;
+    EmojiEntryHeader h;
+    memcpy(&h, p, sizeof(h));
+    uint16_t need = (sizeof(h) + h.len + EMOJI_SECTOR - 1) / EMOJI_SECTOR;
+    if(h.magic == EMOJI_CACHE_MAGIC && h.len && h.w == EMOJI_SIZE && h.h == EMOJI_SIZE && need <= EMOJI_MAX_SECTORS
+       && s + need <= emojiCacheSectors && fontCrc32(p + sizeof(h), h.len) == h.crc){
+      emojiIndex.push_back({h.key, h.seq, s, need});
+      s += need;
+    } else s++;
+  }
+  for(const auto& e : emojiIndex) if(!newest || e.seq > newest->seq) newest = &e;
+  if(newest){
+    emojiSeq = newest->seq + 1;
+    emojiNextSector = newest->sector + newest->sectors;
+    if(emojiNextSector >= emojiCacheSectors) emojiNextSector = 0;
+  }
+  emojiCacheReady = emojiCacheSectors >= EMOJI_MAX_SECTORS;
+  xSemaphoreGive(emojiLock);
+  DEBUG_I.printf("[Emoji] Cache: %u emoji in %u sectors.\n", (unsigned)emojiIndex.size(), emojiCacheSectors);
+}
+
+const EmojiIndexEntry* findEmoji(uint32_t key){   // under emojiLock
+  const EmojiIndexEntry* found = nullptr;
+  for(const auto& e : emojiIndex) if(e.key == key && (!found || e.seq > found->seq)) found = &e;
+  return found;
+}
+
+bool emojiCached(uint32_t key){
+  if(!emojiLock) return false;
+  xSemaphoreTake(emojiLock, portMAX_DELAY);
+  bool cached = emojiCacheReady && findEmoji(key);
+  xSemaphoreGive(emojiLock);
+  return cached;
+}
+
+// Decodes a cached emoji into px (EMOJI_SIZE x EMOJI_SIZE)
+bool readEmoji(uint32_t key, std::vector<uint16_t>& px){
+  xSemaphoreTake(emojiLock, portMAX_DELAY);
+  const EmojiIndexEntry* e = emojiCacheReady ? findEmoji(key) : nullptr;
+  bool ok = false;
+  if(e){
+    const uint8_t* p = (const uint8_t*)fontMap + emojiCacheStart + (size_t)e->sector * EMOJI_SECTOR;
+    EmojiEntryHeader h;
+    memcpy(&h, p, sizeof(h));
+    px.assign(EMOJI_SIZE * EMOJI_SIZE, 0);
+    size_t out = 0;
+    for(size_t i = 0; i + 3 <= h.len && out < px.size(); i += 3){
+      const uint8_t* run = p + sizeof(h) + i;
+      uint16_t color = run[1] | (run[2] << 8);
+      for(int k = 0; k < run[0] && out < px.size(); k++) px[out++] = color;
+    }
+    ok = out == px.size();
+  }
+  xSemaphoreGive(emojiLock);
+  return ok;
+}
+
+// Run-length coding: runs of (count 1..255, RGB565 little endian)
+std::vector<uint8_t> rleEncode(const uint16_t* px, size_t n){
+  std::vector<uint8_t> out;
+  for(size_t i = 0; i < n;){
+    size_t run = 1;
+    while(i + run < n && run < 255 && px[i + run] == px[i]) run++;
+    out.push_back((uint8_t)run);
+    out.push_back(px[i] & 0xFF);
+    out.push_back(px[i] >> 8);
+    i += run;
+  }
+  return out;
+}
+
+// Writes an emoji into the next sector(s), replacing the oldest entries there
+bool storeEmoji(uint32_t key, const std::vector<uint8_t>& rle){
+  uint16_t need = (sizeof(EmojiEntryHeader) + rle.size() + EMOJI_SECTOR - 1) / EMOJI_SECTOR;
+  if(rle.empty() || need > EMOJI_MAX_SECTORS) return false;
+  xSemaphoreTake(emojiLock, portMAX_DELAY);
+  bool ok = false;
+  if(emojiCacheReady){
+    if(emojiNextSector + need > emojiCacheSectors) emojiNextSector = 0;
+    uint16_t first = emojiNextSector;
+    emojiIndex.erase(std::remove_if(emojiIndex.begin(), emojiIndex.end(), [&](const EmojiIndexEntry& e){
+      return e.sector < first + need && first < e.sector + e.sectors; }), emojiIndex.end());
+    size_t offset = emojiCacheStart + (size_t)first * EMOJI_SECTOR;
+    EmojiEntryHeader h{EMOJI_CACHE_MAGIC, key, emojiSeq, (uint16_t)rle.size(), EMOJI_SIZE, EMOJI_SIZE, fontCrc32(rle.data(), rle.size())};
+    ok = esp_partition_erase_range(fontPartition, offset, (size_t)need * EMOJI_SECTOR) == ESP_OK
+      && esp_partition_write(fontPartition, offset + sizeof(h), rle.data(), rle.size()) == ESP_OK
+      && esp_partition_write(fontPartition, offset, &h, sizeof(h)) == ESP_OK;
+    if(ok){
+      emojiIndex.push_back({key, emojiSeq++, first, need});
+      emojiNextSector = first + need;
+    }
+  }
+  xSemaphoreGive(emojiLock);
+  return ok;
 }
 
 // Green frame around the pic of the channel whose title is scrolling
@@ -765,13 +928,18 @@ void layoutTitle(const std::string& utf8){
   titleText = TitleText();
   if(titleFont.ready()){
     titleText.builtin = false;
-    for(uint32_t cp : titleCodepoints(utf8.c_str())){
-      titleText.chars.push_back(cp);
-      titleText.advance.push_back((uint16_t)titleFont.advance(cp, TITLE_EM));
+    for(const TitleChar& c : titleChars(utf8.c_str())){
+      uint32_t key = (!c.emoji.empty() && config.colourEmoji) ? emojiKey(c.emoji) : 0;
+      if(key && !emojiCached(key)) key = 0;
+      if(!key && !c.cp) continue;        // a flag without its colour image: nothing to draw
+      titleText.chars.push_back(c.cp);
+      titleText.emojiKey.push_back(key);
+      titleText.advance.push_back((uint16_t)(key ? EMOJI_ADVANCE : titleFont.advance(c.cp, TITLE_EM)));
     }
   } else {
     for(char c : toDisplayText(utf8.c_str())){
       titleText.chars.push_back((uint8_t)c);
+      titleText.emojiKey.push_back(0);
       titleText.advance.push_back(BUILTIN_ADVANCE);
     }
   }
@@ -789,6 +957,7 @@ bool renderAheadStep(){
   size_t count = titleText.chars.size(), item = titleNextItem;
   bool gap = item >= count;
   uint32_t c = gap ? 0 : titleText.chars[item];
+  uint32_t key = gap ? 0 : titleText.emojiKey[item];
   bool builtin = titleText.builtin;
   int advance = gap ? TITLE_GAP : titleText.advance[item];
   // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
@@ -797,8 +966,11 @@ bool renderAheadStep(){
   if(!room) return false;
 
   GlyphBitmap glyph;
+  std::vector<uint16_t> colour;     // a colour emoji, if it is (still) in the cache
   bool box = false;
-  if(!gap){
+  // a colour emoji needs a 5.8 KB buffer: without the RAM the monochrome one is drawn
+  if(key && (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK || !readEmoji(key, colour))) colour.clear();
+  if(!gap && colour.empty() && (c || !key)){
     if(builtin) renderBuiltinGlyph((uint8_t)c, glyph);
     else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) box = c != ' ';  // no RAM: a box instead of failing
     else box = !titleFont.render(c, TITLE_EM, glyph);
@@ -806,7 +978,16 @@ bool renderAheadStep(){
 
   xSemaphoreTake(titleLock, portMAX_DELAY);
   if(generation == titleGeneration && isTitleDisplaying){
-    if(box) drawGlyphBox(text_canvas, titleNextX, advance, TITLE_COLOR);
+    if(!colour.empty()){
+      // centred in its advance; black is the transparent background
+      int x0 = titleNextX + (advance - EMOJI_SIZE) / 2;
+      uint16_t* buf = text_canvas.getBuffer();
+      for(int y = 0; y < EMOJI_SIZE; y++) for(int x = 0; x < EMOJI_SIZE; x++){
+        uint16_t px = colour[y * EMOJI_SIZE + x];
+        if(px && x0 + x >= 0 && x0 + x < CANVAS_W) buf[(EMOJI_TOP + y) * CANVAS_W + x0 + x] = px;
+      }
+    }
+    else if(box) drawGlyphBox(text_canvas, titleNextX, advance, TITLE_COLOR);
     else if(!gap) blitGlyph(text_canvas, glyph, titleNextX, TITLE_BASELINE, TITLE_COLOR);
     titleNextX += advance;
     titleNextItem = (item + 1) % (count + 1);
@@ -1235,6 +1416,41 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
 }
 
 // One update: fetch (renewing the token if needed) and hand the result to loop()
+// Downloads the colour emoji of the live titles that are not cached yet
+// (network task), so a new title already shows them when it starts
+std::set<uint32_t> emojiMissing;   // not in Twemoji (404): not asked again until a restart
+void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
+  if(!config.colourEmoji || !emojiCacheReady) return;
+  std::vector<std::string> names;
+  for(const auto& stream : streams)
+    for(const TitleChar& c : titleChars(stream.title.c_str()))
+      if(!c.emoji.empty() && std::find(names.begin(), names.end(), c.emoji) == names.end()) names.push_back(c.emoji);
+  int downloads = 0;
+  for(const auto& name : names){
+    uint32_t key = emojiKey(name);
+    if(emojiMissing.count(key) || emojiCached(key)) continue;
+    if(downloads++ >= EMOJI_MAX_PER_UPDATE || otaActive) break;
+    std::vector<uint8_t> png;
+    String error = downloadToMemory(TWEMOJI_URL + name + ".png", png, EMOJI_MAX_DOWNLOAD);
+    tlsClient.stop();   // free the TLS session before decoding
+    if(error.length()){
+      if(error.indexOf("(404)") >= 0){ emojiMissing.insert(key); continue; }   // no colour version: monochrome
+      emojiError = name.c_str() + String(": ") + error;
+      DEBUG_W.printf("[Emoji] %s\n", emojiError.c_str());
+      break;   // network problem: try the rest next time
+    }
+    std::vector<uint16_t> px(EMOJI_SIZE * EMOJI_SIZE);
+    const char* e = pngToRgb565(png.data(), png.size(), px.data(), EMOJI_SIZE, EMOJI_SIZE);
+    png.clear(); png.shrink_to_fit();
+    if(e){ emojiError = name.c_str() + String(": ") + e; emojiMissing.insert(key); continue; }
+    std::vector<uint8_t> rle = rleEncode(px.data(), px.size());
+    px.clear(); px.shrink_to_fit();
+    if(!storeEmoji(key, rle)){ emojiError = name.c_str() + String(": cannot store it"); continue; }
+    emojiDownloads++;
+    DEBUG_I.printf("[Emoji] %s stored (%u bytes).\n", name.c_str(), (unsigned)rle.size());
+  }
+}
+
 void runNetworkUpdate(){
   if (WiFi.status() != WL_CONNECTED) return; // handleWiFi() requests an update when it is back
   if (otaActive) return;                      // firmware upload in progress
@@ -1253,6 +1469,7 @@ void runNetworkUpdate(){
       update->result = fetchLiveChannels(*update);
     }
   }
+  if (update->result == FetchResult::Ok) fetchMissingEmoji(update->streams);
   if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
 }
 
@@ -2242,6 +2459,20 @@ void handleStatus(){
       b += "<span class=\"err\">built-in font: font.bin " + htmlEscape(fontProblem.c_str()) + " (trying again later)</span>"; break;
   }
   b += "</td></tr>";
+  b += "<tr><td>Emoji</td><td>";
+  if(!config.colourEmoji) b += "monochrome only";
+  else if(!emojiCacheReady) b += "monochrome (colour needs font.bin)";
+  else {
+    xSemaphoreTake(emojiLock, portMAX_DELAY);
+    size_t used = 0;
+    for(const auto& e : emojiIndex) used += e.sectors;
+    size_t count = emojiIndex.size();
+    xSemaphoreGive(emojiLock);
+    b += "colour (Twemoji, CC-BY 4.0): " + String((unsigned)count) + " stored, " + String((unsigned)(used * EMOJI_SECTOR / 1024))
+         + " of " + String((unsigned)(emojiCacheSectors * EMOJI_SECTOR / 1024)) + " KB";
+    if(emojiError.length()) b += "<br><span class=\"err\">last problem: " + htmlEscape(emojiError.c_str()) + "</span>";
+  }
+  b += "</td></tr>";
   if(!config.requireLogin) b += "<tr><td>Web login</td><td class=\"err\">off: anyone on the network can use this page</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
   b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
@@ -2459,6 +2690,12 @@ void sendSettingsPage(const String& message, bool isError){
   b += "<label>Show a live channel's title again after<input type=\"number\" name=\"repeatmin\" min=\"0\" max=\"" + String(MAX_TITLE_REPEAT_MIN)
        + "\" value=\"" + inputValue("repeatmin", String(config.titleRepeatMinutes)) + "\"></label>";
   b += "<p class=\"hint\">Minutes without a title, 0 = off. The live channels take turns: the one whose title was shown longest ago comes next.</p>";
+  {
+    bool colour = server.hasArg("emoji") ? server.arg("emoji") != "mono" : config.colourEmoji;
+    b += String("<label>Emoji in titles<select name=\"emoji\"><option value=\"colour\"") + (colour ? " selected" : "") + ">colour (downloaded, monochrome when that fails)</option>"
+         "<option value=\"mono\"" + (colour ? "" : " selected") + ">monochrome only (no downloads)</option></select></label>";
+    b += "<p class=\"hint\">Colour emoji are Twemoji images (CC-BY 4.0), downloaded once from cdn.jsdelivr.net and kept on the display.</p>";
+  }
   if(!unknownChannels.empty()){
     String names;
     for(const auto& n : unknownChannels){ if(names.length()) names += ", "; names += n.c_str(); }
@@ -2544,6 +2781,7 @@ void handleSettingsSave(){
   }
   if(repeatSubmitted) prefs.putString("repeatmin", String(repeatMinutes));
   if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
+  if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back

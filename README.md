@@ -99,8 +99,14 @@ a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
 
 Titles are drawn in Noto Sans SemiBold: Latin with all its extensions, Greek,
-Cyrillic, typographic quotes and dashes, and about 400 common emoji (in the
-text colour). Characters the fonts do not have, e.g. Chinese, Japanese or
+Cyrillic, typographic quotes and dashes. Emoji appear in colour: the display
+downloads each one once as a [Twemoji](https://github.com/jdecked/twemoji)
+image (CC-BY 4.0) from cdn.jsdelivr.net before the title starts, and keeps
+about 60 of them in flash (the oldest are replaced). Flags, skin tones and
+combined emoji work too. Emoji without a colour image, or while a download
+fails, are drawn from a monochrome emoji font in the text colour (about 400
+common ones). Settings > **Emoji in titles** switches to monochrome only (no
+downloads). Characters the fonts do not have, e.g. Chinese, Japanese or
 Korean, show as a box for now. Without `font.bin` (see below) titles use the
 built-in 5×7 font, which knows umlauts but no emoji.
 
@@ -141,8 +147,8 @@ passwords stay hidden, uploads from PlatformIO still need the password).
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
-- **Settings**: WiFi, Twitch credentials, channel list, title repeat, web
-  password and login, reset to defaults
+- **Settings**: WiFi, Twitch credentials, channel list, title repeat, emoji,
+  web password and login, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on
 probation" and only confirms itself after it has been online for 60 s. If it
@@ -161,7 +167,7 @@ support?)" after an update, flash once over USB.
 | 0x010000 | 1600 KB | `app0` | Firmware slot 1 |
 | 0x1A0000 | 1600 KB | `app1` | Firmware slot 2 (updates go to the slot that is not running) |
 | 0x330000 | 256 KB | `logos` | 32 channel logos, 64×64 pixels each |
-| 0x370000 | 512 KB | `font` | `font.bin` (about 260 KB); the rest is reserved for a cache |
+| 0x370000 | 512 KB | `font` | `font.bin` (about 260 KB) and the colour emoji cache |
 | 0x3F0000 | 64 KB | `coredump` | Crash dump |
 
 The firmware knows which `font.bin` it was built with. If the `font`

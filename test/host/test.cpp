@@ -503,7 +503,7 @@ int main(){
 
   printf("T49 fonts: code points, font.bin, glyphs, boxes\n");
   { auto cps = titleCodepoints("A\xc3\xa9\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd\xe2\x9d\xa4\xef\xb8\x8f\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x92\xbb\n\xff");
-    CHECK(cps == std::vector<uint32_t>({'A', 0xE9, 0x1F44D, 0x2764, 0x1F468, 0x1F4BB, ' '}));   // skin tone, VS16, flag, ZWJ dropped
+    CHECK(cps == std::vector<uint32_t>({'A', 0xE9, 0x1F44D, 0x2764, 0x1F468, ' '}));   // emoji as their first code point, the flag left out
     FontBin bin;
     CHECK(parseFontBin(g_fontBin.data(), g_fontBin.size(), bin) == nullptr && bin.crc == FONT_BIN_CRC && bin.textLen > 50000 && bin.emojiLen > 150000);
     auto bad = g_fontBin; bad[1000] ^= 1;
@@ -606,6 +606,91 @@ int main(){
     CHECK(!g_nvs["logos"].count("s3") && g_nvs["logos"]["part"] == "330000:40000");
     assignLogoSlots(); for(auto& c : channels) CHECK(c.logoSlot == -1);
     g_spiffs.address = 0;
+    reset(); }
+
+  printf("T51 colour emoji: sequences, download, cache, drawing\n");
+  { auto names = [](const char* t){ std::vector<std::string> v; for(auto& c : titleChars(t)) v.push_back(c.emoji.empty() ? "U+" + std::to_string(c.cp) : c.emoji); return v; };
+    CHECK(names("\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd\xe2\x9d\xa4\xef\xb8\x8f\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa\xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x92\xbb")
+          == std::vector<std::string>({"1f44d-1f3fd", "2764", "1f1e9-1f1ea", "1f468-200d-1f4bb"}));            // skin tone, VS16 dropped without joiner, flag, joiner
+    CHECK(names("#\xef\xb8\x8f\xe2\x83\xa3\xc2\xa9\xc2\xa9\xef\xb8\x8f\xe2\x9c\x85\xef\xb8\x8e") == std::vector<std::string>({"23-20e3", "U+169", "a9", "U+9989"}));   // keycap, © text/emoji, ✅ as text
+    CHECK(names("\xf0\x9f\x91\xa9\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\x91\xa8") == std::vector<std::string>({"1f469-200d-2764-fe0f-200d-1f468"}));   // joiner sequence keeps VS16
+    CHECK(names("\xf0\x9f\x8f\xb4\xf3\xa0\x81\xa7\xf3\xa0\x81\xa2\xf3\xa0\x81\xa5\xf3\xa0\x81\xae\xf3\xa0\x81\xa7\xf3\xa0\x81\xbf") == std::vector<std::string>({"1f3f4-e0067-e0062-e0065-e006e-e0067-e007f"}));   // England
+    emojiMissing.clear(); emojiError = "";                                    // earlier tests' titles had emoji too (with no images to get)
+    CHECK(emojiCacheReady && emojiIndex.empty() && emojiCacheSectors == 62);
+    std::string fire = avatar("bonjwa"), flag = avatar("gronkh"), heart = avatar("x");
+    auto twitchAnswer = [](){ g_responses.push_back({200, g_response}); };
+    reset(); g_requests.clear();
+    setResponse({{0, "Stream \xf0\x9f\x94\xa5 \xf0\x9f\x87\xa9\xf0\x9f\x87\xaa \xe2\x9d\xa4\xef\xb8\x8f \xf0\x9f\x94\xa5"}}); twitchAnswer();
+    g_responses.push_back({200, fire}); g_responses.push_back({200, flag}); g_responses.push_back({200, heart});
+    loopWithUpdate();
+    std::vector<std::string> urls; for(auto& r : g_requests) if(contains(r.url, "twemoji")) urls.push_back(r.url);
+    CHECK(urls == std::vector<std::string>({TWEMOJI_URL "1f525.png", TWEMOJI_URL "1f1e9-1f1ea.png", TWEMOJI_URL "2764.png"}));   // each once, before the title
+    CHECK(emojiIndex.size() == 3 && emojiDownloads >= 3 && emojiError.isEmpty());
+    CHECK(isTitleDisplaying && titleText.emojiKey[7] == emojiKey("1f525") && titleText.advance[7] == EMOJI_ADVANCE && titleText.emojiKey[9] == emojiKey("1f1e9-1f1ea"));
+    { std::vector<uint16_t> px; CHECK(readEmoji(emojiKey("1f525"), px));
+      std::vector<uint16_t> expect(EMOJI_SIZE * EMOJI_SIZE); pngToRgb565((const uint8_t*)fire.data(), fire.size(), expect.data(), EMOJI_SIZE, EMOJI_SIZE);
+      CHECK(px == expect);                                                       // stored losslessly
+      bool drawn = false;                                                        // and drawn into the title
+      for(int k = 0; k < 300 && isTitleDisplaying && !drawn; k++){
+        loopNoUpdate(1);
+        const uint16_t* b = text_canvas.getBuffer();
+        for(int x = 0; x + EMOJI_SIZE <= CANVAS_W && !drawn; x++){
+          bool same = true;
+          for(int y = 0; y < EMOJI_SIZE && same; y += 7) for(int i = 0; i < EMOJI_SIZE && same; i += 5) if(expect[y*EMOJI_SIZE + i] && b[(EMOJI_TOP + y)*CANVAS_W + x + i] != expect[y*EMOJI_SIZE + i]) same = false;
+          if(same) drawn = true;
+        }
+      }
+      CHECK(drawn); }
+    runUntilTitleDone(); CHECK(xSemaphoreTakeCount(emojiLock) == 0);
+
+    printf("    cached: not downloaded again, also after a restart\n");
+    g_requests.clear(); setResponse({{0, "Neu \xf0\x9f\x94\xa5\xe2\x9d\xa4"}}); twitchAnswer(); loopWithUpdate();
+    CHECK(std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
+    runUntilTitleDone();
+    { size_t used = 0; for(auto& e : emojiIndex) used += e.sectors;
+      openFont(); CHECK(emojiIndex.size() == 3 && emojiCached(emojiKey("2764")) && emojiNextSector == used); }   // the test images need one or two sectors
+
+    printf("    not in Twemoji (404): monochrome, not asked again; network error: tried again next time\n");
+    g_requests.clear(); setResponse({{0, "A \xf0\x9f\x8e\xae \xf0\x9f\x91\xbe"}}); twitchAnswer();
+    g_responses.push_back({404, "Not Found"}); g_responses.push_back({500, "oops"});
+    loopWithUpdate();
+    CHECK(isTitleDisplaying && titleText.emojiKey[2] == 0 && titleText.chars[2] == 0x1F3AE && titleText.advance[2] == titleFont.advance(0x1F3AE, TITLE_EM));   // monochrome 🎮
+    CHECK(contains(emojiError.c_str(), "1f47e") && contains(emojiError.c_str(), "500"));
+    runUntilTitleDone();
+    g_requests.clear(); setResponse({{0, "A \xf0\x9f\x8e\xae \xf0\x9f\x91\xbe!"}}); twitchAnswer(); g_responses.push_back({200, heart}); loopWithUpdate();
+    { std::vector<std::string> u; for(auto& r : g_requests) if(contains(r.url, "twemoji")) u.push_back(r.url);
+      CHECK(u == std::vector<std::string>({TWEMOJI_URL "1f47e.png"})); }      // 🎮 not again, 👾 now
+    CHECK(emojiCached(emojiKey("1f47e")) && titleText.emojiKey[4] == emojiKey("1f47e"));
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji</td><td>colour (Twemoji, CC-BY 4.0): 4 stored, ") && contains(g_lastBody, " of 248 KB"));
+    runUntilTitleDone();
+
+    printf("    monochrome only: no downloads, flags left out\n");
+    config.colourEmoji = false; g_requests.clear();
+    setResponse({{0, "B \xf0\x9f\x8d\x95 \xf0\x9f\x87\xa9\xf0\x9f\x87\xaa \xf0\x9f\x94\xa5"}}); twitchAnswer(); loopWithUpdate();
+    CHECK(std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
+    CHECK(isTitleDisplaying && titleText.chars.size() == 10 && titleText.emojiKey[5] == 0 && titleText.chars[5] == 0x1F525);   // "B 🍕  🔥 | g" without the flag
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<tr><td>Emoji</td><td>monochrome only"));
+    runUntilTitleDone(); config.colourEmoji = true;
+
+    printf("    full cache: the oldest are replaced, the index survives a restart\n");
+    std::vector<uint8_t> small = rleEncode(std::vector<uint16_t>(EMOJI_SIZE * EMOJI_SIZE, 0x1234).data(), EMOJI_SIZE * EMOJI_SIZE);
+    std::vector<uint8_t> big(5000, 0); for(size_t i = 0; i + 3 <= big.size(); i += 3) big[i] = 1;   // two sectors
+    for(int i = 0; i < 70; i++) CHECK(storeEmoji(emojiKey("e" + std::to_string(i)), i % 10 == 9 ? big : small));
+    CHECK(!emojiCached(emojiKey("1f525")) && !emojiCached(emojiKey("e0")) && emojiCached(emojiKey("e69")) && emojiCached(emojiKey("e60")));
+    size_t count = emojiIndex.size(); uint16_t next = emojiNextSector;
+    openFont(); CHECK(emojiIndex.size() == count && emojiNextSector == next && emojiCached(emojiKey("e69")));
+    CHECK(!storeEmoji(1, std::vector<uint8_t>(9000, 1)));                      // more than two sectors: not stored
+    g_fontData[emojiCacheStart + (size_t)emojiNextSector * EMOJI_SECTOR + 30] ^= 0xFF;   // damaged entry: dropped at the next start
+    openFont(); CHECK(emojiIndex.size() == count - 1);
+
+    printf("    setting\n");
+    auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
+    server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "<select name=\"emoji\"><option value=\"colour\" selected>colour (downloaded, monochrome when that fails)"));
+    rebootAt = 0; post({{"emoji", "mono"}}); CHECK(g_nvs["config"]["emoji"] == "mono" && rebootAt != 0); rebootAt = 0;
+    loadConfig(); CHECK(!config.colourEmoji);
+    server.find("/settings", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "<option value=\"mono\" selected>"));
+    g_nvs["config"].erase("emoji"); loadConfig(); CHECK(config.colourEmoji);
     reset(); }
 
   printf("T23 new firmware confirmed only after 60 s online\n");
