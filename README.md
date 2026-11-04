@@ -36,6 +36,7 @@ dimmed automatically via an LDR.
 | `examples/apiTest/` | Twitch Helix / EventSub websocket test |
 | `examples/displayTest/` | Display and smooth text-scrolling test (with its own `pics.h`) |
 | `examples/ldrTest/` | LDR backlight dimming test |
+| `examples/fontPreview/` | Test firmware: built-in font vs. Noto Sans, monochrome and colour emoji, CJK downloaded on demand (fonts built by `tools/make_preview_fonts.py`) |
 | `test/host/` | Simulation of the firmware on the PC (`test/host/run.sh`, see its README) |
 | `C3_partition_minimalSPIFFS.csv` | Partition table with two OTA slots; the `spiffs` partition stores the channel logos |
 
