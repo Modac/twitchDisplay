@@ -1,6 +1,5 @@
 // TODO: full unicode support (e.g. with https://github.com/takkaO/OpenFontRender/tree/master and Noto Sans + Noto Emoji, but together at least 1,5MB).
 //       For now titles are converted to the CP437 charset of the built-in font (umlauts and other Latin-1 letters work, emoji are dropped).
-// TODO: reduce scrolling text flicker by flipping the MV flag such that the pixels can be transfered column by column and not row by row
 
 #include <Arduino.h>
 #include <Adafruit_GFX.h>    // Core graphics library
@@ -190,7 +189,57 @@ void slotXY(int8_t slot, uint16_t& x, uint16_t& y){
 }
 
 // Use hardware spi (for esp32-c3 super mini this is SPI0/1 at pins 4-7)
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+// Draw the scrolling title column by column (1) instead of row by row (0), see Display::drawColumnwise()
+#define TITLE_COLUMNWISE 1
+
+// ST7789 with a column-wise bitmap transfer for the scrolling title.
+//
+// The 170x320 panel refreshes its native lines, which are columns in
+// landscape (rotation 1). Writing the title row by row crosses every refresh
+// line, so moving text tears diagonally. drawColumnwise() switches the
+// address order for the transfer (MADCTL MY instead of MY|MV: no row/column
+// exchange), so the pixels arrive column by column, in the panel's line order.
+//
+// Mapping (rotation 1, MADCTL MY|MV, offsets _xstart/_ystart): landscape (x, y)
+// is memory column X = y + _ystart and memory row Y = 319 - (x + _xstart).
+// With MADCTL MY the column address (CASET) runs along X and the row address
+// (RASET) along Y mirrored, so CASET = y + _ystart, RASET = x + _xstart and
+// each landscape column is one memory row.
+class Display : public Adafruit_ST7789 {
+public:
+  using Adafruit_ST7789::Adafruit_ST7789;
+
+  // Draws a w x h section of bitmap (row-major, bitmapWidth wide, starting at
+  // column offsetX) at (x, y)
+  void drawColumnwise(int16_t x, int16_t y, const uint16_t* bitmap, int16_t offsetX, int16_t w, int16_t h, int16_t bitmapWidth){
+    static uint16_t column[PIC_SIZE];
+    startWrite();
+    if(!TITLE_COLUMNWISE || rotation != 1 || h > PIC_SIZE){
+      // row by row (the display's normal order)
+      setAddrWindow(x, y, w, h);
+      for(int16_t j = 0; j < h; j++) writePixels((uint16_t*)&bitmap[j * bitmapWidth + offsetX], w);
+      endWrite();
+      return;
+    }
+    writeCommand(ST77XX_MADCTL);
+    spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_RGB);
+    writeCommand(ST77XX_CASET);
+    SPI_WRITE32(((uint32_t)(y + _ystart) << 16) | (uint32_t)(y + _ystart + h - 1));
+    writeCommand(ST77XX_RASET);
+    SPI_WRITE32(((uint32_t)(x + _xstart) << 16) | (uint32_t)(x + _xstart + w - 1));
+    writeCommand(ST77XX_RAMWR);
+    for(int16_t i = 0; i < w; i++){
+      for(int16_t j = 0; j < h; j++) column[j] = bitmap[j * bitmapWidth + offsetX + i];
+      writePixels(column, h);
+    }
+    // back to the landscape order of rotation 1
+    writeCommand(ST77XX_MADCTL);
+    spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB);
+    endWrite();
+  }
+};
+
+Display tft(TFT_CS, TFT_DC, TFT_RST);
 
 // Settings, loaded once at boot; saving them restarts the display
 struct Config {
@@ -447,16 +496,6 @@ void setup(void) {
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
 }
 
-void drawRGBBitmapSectionFast(int16_t x, int16_t y, uint16_t *bitmap,
-                                int16_t o_x, int16_t o_y, int16_t w, int16_t h, int16_t b_w) {
-  tft.startWrite();
-  tft.setAddrWindow(x, y, w, h);
-  for (int16_t j = o_y; j < (o_y+h); j++) {
-    tft.writePixels(&bitmap[j * b_w + o_x], w);
-  }
-  tft.endWrite();
-}
-
 /**************************************************************************/
 /*!
    @brief   Draw a rectangle with no fill color
@@ -629,7 +668,7 @@ void loop(){
       channelTitleInfo.textOffset%=channelTitleInfo.displayTitle.length()-5;
     }
     // the title scrolls over the row that does not contain the channel's pic
-    drawRGBBitmapSectionFast(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, 0, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
+    tft.drawColumnwise(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), text_canvas.getBuffer(), o_X, TITLE_WIDTH, text_canvas.height(), text_canvas.width());
     o_X = (o_X+6)%(6*8);
 
     if (!o_X && channelTitleInfo.textOffset==0) {

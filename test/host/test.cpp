@@ -702,7 +702,7 @@ int main(){
     g_nvs.erase("logos"); std::fill(g_flashData.begin(), g_flashData.end(), 0xFF); loadLogoIndex(netLogoIndex);
     g_nvs["config"].erase("chcache"); loadConfig(); buildChannels(); assignLogoSlots(); reset(); }
 
-  printf("T42 display: the emulator reproduces Adafruit's rotation table\n");
+  printf("T42 display: rotation model, column-wise title transfer\n");
   { // the emulator's MADCTL model must reproduce Adafruit's rotation table:
     // a point in rotation m is the same memory cell as in rotation 0 under GFXcanvas' rotation formula
     auto cellOf = [](int rot, int x, int y){
@@ -722,6 +722,31 @@ int main(){
     CHECK(consistent);
     tft.setRotation(1); CHECK(g_madctl == (ST77XX_MADCTL_MY | ST77XX_MADCTL_MV));
 
+    // column-wise transfer of a test image with a unique value per pixel
+    std::vector<uint16_t> bm(346 * 64);
+    for(size_t i = 0; i < bm.size(); i++) bm[i] = (uint16_t)(i * 7 + 1);
+    for(int rowTop : {14, 92}){
+      g_writeOrder.clear(); g_recordWrites = true;
+      tft.drawColumnwise(GRID_X0, rowTop, bm.data(), 6, TITLE_WIDTH, 64, 346);
+      g_recordWrites = false;
+      bool same = true;
+      for(int j = 0; j < 64; j++) for(int i = 0; i < TITLE_WIDTH; i++) if(g_fb[rowTop + j][GRID_X0 + i] != bm[j * 346 + 6 + i]) same = false;
+      CHECK(same);                                                          // right place, not mirrored or shifted
+      CHECK(g_writeOrder.size() == (size_t)TITLE_WIDTH * 64);
+      bool columnwise = true;                                               // top to bottom, then the next column
+      for(size_t k = 0; k < g_writeOrder.size(); k++)
+        if(g_writeOrder[k] != std::make_pair(GRID_X0 + (int)(k / 64), rowTop + (int)(k % 64))) { columnwise = false; break; }
+      CHECK(columnwise);
+      CHECK(g_madctl == (ST77XX_MADCTL_MY | ST77XX_MADCTL_MV));            // back to rotation 1
+    }
+
+    // the scrolling title in loop() uses it, and the tiles are still drawn correctly afterwards
+    reset(); setResponse({{0,"A"},{4,"B"}}); loopWithUpdate();
+    CHECK(isTitleDisplaying && titleInRow(1));
+    g_writeOrder.clear(); g_recordWrites = true; loopNoUpdate(1); g_recordWrites = false;
+    CHECK(g_writeOrder.size() >= (size_t)TITLE_WIDTH * 64 && g_writeOrder[0] == std::make_pair(GRID_X0, (int)rowY(1)) && g_writeOrder[1] == std::make_pair(GRID_X0, (int)rowY(1) + 1));
+    runUntilTitleDone();
+    CHECK(tileIsPic(0,0) && tileIsPic(1,4) && tileIsFill(2,0));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");
