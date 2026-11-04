@@ -348,6 +348,17 @@ void setup(void) {
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
 
+  // New firmware from an OTA update starts "pending verify" and must confirm
+  // itself (confirmFirmwareWhenStable()), otherwise the bootloader rolls back
+  // on the next restart (needs a bootloader with rollback support). Checked
+  // first: setup mode needs to know it too.
+  esp_ota_img_states_t otaState;
+  if(esp_ota_get_state_partition(esp_ota_get_running_partition(), &otaState) == ESP_OK
+     && otaState == ESP_OTA_IMG_PENDING_VERIFY){
+    appPendingVerify = true;
+    DEBUG_I.printf("[%s] New firmware, waiting %ds before confirming it.\n", DEBUG_TAG, APP_CONFIRM_DELAY/1000);
+  }
+
   loadConfig();
   twitchToken = config.token;
 
@@ -374,16 +385,6 @@ void setup(void) {
 
   setupOTA();
   setupWeb();
-
-  // New firmware from an OTA update starts "pending verify": loop() confirms it
-  // after APP_CONFIRM_DELAY online, otherwise the bootloader rolls back on the
-  // next restart (needs a bootloader with rollback support)
-  esp_ota_img_states_t otaState;
-  if(esp_ota_get_state_partition(esp_ota_get_running_partition(), &otaState) == ESP_OK
-     && otaState == ESP_OTA_IMG_PENDING_VERIFY){
-    appPendingVerify = true;
-    DEBUG_I.printf("[%s] New firmware, waiting %ds online before confirming it.\n", DEBUG_TAG, APP_CONFIRM_DELAY/1000);
-  }
 
   // Restart if loop() hangs; with a pending firmware this triggers the rollback
   esp_task_wdt_config_t wdtConfig = { .timeout_ms = LOOP_WDT_TIMEOUT, .idle_core_mask = 0, .trigger_panic = true };
@@ -978,9 +979,14 @@ extern "C" bool verifyRollbackLater(){
 
 // Marks a freshly updated firmware as good once it has been online for
 // APP_CONFIRM_DELAY. Until then a crash or restart rolls back to the old one.
+void confirmFirmwareNow();
+
 void confirmFirmwareWhenStable(bool wifiConnected){
   static unsigned long onlineSince = 0;
-  if(!appPendingVerify) return;
+  if(!appPendingVerify){
+    onlineSince = 0;
+    return;
+  }
   if(!wifiConnected){
     onlineSince = 0;
     return;
@@ -989,10 +995,18 @@ void confirmFirmwareWhenStable(bool wifiConnected){
     onlineSince = millis();
     if(!onlineSince) onlineSince = 1;
   } else if(millis() - onlineSince >= APP_CONFIRM_DELAY){
-    esp_ota_mark_app_valid_cancel_rollback();
-    appPendingVerify = false;
-    DEBUG_I.printf("[%s] New firmware confirmed.\n", DEBUG_TAG);
+    onlineSince = 0;
+    confirmFirmwareNow();
   }
+}
+
+// Confirms a pending firmware right away (it just proved to work, e.g. the
+// settings were saved in setup mode and the display is about to restart)
+void confirmFirmwareNow(){
+  if(!appPendingVerify) return;
+  esp_ota_mark_app_valid_cancel_rollback();
+  appPendingVerify = false;
+  DEBUG_I.printf("[%s] New firmware confirmed.\n", DEBUG_TAG);
 }
 
 const char* otaStateName(){
@@ -1405,6 +1419,8 @@ void handleSettingsSave(){
   if(webPassword.length()) prefs.putString("webpw", webPassword);
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
+  // a new firmware that got this far works; the restart must not roll it back
+  confirmFirmwareNow();
 
   String b = "<div class=\"card\"><h2>Saved</h2><p class=\"ok\">The settings were saved. The display restarts now.</p>";
   if(setupMode) b += "<p>Connect this device back to your normal WiFi and open <a href=\"http://" HOSTNAME ".fritz.box/\">http://" HOSTNAME ".fritz.box/</a> "
@@ -1423,6 +1439,7 @@ void handleReset(){
   prefs.clear();
   prefs.end();
   DEBUG_I.printf("[%s] Settings reset, restarting.\n", DEBUG_TAG);
+  confirmFirmwareNow();
   sendPage("Reset", "<div class=\"card\"><h2>Reset</h2><p class=\"ok\">All settings were removed. The display restarts now.</p></div>");
   drawMessageScreen("Settings reset", ST77XX_YELLOW, "Restarting...");
   rebootAt = millis() + 1500;
