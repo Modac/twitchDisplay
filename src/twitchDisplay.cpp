@@ -925,6 +925,7 @@ std::string smallAvatarUrl(const std::string& url){
 String downloadToMemory(const std::string& url, std::vector<uint8_t>& data, size_t maxLen){
   data.clear();
   HTTPClient http;
+  http.useHTTP10(true); // no keep-alive: the connection (and its TLS buffers) is closed afterwards
   http.begin(tlsClient, url.c_str());
   http.setUserAgent("twitchDisplay/" FW_VERSION);
   http.setTimeout(DOWNLOAD_TIMEOUT);
@@ -985,6 +986,7 @@ void syncLogos(const std::vector<ChannelRef>& refs){
     sendLogoMessage(ref.id, LOGO_SLOT_UNCHANGED, "downloading");
     std::vector<uint8_t> png;
     String error = downloadToMemory(url, png, LOGO_MAX_DOWNLOAD);
+    tlsClient.stop(); // free the TLS session before decoding
     std::vector<uint16_t> logo(LOGO_SIZE * LOGO_SIZE);
     if (error.isEmpty()) {
       const char* e = pngToLogo(png.data(), png.size(), logo.data());
@@ -1727,7 +1729,8 @@ void handleStatus(){
   b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
   b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
-  b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB)</td></tr>";
+  b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB, largest block "
+       + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024)) + " KB)</td></tr>";
   b += "<tr><td>Brightness sensor</td><td>" + String(ldr_avg) + "</td></tr>";
   b += "</table><form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
   sendPage("Status", b);

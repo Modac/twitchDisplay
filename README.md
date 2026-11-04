@@ -30,8 +30,7 @@ dimmed automatically via an LDR.
 | `include/secrets.h.example` | Template for the optional `include/secrets.h` (default settings) |
 | `include/web_pages.h` | HTML of the web interface |
 | `tools/version.py` | Build script that puts the git version into the firmware |
-| `tools/pngdec_fix.py` | Build script: leaves PNGdec's ESP32-S3-only file out of ESP32-C3 builds |
-| `lib/LogoImage/` | Converts a PNG avatar into a 64×64 logo (PNGdec + box filter) |
+| `lib/LogoImage/` | Converts a PNG avatar into a 64×64 logo (small PNG reader using the ROM inflater, box filter) |
 | `.github/workflows/build.yml` | GitHub Action: builds the firmware, publishes releases for version tags |
 | `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
 | `examples/apiTest/` | Twitch Helix / EventSub websocket test |
