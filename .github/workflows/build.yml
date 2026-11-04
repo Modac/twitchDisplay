@@ -1,4 +1,5 @@
-# Builds the firmware on every push / pull request of the PlatformIO branch.
+# Builds the firmware on every push / pull request of the PlatformIO branch
+# (only the main firmware; the test sketches in examples/ need secrets.h).
 # Pushing a version tag (e.g. v1.0.0) also publishes a GitHub release with
 # firmware.bin, which the display's "Online update" installs.
 name: Build firmware
@@ -38,9 +39,6 @@ jobs:
         run: |
           test ! -e include/secrets.h
           pio run -e twitchDisplay
-
-      - name: Build display test sketch
-        run: pio run -e twitchDisplay_displayTest
 
       - name: Create merged image for the first flash over USB
         run: |
