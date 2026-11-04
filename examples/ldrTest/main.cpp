@@ -19,7 +19,6 @@
 
 #include "LowPass.h"
 
-#include "pics.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #endif

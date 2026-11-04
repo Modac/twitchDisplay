@@ -25,7 +25,6 @@
 #include <string>
 #include <vector>
 
-#include "pics.h"
 // optional: default settings for the first boot (see include/secrets.h.example)
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -253,7 +252,6 @@ struct channelInfo {
   bool isLive = false;
   std::string streamTitle;  // display charset, used for the scrolling title
   int8_t slotNum = -1;
-  const uint16_t* pic = nullptr;
   std::string name;         // display name (UTF-8)
   std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
   int8_t logoSlot = -1;     // slot of the downloaded logo in flash, -1 = none
@@ -269,18 +267,6 @@ static const char* const DEFAULT_CHANNEL_IDS[] = {
   "761017145", "21991090", "73437396", "1024088182", "12875057",
   "16064695", "55898523", "38770961", "172376071", "549536744"
 };
-
-// Built-in pictures of the default channels
-const uint16_t* builtinPic(const std::string& id){
-  static const struct { const char* id; const uint16_t* pic; } pics[] = {
-    {"761017145", epd_bitmap_lidi}, {"21991090", epd_bitmap_pietsmiet}, {"73437396", epd_bitmap_bonjwa},
-    {"1024088182", epd_bitmap_bonjwachill}, {"12875057", epd_bitmap_gronkh}, {"16064695", epd_bitmap_dhalucard},
-    {"55898523", epd_bitmap_trilluxe}, {"38770961", epd_bitmap_dracon}, {"172376071", epd_bitmap_maxim},
-    {"549536744", epd_bitmap_finanzfluss}
-  };
-  for(const auto& p : pics) if(id == p.id) return p.pic;
-  return nullptr;
-}
 
 // Built once at boot from the settings and never resized afterwards
 // (titleChangeQueue keeps pointers into it)
@@ -1165,11 +1151,8 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   channel.slotNum = pic_slot_index;
   if(pic_slot_index<MAX_NUM_PICS){
     DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
-    // downloaded logo, else built-in picture, else placeholder
-    if(!(channel.logoSlot >= 0 && readLogo(channel.logoSlot, pic_canvas.getBuffer()))){
-      if(channel.pic) pic_canvas.drawRGBBitmap(0, 0, channel.pic, pic_canvas.width(), pic_canvas.height());
-      else drawPlaceholder(channel);
-    }
+    // downloaded logo, else placeholder
+    if(!(channel.logoSlot >= 0 && readLogo(channel.logoSlot, pic_canvas.getBuffer()))) drawPlaceholder(channel);
   } else {
     // more live channels than slots: the last slot shows how many are hidden
     pic_canvas.fillScreen(ST77XX_BLACK);
@@ -1297,7 +1280,6 @@ void buildChannels(){
     ch.id = r.id;
     ch.login = r.login;
     ch.name = r.name;
-    ch.pic = builtinPic(r.id);
     channels.push_back(ch);
   }
   netChannels = refs;
@@ -1311,7 +1293,7 @@ void applyChannels(const NetMessage& msg){
   for (size_t i = 0; i < channels.size() && i < msg.channels.size(); i++) {
     channelInfo& ch = channels[i];
     const ChannelRef& r = msg.channels[i];
-    if (ch.id != r.id) { ch.id = r.id; ch.pic = builtinPic(r.id); changed = true; }
+    if (ch.id != r.id) { ch.id = r.id; changed = true; }
     if (ch.login != r.login) { ch.login = r.login; changed = true; }
     if (!r.name.empty() && ch.name != r.name) { ch.name = r.name; changed = true; }
   }
