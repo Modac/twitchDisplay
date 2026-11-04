@@ -557,6 +557,7 @@ void setup(){
   tft.fillScreen(ST77XX_BLACK);
   fontsOk = stbtt_InitFont(&sans600, font600, 0) && stbtt_InitFont(&sans400, font400, 0)
             && stbtt_InitFont(&sans700, font700, 0) && stbtt_InitFont(&emojiFont, fontEmoji, 0);
+  tls.useBuiltinCACertBundle();   // verify servers with the root certificates built into the core
   connectWiFi();
 }
 
