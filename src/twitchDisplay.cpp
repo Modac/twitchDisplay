@@ -19,6 +19,8 @@
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <esp_rom_crc.h>
+#include <driver/gpio.h>
+#include <soc/gpio_sig_map.h>
 
 #include <deque>
 #include <string>
@@ -157,6 +159,8 @@ CrlfSerial debugSerial;
 #define TFT_RST       10 // Or set to -1 and connect to Arduino RESET pin
 #define TFT_DC         1
 #define TFT_BK         0
+#define TFT_SCK        4  // hardware SPI clock (SCL on the module)
+#define TFT_SDA        6  // hardware SPI data (SDA on the module, bidirectional on the ST7789V)
 
 #define MAX_NUM_PICS 8
 
@@ -251,9 +255,94 @@ public:
     spiWrite(ST77XX_MADCTL_MY | ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB);
     endWrite();
   }
+
+  // Reads the current scanline (GSCAN, 45h) and returns the raw bits: the
+  // first `bits` clocks after the command, first bit in the highest position.
+  // In the ST7789V's 4-line serial interface I the SDA line is bidirectional
+  // (data sheet 8.4), so the clock and data pins are taken from the SPI
+  // peripheral for this, driven by hand and attached again afterwards.
+  // Must not be called inside a startWrite()/endWrite() transfer.
+  uint32_t readScanlineRaw(int bits = 25){
+    pinMatrixOutDetach(TFT_SCK, false, false);
+    pinMatrixOutDetach(TFT_SDA, false, false);
+    gpio_set_level((gpio_num_t)TFT_SCK, 0);
+    digitalWrite(TFT_DC, LOW);
+    digitalWrite(TFT_CS, LOW);
+    for(int b = 7; b >= 0; b--){ // command, MSB first, sampled on the rising edge
+      gpio_set_level((gpio_num_t)TFT_SDA, (0x45 >> b) & 1);
+      esp_rom_delay_us(1);
+      gpio_set_level((gpio_num_t)TFT_SCK, 1);
+      esp_rom_delay_us(1);
+      gpio_set_level((gpio_num_t)TFT_SCK, 0);
+    }
+    digitalWrite(TFT_DC, HIGH);
+    gpio_set_direction((gpio_num_t)TFT_SDA, GPIO_MODE_INPUT);
+    gpio_set_pull_mode((gpio_num_t)TFT_SDA, GPIO_PULLDOWN_ONLY); // no answer reads as 0
+    uint32_t value = 0;
+    for(int i = 0; i < bits; i++){ // the display sets each bit after a falling edge
+      esp_rom_delay_us(1);
+      gpio_set_level((gpio_num_t)TFT_SCK, 1);
+      esp_rom_delay_us(1);
+      value = (value << 1) | (uint32_t)gpio_get_level((gpio_num_t)TFT_SDA);
+      gpio_set_level((gpio_num_t)TFT_SCK, 0);
+    }
+    digitalWrite(TFT_CS, HIGH);
+    gpio_set_pull_mode((gpio_num_t)TFT_SDA, GPIO_FLOATING);
+    gpio_set_direction((gpio_num_t)TFT_SDA, GPIO_MODE_OUTPUT);
+    pinMatrixOutAttach(TFT_SDA, FSPID_OUT_IDX, false, false);
+    pinMatrixOutAttach(TFT_SCK, FSPICLK_OUT_IDX, false, false);
+    return value;
+  }
 };
 
 Display tft(TFT_CS, TFT_DC, TFT_RST);
+
+// Scanline read test (diagnostic for synchronising frames to the panel):
+// 8 readings ~1.3 ms apart, i.e. spread over one panel refresh (10.25 ms).
+// The data sheet leaves open whether a serial multi-byte read starts with one
+// dummy clock or a dummy byte, so both interpretations are kept:
+// A = 16 bits after 1 dummy clock, B = 16 bits after 8 dummy clocks.
+#define SCANLINE_SAMPLES 8
+struct ScanlineTest {
+  uint32_t raw[SCANLINE_SAMPLES];
+  uint16_t a[SCANLINE_SAMPLES], b[SCANLINE_SAMPLES];
+  const char* verdict;
+};
+
+// Plausible: all values within the frame (VSYNC+VBP+320+VFP < 400 lines) and changing
+// Plausible: all within one frame (320 lines + porches), changing, and spread
+// over the frame. The spread matters: the other interpretation of the same bits
+// is the value shifted by 7, so B read as A gives tiny values (0..2).
+bool plausibleScanlines(const uint16_t* v){
+  bool changing = false;
+  uint16_t maxLine = 0;
+  for(int i = 0; i < SCANLINE_SAMPLES; i++){
+    if(v[i] > 400) return false;
+    if(i && v[i] != v[0]) changing = true;
+    if(v[i] > maxLine) maxLine = v[i];
+  }
+  return changing && maxLine >= 16;
+}
+
+ScanlineTest runScanlineTest(){
+  ScanlineTest t;
+  for(int i = 0; i < SCANLINE_SAMPLES; i++){
+    t.raw[i] = tft.readScanlineRaw(25);
+    t.a[i] = (uint16_t)((t.raw[i] >> 8) & 0xFFFF);  // bits 1..16 of 25
+    t.b[i] = (uint16_t)((t.raw[i] >> 1) & 0xFFFF);  // bits 8..23 of 25
+    delayMicroseconds(1300);
+  }
+  bool allZero = true, allOnes = true;
+  for(uint32_t r : t.raw){ if(r) allZero = false; if(r != 0x1FFFFFF) allOnes = false; }
+  if(allZero) t.verdict = "no answer (SDA stays low): reading not possible on this module";
+  else if(allOnes) t.verdict = "no answer (SDA stays high): reading not possible on this module";
+  else if(plausibleScanlines(t.a)) t.verdict = "works (interpretation A: 1 dummy clock)";
+  else if(plausibleScanlines(t.b)) t.verdict = "works (interpretation B: dummy byte)";
+  else t.verdict = "answer, but no plausible scanlines";
+  return t;
+}
+
+ScanlineTest bootScanlineTest;
 
 // Settings, loaded once at boot; saving them restarts the display
 struct Config {
@@ -459,6 +548,13 @@ void setup(void) {
   text_canvas.cp437(true); // titles are converted to CP437, see toDisplayText()
 
   DEBUG_I.printf("[%s] Display initialized.\n", DEBUG_TAG);
+
+  bootScanlineTest = runScanlineTest();
+  for(int i = 0; i < SCANLINE_SAMPLES; i++){
+    DEBUG_I.printf("[%s] Scanline read %d: raw 0x%07lx  A %u  B %u\n", DEBUG_TAG, i,
+                   (unsigned long)bootScanlineTest.raw[i], bootScanlineTest.a[i], bootScanlineTest.b[i]);
+  }
+  DEBUG_I.printf("[%s] Scanline read: %s\n", DEBUG_TAG, bootScanlineTest.verdict);
 
   // New firmware from an OTA update starts "pending verify" and must confirm
   // itself (confirmFirmwareWhenStable()), otherwise the bootloader rolls back
@@ -1845,7 +1941,23 @@ void handleStatus(){
     b += String(fps) + " fps, longest frame gap " + String((unsigned)(titleMaxGapUs / 1000)) + " ms";
   }
   b += "</td></tr>";
-  b += "</table><form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
+  b += "</table>";
+  {
+    // fresh readings (between two title frames, loop() is not drawing now)
+    ScanlineTest t = runScanlineTest();
+    b += "<h2 style=\"margin-top:16px\">Display scanline read (test)</h2><table>";
+    b += String("<tr><td>Result</td><td>") + t.verdict + "</td></tr>";
+    String raw, a, bb;
+    for(int i = 0; i < SCANLINE_SAMPLES; i++){
+      char hex[12]; snprintf(hex, sizeof(hex), "%07lx", (unsigned long)t.raw[i]);
+      raw += String(i ? " " : "") + hex; a += String(i ? " " : "") + String(t.a[i]); bb += String(i ? " " : "") + String(t.b[i]);
+    }
+    b += "<tr><td>Raw (25 bits)</td><td><code>" + raw + "</code></td></tr>";
+    b += "<tr><td>A (1 dummy clock)</td><td>" + a + "</td></tr>";
+    b += "<tr><td>B (dummy byte)</td><td>" + bb + "</td></tr>";
+    b += String("<tr><td>At boot</td><td>") + bootScanlineTest.verdict + "</td></tr></table>";
+  }
+  b += "<form method=\"post\" action=\"/reboot\" onsubmit=\"return confirm('Restart the display?')\"><p><button>Restart</button></p></form></div>";
   sendPage("Status", b);
 }
 

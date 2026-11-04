@@ -19,7 +19,8 @@ extern int g_analogReads;
 inline int analogRead(int){ g_analogReads++; return 2000; }
 inline void analogWrite(int,int){}
 inline void pinMode(int,int){}
-inline void digitalWrite(int,int){}
+extern int g_pinLevel[32]; struct SerialReadEmu; extern void serialReadCsChanged(int pin, int level);
+inline void digitalWrite(int pin, int level){ if(pin >= 0 && pin < 32){ g_pinLevel[pin] = level ? 1 : 0; serialReadCsChanged(pin, level); } }
 extern bool g_bootPressed;
 inline int digitalRead(int pin){ return (pin==9 && g_bootPressed) ? 0 : 1; }
 inline uint32_t esp_random(){ return (uint32_t)rand(); }
