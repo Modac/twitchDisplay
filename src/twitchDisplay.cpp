@@ -278,10 +278,14 @@ struct Config {
   String token;
   String webPassword;
   String channelList;  // comma separated logins (or numeric ids), empty = default channels
+  uint16_t titleRepeatMinutes;  // show a live channel's title again after this many minutes without a title, 0 = off
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
 } config;
+
+#define DEFAULT_TITLE_REPEAT_MIN 5
+#define MAX_TITLE_REPEAT_MIN     1440
 
 void loadConfig(){
   Preferences prefs;
@@ -293,6 +297,7 @@ void loadConfig(){
   config.token        = prefs.getString("token", TWITCH_TOKEN);
   config.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
   config.channelList  = prefs.getString("channels", "");
+  config.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
   prefs.end();
 }
 
@@ -334,6 +339,7 @@ struct channelInfo {
   int8_t logoSlot = -1;     // slot of the downloaded logo in flash, -1 = none
   std::string login;        // Twitch login (channel name in the URL)
   std::string logoStatus;   // for the status page: "stored", "downloading", error text, ...
+  uint32_t titleShownSeq = 0; // when its title was shown last (titleShowCount then), 0 = never
 };
 
 #define MAX_CHANNELS 16
@@ -595,7 +601,11 @@ void drawTitleIndicator(){
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_GREEN);
 }
 
+uint32_t titleShowCount = 0;          // titles shown since boot
+unsigned long lastTitleEndAt = 0;     // millis() when the last title ended
+
 void startTitle(channelInfo* channel){
+  channel->titleShownSeq = ++titleShowCount;
   channelTitleInfo.channel = channel;
   channelTitleInfo.slot = channel->slotNum;
   channelTitleInfo.displayTitle = channel->streamTitle;
@@ -667,7 +677,26 @@ void drawTitleFrame(){
 // Ends the title display and restores all pics (the title covers one row)
 void stopTitle(){
   isTitleDisplaying = false;
+  lastTitleEndAt = millis();
   redrawLiveChannelPics();
+}
+
+// Every few minutes without a title (setting, 0 = off), a live channel's title
+// is shown again. Fair: the channel whose title was shown longest ago (or
+// never) comes next; among equals chance decides. A changed title counts as
+// shown too, so each live channel gets its turn before one comes again.
+void repeatTitleWhenDue(){
+  if(!config.titleRepeatMinutes || millis() - lastTitleEndAt < config.titleRepeatMinutes * 60000UL) return;
+  channelInfo* pick = nullptr;
+  uint32_t equals = 0;
+  for(auto& c : channels){
+    if(!c.isLive || c.slotNum < 0 || c.streamTitle.length() <= 5) continue;
+    if(!pick || c.titleShownSeq < pick->titleShownSeq){ pick = &c; equals = 1; }
+    else if(c.titleShownSeq == pick->titleShownSeq && esp_random() % ++equals == 0) pick = &c;  // each equal one with the same chance
+  }
+  if(!pick){ lastTitleEndAt = millis(); return; }  // nobody live: check again after the next interval
+  DEBUG_I.printf("[%s] Showing the title of %s again.\n", DEBUG_TAG, pick->name.c_str());
+  startTitle(pick);
 }
 
 uint16_t statusColor = STATUS_OK;
@@ -771,6 +800,7 @@ void loop(){
     // channel may have gone offline while it was queued
     if(next->isLive) startTitle(next);
   }
+  if(!isTitleDisplaying) repeatTitleWhenDue();
   if(isTitleDisplaying && (long)(micros() - nextFrameUs) >= 0) drawTitleFrame();
 
 #ifdef DEBUG_UDP_LDR
@@ -2104,6 +2134,9 @@ void sendSettingsPage(const String& message, bool isError){
   b += "</textarea></label>";
   b += "<p class=\"hint\">One channel name per line (as in twitch.tv/<i>name</i>), at most " + String(MAX_CHANNELS) + ". "
        "They are shown in this order; up to 8 live channels get a tile.</p>";
+  b += "<label>Show a live channel's title again after<input type=\"number\" name=\"repeatmin\" min=\"0\" max=\"" + String(MAX_TITLE_REPEAT_MIN)
+       + "\" value=\"" + inputValue("repeatmin", String(config.titleRepeatMinutes)) + "\"></label>";
+  b += "<p class=\"hint\">Minutes without a title, 0 = off. The live channels take turns: the one whose title was shown longest ago comes next.</p>";
   if(!unknownChannels.empty()){
     String names;
     for(const auto& n : unknownChannels){ if(names.length()) names += ", "; names += n.c_str(); }
@@ -2145,6 +2178,14 @@ void handleSettingsSave(){
     sendSettingsPage(err, true);
     return;
   }
+  bool repeatSubmitted = server.hasArg("repeatmin");
+  String repeatText = server.arg("repeatmin"); repeatText.trim();
+  long repeatMinutes = repeatText.toInt();
+  if(repeatSubmitted && (repeatText.length() == 0 || repeatText.length() > 4 || (repeatMinutes == 0 && repeatText != "0")
+                         || repeatMinutes < 0 || repeatMinutes > MAX_TITLE_REPEAT_MIN)){
+    sendSettingsPage("Title repeat: enter minutes from 0 to " + String(MAX_TITLE_REPEAT_MIN) + ".", true);
+    return;
+  }
   std::vector<std::string> logins;
   bool channelsSubmitted = server.hasArg("channels");
   if(channelsSubmitted){
@@ -2172,6 +2213,7 @@ void handleSettingsSave(){
     for(const auto& l : logins){ if(list.length()) list += ","; list += l.c_str(); }
     prefs.putString("channels", list);
   }
+  if(repeatSubmitted) prefs.putString("repeatmin", String(repeatMinutes));
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back

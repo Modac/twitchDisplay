@@ -91,6 +91,11 @@ Enter the channels on the **Settings** page, one name per line (as in
 order; up to 8 live channels get a tile, more are counted on a "+N" tile.
 Without a saved list the display uses the ten channels it always had.
 
+A channel's title scrolls when it goes live or changes its title or game. In
+addition, after some minutes without a title (Settings, default 5, 0 = off)
+a live channel's title is shown again. The live channels take turns: the one
+whose title was shown longest ago comes next, chance decides among equals.
+
 The display looks the channels up on Twitch at the start and once a day and
 downloads each channel's avatar (the 70×70 version, about 10 KB) only when it
 is new or has changed. It is converted to a 64×64 logo and kept in flash, so

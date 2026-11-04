@@ -1,3 +1,4 @@
+#include <set>
 // Host simulation of the twitchDisplay firmware: compiles the real
 // src/twitchDisplay.cpp against the stand-ins in stubs/ and checks its
 // behaviour (see README.md). Build and run with ./run.sh
@@ -367,6 +368,61 @@ int main(){
     g_millis += 1500; loop(); CHECK(!otaActive && g_updateAborts == 1 && restoreDisplayAt != 0);
     g_millis += 5100; loop(); CHECK(tileIsPic(0,0));
     setResponse({{0,"A2"}}); loopWithUpdate(); CHECK(isTitleDisplaying);     // Twitch updates run again
+    reset(); }
+
+  printf("T46 a live channel's title comes again after the set minutes, channels take turns\n");
+  { reset(); for(auto& c : channels) c.titleShownSeq = 0;
+    CHECK(config.titleRepeatMinutes == 5);                                     // default without a saved value
+    setResponse({{0,"Title zero"},{2,"Title two"},{5,"Title five"}}); loopWithUpdate();
+    for(int k = 0; k < 3; k++){ CHECK(isTitleDisplaying); runUntilTitleDone(); loopNoUpdate(1); }  // the three new titles
+    CHECK(!isTitleDisplaying);
+    std::vector<channelInfo*> shown;
+    auto waitForRepeat = [&](){
+      g_millis += 4 * 60000; loopNoUpdate(1); CHECK(!isTitleDisplaying);       // not before 5 minutes
+      g_millis += 60000 + 10; loopNoUpdate(1); CHECK(isTitleDisplaying);
+      shown.push_back(channelTitleInfo.channel); runUntilTitleDone(); };
+    for(int k = 0; k < 6; k++) waitForRepeat();
+    CHECK(shown[0] == &channels[0] && shown[1] == &channels[2] && shown[2] == &channels[5]);   // longest ago first
+    CHECK(shown[3] == shown[0] && shown[4] == shown[1] && shown[5] == shown[2]);                 // then the same turns again
+
+    printf("    a changed title counts as shown, and restarts the waiting time\n");
+    g_millis += 3 * 60000;
+    setResponse({{0,"Title zero"},{2,"Title two"},{5,"New five"}}); loopWithUpdate();
+    CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[5]); runUntilTitleDone();
+    g_millis += 4 * 60000; loopNoUpdate(1); CHECK(!isTitleDisplaying);
+    g_millis += 60000 + 10; loopNoUpdate(1); CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[0]); runUntilTitleDone();
+
+    printf("    never shown channels in equal turns: chance decides, each comes once\n");
+    int first[3] = {0, 0, 0};
+    for(int round = 0; round < 60; round++){
+      for(int ch : {0, 2, 5}) channels[ch].titleShownSeq = 0;
+      std::set<channelInfo*> once;
+      for(int k = 0; k < 3; k++){
+        g_millis += 5 * 60000 + 10; loopNoUpdate(1); CHECK(isTitleDisplaying);
+        if(k == 0) first[channelTitleInfo.channel == &channels[0] ? 0 : channelTitleInfo.channel == &channels[2] ? 1 : 2]++;
+        once.insert(channelTitleInfo.channel); runUntilTitleDone();
+      }
+      CHECK(once.size() == 3);
+    }
+    CHECK(first[0] >= 8 && first[1] >= 8 && first[2] >= 8);                  // each starts sometimes (60 rounds)
+
+    printf("    0 = off; nobody live = nothing\n");
+    config.titleRepeatMinutes = 0; g_millis += 60 * 60000; loopNoUpdate(1); CHECK(!isTitleDisplaying);
+    config.titleRepeatMinutes = 5; setResponse({}); loopWithUpdate();
+    g_millis += 10 * 60000; loopNoUpdate(1); CHECK(!isTitleDisplaying);
+
+    printf("    Settings page: minutes validated and saved\n");
+    auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
+    rebootAt = 0;
+    for(const char* bad : {"-1", "1441", "abc", ""}){ post({{"repeatmin", bad}}); CHECK(contains(g_lastBody, "Title repeat: enter minutes from 0 to 1440.") && rebootAt == 0); }
+    CHECK(!g_nvs["config"].count("repeatmin"));
+    post({{"repeatmin", " 12 "}}); CHECK(rebootAt != 0 && g_nvs["config"]["repeatmin"] == "12"); rebootAt = 0;
+    loadConfig(); CHECK(config.titleRepeatMinutes == 12);
+    post({{"repeatmin", "0"}}); CHECK(g_nvs["config"]["repeatmin"] == "0"); rebootAt = 0;
+    loadConfig(); CHECK(config.titleRepeatMinutes == 0);
+    server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "name=\"repeatmin\" min=\"0\" max=\"1440\" value=\"0\"") && contains(g_lastBody, "take turns"));
+    g_nvs["config"].erase("repeatmin"); loadConfig(); CHECK(config.titleRepeatMinutes == 5);
     reset(); }
 
   printf("T23 new firmware confirmed only after 60 s online\n");
