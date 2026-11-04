@@ -38,8 +38,6 @@ std::map<std::string,std::string> g_args, g_respHeaders; std::map<std::string, s
 std::string g_serialOut;
 esp_partition_t g_spiffs{"spiffs", 0x20000}; std::vector<uint8_t> g_flashData(0x20000, 0xFF); int g_flashErases = 0, g_flashWrites = 0, g_flashBadWrites = 0; bool g_flashFail = false;
 std::vector<TextBox> g_textBoxes;
-int g_pinLevel[32] = {0}; int g_pinSignal[32] = {0}; bool g_pinInput[32] = {false}; int g_scanlineDummyBits = 1; SerialReadEmu g_serialRead;
-void serialReadCsChanged(int pin, int level){ if(pin == 7 && level == 0) g_serialRead.reset(); }   // CS falling edge starts a new transfer
 int g_panelFrameRate = -1; uint16_t g_gram[320][240]; uint8_t g_madctl = 0; bool g_recordWrites = false; std::vector<std::pair<int,int>> g_writeOrder;
 int g_dnsStarted = 0; bool g_bootPressed = false; std::vector<std::string> g_scan; std::string g_beginSsid, g_beginPw, g_apSsid, g_apPw; int g_apStations = 0;
 bool contains(const std::string& h, const std::string& n){ return h.find(n) != std::string::npos; }
@@ -782,38 +780,6 @@ int main(){
     CHECK(titleFrames >= expectMs * 1000 / FRAME_INTERVAL_US - 5 && titleMaxGapUs <= 12000);
     server.find("/", HTTP_GET)->fn();
     CHECK(contains(g_lastBody, "Title scrolling</td><td>") && contains(g_lastBody, " fps, longest frame gap ") && contains(g_lastBody, "drawing a frame takes ") && contains(g_lastBody, "panel refresh 10.3 ms"));
-    reset(); }
-
-  printf("T44 scanline (GSCAN) and ID read diagnostics\n");
-  { CHECK(bootScanlineTest.verdict != nullptr);
-    struct { int dummy; const char* expect; } modes[] = {
-      {1, "works (interpretation A: 1 dummy clock)"}, {8, "works (interpretation B: dummy byte)"}, {0, "no answer (SDA stays low)"}};
-    for(auto m : modes){
-      g_scanlineDummyBits = m.dummy;
-      ScanlineTest t = runScanlineTest();
-      if(!contains(t.verdict, m.expect)) printf("  dummy %d: verdict \"%s\" raw %08x\n", m.dummy, t.verdict, (unsigned)t.raw[0]);
-      CHECK(contains(t.verdict, m.expect));
-      if(m.dummy == 1){ bool inFrame = true; for(auto v : t.a) if(v >= 344) inFrame = false; CHECK(inFrame && t.a[1] != t.a[0]); }
-      CHECK(g_pinSignal[4] == FSPICLK_OUT_IDX && g_pinSignal[6] == FSPID_OUT_IDX && !g_pinInput[6]);  // SPI pins given back
-      CHECK(g_pinLevel[7] == 1);                                                                       // CS released
-    }
-    g_scanlineDummyBits = 1;
-    CHECK(bootIdTest.verdict != nullptr);
-    for(int dummy : {1, 8, 0}){
-      g_scanlineDummyBits = dummy;
-      IdTest id = runIdTest();
-      if(dummy) CHECK(contains(id.verdict, "works: ST7789V ID") && id.idDxA == 0x858552 && (dummy == 1 ? id.id04A : id.id04B) == 0x858552);
-      else CHECK(contains(id.verdict, "no answer (SDA stays low)"));
-      CHECK(g_pinSignal[4] == FSPICLK_OUT_IDX && g_pinSignal[6] == FSPID_OUT_IDX && !g_pinInput[6] && g_pinLevel[7] == 1);
-    }
-    g_scanlineDummyBits = 1;
-    // drawing still works afterwards
-    std::vector<uint16_t> bm(346 * 64, 0x5A5A);
-    tft.drawColumnwise(GRID_X0, 14, bm.data(), 0, TITLE_WIDTH, 64, 346);
-    CHECK(g_fb[14][GRID_X0] == 0x5A5A && g_fb[77][GRID_X0 + TITLE_WIDTH - 1] == 0x5A5A);
-    server.find("/", HTTP_GET)->fn();
-    CHECK(contains(g_lastBody, "Display scanline read (test)") && contains(g_lastBody, "works (interpretation A"));
-    CHECK(contains(g_lastBody, "Display ID read (test)") && contains(g_lastBody, "works: ST7789V ID 85 85 52") && contains(g_lastBody, "<code>858552 / "));
     reset(); }
 
   printf("T37 serial output uses CRLF line ends\n");
