@@ -792,10 +792,18 @@ int main(){
       g_requests.clear(); setResponse({{0, "Lang genug"}, {2, "Neu \xf0\x9f\xa6\x84!"}}); twitchAnswer(); g_responses.push_back({200, avatar("x")});
       runNetworkUpdate(); CHECK(emojiCached(emojiKey("1f984")));          // in the pause: downloaded
       loop(); runUntilTitleDone(); while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
-      g_largestBlock = 20000; emojiError = "";
+      g_largestBlock = 16000; emojiError = "";
       g_requests.clear(); setResponse({{0, "Wenig \xf0\x9f\xa6\x8a"}}); twitchAnswer(); runNetworkUpdate();
       CHECK(!emojiCached(emojiKey("1f98a")) && contains(emojiError.c_str(), "not enough free memory") && std::none_of(g_requests.begin(), g_requests.end(), [](const FakeRequest& r){ return contains(r.url, "twemoji"); }));
-      g_largestBlock = 61440; loop(); runUntilTitleDone(); reset(); }
+      g_largestBlock = 61440; loop(); runUntilTitleDone();
+      printf("    enough for the download but not for decoding: not marked as missing, tried again\n");
+      reset(); emojiError = ""; g_largestBlock = 20000;
+      g_requests.clear(); setResponse({{0, "Wenig \xf0\x9f\xa6\x8a"}}); twitchAnswer(); g_responses.push_back({200, avatar("x")}); runNetworkUpdate();
+      CHECK(!emojiCached(emojiKey("1f98a")) && !emojiMissing.count(emojiKey("1f98a")) && contains(emojiError.c_str(), "decode it, trying again later"));
+      g_largestBlock = 61440; loop(); runUntilTitleDone();
+      g_requests.clear(); setResponse({{0, "Wenig \xf0\x9f\xa6\x8a!"}}); twitchAnswer(); g_responses.push_back({200, avatar("x")}); runNetworkUpdate();
+      CHECK(emojiCached(emojiKey("1f98a")));
+      loop(); runUntilTitleDone(); reset(); }
 
     printf("    setting\n");
     auto post = [](std::map<std::string,std::string> a){ a["ssid"] = "homewifi"; g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };

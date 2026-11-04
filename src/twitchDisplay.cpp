@@ -1488,8 +1488,9 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
 // rendered and drawn at the same time the heap ran empty, so these downloads
 // wait for a pause between titles, and only start with enough RAM in one
 // block. Returns false if there is no pause within 2 minutes (next update).
-#define DOWNLOAD_MIN_FREE_BLOCK 24576
-#define DOWNLOAD_MIN_FREE       49152
+#define DOWNLOAD_MIN_FREE_BLOCK 18432   // each of the two 16 KB TLS buffers needs a block of about 17 KB
+#define DOWNLOAD_MIN_FREE       40960
+#define DECODE_MIN_FREE_BLOCK   22528   // a 72x72 RGBA PNG is unpacked into one 21 KB buffer
 #define TITLE_PAUSE_WAIT        120000
 bool waitForDownloadSlot(){
   for(unsigned long t0 = millis(); isTitleDisplaying || installRequested;){
@@ -1531,10 +1532,15 @@ void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
       DEBUG_W.printf("[Emoji] %s\n", emojiError.c_str());
       break;   // network problem: try the rest next time
     }
+    if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < DECODE_MIN_FREE_BLOCK){
+      emojiError = name.c_str() + String(": not enough memory in one block to decode it, trying again later");
+      break;
+    }
     std::vector<uint16_t> px(EMOJI_SIZE * EMOJI_SIZE);
     const char* e = pngToRgb565(png.data(), png.size(), px.data(), EMOJI_SIZE, EMOJI_SIZE);
     png.clear(); png.shrink_to_fit();
-    if(e){ emojiError = name.c_str() + String(": ") + e; emojiMissing.insert(key); continue; }
+    if(e && !strcmp(e, "Out of memory")){ emojiError = name.c_str() + String(": out of memory while decoding, trying again later"); break; }
+    if(e){ emojiError = name.c_str() + String(": ") + e; emojiMissing.insert(key); continue; }   // a broken image: not asked again
     std::vector<uint8_t> rle = rleEncode(px.data(), px.size());
     px.clear(); px.shrink_to_fit();
     if(!storeEmoji(key, rle)){ emojiError = name.c_str() + String(": cannot store it"); continue; }
