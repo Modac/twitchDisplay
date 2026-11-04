@@ -48,11 +48,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip                                    # PlatformIO and esptool downloads
+          cache-dependency-path: .github/workflows/build.yml
 
+      # toolchain and framework (not ~/.platformio/.cache: the downloaded archives, ~1 GB)
       - uses: actions/cache@v4
         with:
-          path: ~/.platformio
-          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-packages-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      # build results and libraries of the last run: only changed files are compiled
+      # (the version is in a generated header, see tools/version.py)
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .pio/build
+            .pio/libdeps
+          key: pio-build-${{ runner.os }}-${{ hashFiles('platformio.ini', 'partitions.csv') }}-${{ github.sha }}
+          restore-keys: pio-build-${{ runner.os }}-${{ hashFiles('platformio.ini', 'partitions.csv') }}-
 
       - name: Install PlatformIO and esptool
         run: pip install "platformio>=6.1,<7" "esptool>=5,<6"
