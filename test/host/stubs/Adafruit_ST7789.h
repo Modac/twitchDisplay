@@ -110,6 +110,9 @@ public:
     setAddrWindow(x, y, w, h);
     writePixels(bm, (uint32_t)w * h);
   }
+  // rounded corners are not simulated
+  void fillRoundRect(int16_t x,int16_t y,int16_t w,int16_t h,int16_t,uint16_t c){ fillRect(x,y,w,h,c); }
+  void drawRoundRect(int16_t x,int16_t y,int16_t w,int16_t h,int16_t,uint16_t c){ drawRect(x,y,w,h,c); }
   void drawRect(int16_t x,int16_t y,int16_t w,int16_t h,uint16_t c){ fillRect(x,y,w,1,c); fillRect(x,y+h-1,w,1,c); fillRect(x,y,1,h,c); fillRect(x+w-1,y,1,h,c); }
   int cx=0, cy=0, tsz=1; bool wrap=true;
   void setTextWrap(bool w){ wrap=w; } void setTextSize(int s){ tsz=s; } void setTextColor(uint16_t){} void setCursor(int x,int y){ cx=x; cy=y; }

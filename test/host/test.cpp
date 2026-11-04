@@ -838,6 +838,49 @@ int main(){
     g_nvs["config"].erase("cjk"); loadConfig(); CHECK(config.cjk);
     reset(); }
 
+  printf("T53 '+N' tile: a hidden channel's title shows its logo with '+N' on the frame corner\n");
+  { // the top left part of a tile (outside the badge) shows channel ch
+    auto tileTopIs = [](int slot, int ch){ uint16_t x,y; slotXY(slot,x,y); std::vector<uint16_t> expect(64*64);
+      if(channels[ch].logoSlot >= 0) readLogo(channels[ch].logoSlot, expect.data()); else { drawPlaceholder(channels[ch]); memcpy(expect.data(), pic_canvas.getBuffer(), 64*64*2); }
+      for(int j = 0; j < 44; j++) for(int i = 0; i < 64; i++) if(g_fb[y+j][x+i] != expect[j*64+i]) return false;
+      return true; };
+    auto badge = [](int& green, int& black){ uint16_t x,y; slotXY(PLUS_SLOT,x,y); green = black = 0;
+      for(int j = 50; j < 70; j++) for(int i = 30; i < 70; i++){ uint16_t v = g_fb[y+j][x+i]; if(v == ST77XX_GREEN) green++; if(v == 0) black++; } };
+    reset();
+    { std::vector<std::pair<int,std::string>> v; for(int k = 0; k < 10; k++) v.push_back({k, "Titel " + std::to_string(k)}); setResponse(v); }
+    loopWithUpdate();
+    CHECK(live_num == 10 && hiddenChannels() == 3);
+    while(!(isTitleDisplaying && channelTitleInfo.channel == &channels[8])) loopNoUpdate(1);   // channel 8 is behind "+3"
+    CHECK(titleOnPlusTile() && tileTopIs(PLUS_SLOT, 8) && frame(PLUS_SLOT) == ST77XX_GREEN && titleInRow(0));
+    { uint16_t x,y; slotXY(PLUS_SLOT,x,y); CHECK(g_fb[y+60][x+68] == ST77XX_GREEN && g_fb[y+51][x+60] == 0 && g_fb[y+60][x+69] == 0); }   // the badge and its outline, on the frame corner
+    int green, black; badge(green, black); CHECK(green > 300 && black > 40);    // green badge with black text and outline
+    redrawLiveChannelPics(1);                                                   // e.g. a Twitch update redraws the row
+    CHECK(tileTopIs(PLUS_SLOT, 8) && frame(PLUS_SLOT) == ST77XX_GREEN);
+    runUntilTitleDone();
+    { uint16_t x,y; slotXY(PLUS_SLOT,x,y); CHECK(!isTitleDisplaying || channelTitleInfo.channel != &channels[8]);
+      if(!isTitleDisplaying){ CHECK(g_fb[y+32][x+32] == 0x4321 && g_fb[y+66][x+66] == 0 && frame(PLUS_SLOT) == 0); } }   // "+3" again, badge gone
+    printf("    a visible channel's title: no badge; exactly 8 live: no '+N' at all\n");
+    while(!(isTitleDisplaying && channelTitleInfo.channel == &channels[5])) loopNoUpdate(1);   // in the row of the '+N' tile: title above
+    CHECK(!titleOnPlusTile());
+    { uint16_t x,y; slotXY(PLUS_SLOT,x,y); CHECK(g_fb[y+32][x+32] == 0x4321 && g_fb[y+66][x+66] == 0); }
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    reset();
+    { std::vector<std::pair<int,std::string>> v; for(int k = 0; k < 8; k++) v.push_back({k, "Titel " + std::to_string(k)}); setResponse(v); }
+    loopWithUpdate();
+    CHECK(hiddenChannels() == 0);
+    while(!(isTitleDisplaying && channelTitleInfo.channel == &channels[7])) loopNoUpdate(1);
+    CHECK(!titleOnPlusTile() && tileIsPic(7, 7));
+    { uint16_t x,y; slotXY(7,x,y); CHECK(g_fb[y+66][x+66] == ST77XX_GREEN); }   // plain frame corner
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    printf("    two digits: a wider badge, its right edge stays\n");
+    reset(); live_num = 20; channelTitleInfo.slot = 12; isTitleDisplaying = true; channelTitleInfo.channel = &channels[0];
+    { uint16_t x,y; slotXY(PLUS_SLOT,x,y); for(int j = 40; j < 72; j++) for(int i = 20; i < 72; i++) g_fb[y+j][x+i] = 0;
+      drawPlusBadge();
+      int left = 72;
+      for(int i = 20; i < 72; i++) if(g_fb[y+64][x+i] == ST77XX_GREEN){ left = i; break; }
+      CHECK(hiddenChannels() == 13 && left < 70 - 30 && g_fb[y+64][x+69] == 0 && g_fb[y+64][x+68] == ST77XX_GREEN); }
+    isTitleDisplaying = false; reset(); }
+
   printf("T23 new firmware confirmed only after 60 s online\n");
   appPendingVerify = true; g_otaState = ESP_OTA_IMG_PENDING_VERIFY; g_markedValid = 0; g_wifiUp = true;
   for(int i=0;i<3000;i++) loop();              // ~30 s

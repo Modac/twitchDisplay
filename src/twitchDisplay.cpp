@@ -1028,10 +1028,15 @@ bool storeEmoji(uint32_t key, const std::vector<uint8_t>& data){
 }
 
 // Green frame around the pic of the channel whose title is scrolling
+void drawPlusBadge();
+void drawPlusTile();
+bool titleOnPlusTile();
+
 void drawTitleIndicator(){
   uint16_t x, y;
   slotXY(channelTitleInfo.slot, x, y);
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_GREEN);
+  if(titleOnPlusTile()) drawPlusBadge();
 }
 
 uint32_t titleShowCount = 0;          // titles shown since boot
@@ -1217,7 +1222,8 @@ void startTitle(channelInfo* channel){
   titleXferUsSum = 0;
   titleDrawUsMax = 0;
   titleWaits = 0;
-  drawTitleIndicator();
+  if(titleOnPlusTile()) drawPlusTile();   // the hidden channel's logo, frame and badge
+  else drawTitleIndicator();
 }
 
 void stopTitle();
@@ -2275,20 +2281,85 @@ void drawPlaceholder(const channelInfo& channel){
   pic_canvas.print(label.c_str());
 }
 
-void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
-  channel.slotNum = pic_slot_index;
-  if(pic_slot_index<MAX_NUM_PICS){
-    DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
-    // downloaded logo, else placeholder
-    if(!(channel.logoSlot >= 0 && readLogo(channel.logoSlot, pic_canvas.getBuffer()))) drawPlaceholder(channel);
-  } else {
-    // more live channels than slots: the last slot shows how many are hidden
+// More live channels than tiles: the last tile stands for the 8th and all
+// further ones and shows how many are hidden ("+N"). While the title of one
+// of them scrolls, it shows that channel's logo with "+N" as a badge on the
+// corner of the green frame.
+#define PLUS_SLOT (MAX_NUM_PICS - 1)
+
+int hiddenChannels(){
+  return live_num > MAX_NUM_PICS ? live_num - PLUS_SLOT : 0;
+}
+
+bool titleOnPlusTile(){
+  return isTitleDisplaying && hiddenChannels() && channelTitleInfo.slot >= PLUS_SLOT;
+}
+
+// The channel's logo, else its placeholder, into pic_canvas
+void drawChannelImage(const channelInfo& channel){
+  if(!(channel.logoSlot >= 0 && readLogo(channel.logoSlot, pic_canvas.getBuffer()))) drawPlaceholder(channel);
+}
+
+// The "+N" tile, or the logo of the hidden channel whose title scrolls
+void drawPlusTile(){
+  if(titleOnPlusTile()) drawChannelImage(*channelTitleInfo.channel);
+  else {
     pic_canvas.fillScreen(ST77XX_BLACK);
     pic_canvas.setCursor(4, 14);
     pic_canvas.setTextColor(ST77XX_WHITE);
     pic_canvas.setTextSize(5);
-    pic_canvas.printf("+%d", pic_slot_index-(MAX_NUM_PICS-2));
+    pic_canvas.printf("+%d", hiddenChannels());
   }
+  uint16_t x, y;
+  slotXY(PLUS_SLOT, x, y);
+  tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
+  drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
+  if(titleOnPlusTile()) drawTitleIndicator();   // frame and badge
+}
+
+// "+N" on the bottom right corner of the green frame: green with a black
+// outline and black text, wider for two digits (right edge stays put)
+void drawPlusBadge(){
+  uint16_t x, y;
+  slotXY(PLUS_SLOT, x, y);
+  char text[8];
+  snprintf(text, sizeof(text), "+%d", hiddenChannels());
+  const float em = 15;
+  int textW = 0;
+  std::vector<uint32_t> cps;
+  for(const char* p = text; *p; p++) cps.push_back((uint8_t)*p);
+  if(titleFont.ready()) for(uint32_t c : cps) textW += titleFont.advance(c, em);
+  else textW = 12 * (int)cps.size();                 // built-in font, size 2
+  int bw = std::max(30, textW + 8), bh = 19;
+  int bx = x + PIC_SIZE + PIC_BORDER - 1 - bw, by = y + PIC_SIZE + PIC_BORDER - 1 - bh;
+  tft.fillRoundRect(bx, by, bw, bh, 4, ST77XX_GREEN);
+  tft.drawRoundRect(bx, by, bw, bh, 4, ST77XX_BLACK);
+  GFXcanvas16 label(bw - 4, bh - 4);
+  label.fillScreen(ST77XX_GREEN);
+  int lx = (label.width() - textW) / 2;
+  if(titleFont.ready()){
+    for(uint32_t c : cps){
+      GlyphBitmap g;
+      if(titleFont.render(c, em, g)) blitGlyph(label, g, lx, 12, ST77XX_BLACK);
+      lx += titleFont.advance(c, em);
+    }
+  } else {
+    label.setTextSize(2);
+    label.setTextColor(ST77XX_BLACK);
+    label.setCursor(lx, 0);
+    label.print(text);
+  }
+  tft.drawRGBBitmap(bx + 2, by + 2, label.getBuffer(), label.width(), label.height());
+}
+
+void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
+  channel.slotNum = pic_slot_index;
+  if(hiddenChannels() && pic_slot_index >= PLUS_SLOT){
+    drawPlusTile();
+    return;
+  }
+  DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
+  drawChannelImage(channel);   // downloaded logo, else placeholder
   uint16_t x, y;
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
