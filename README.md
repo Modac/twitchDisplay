@@ -1,8 +1,8 @@
 # twitchDisplay – PlatformIO
 
-ESP32-C3 firmware that shows which of a fixed list of Twitch channels are live
-on a 1.9" 170×320 ST7789 display. Live channels appear as 64×64 logos in a
-4×2 grid; title/game changes scroll across the display. The backlight is
+ESP32-C3 firmware that shows which of your Twitch channels are live on a 1.9"
+170×320 ST7789 display. Live channels appear with their Twitch avatar as 64×64
+logos in a 4×2 grid; title/game changes scroll across the display. The backlight is
 dimmed automatically via an LDR.
 
 ## Hardware
@@ -27,17 +27,18 @@ dimmed automatically via an LDR.
 | Path | Purpose |
 |------|---------|
 | `src/twitchDisplay.cpp` | Main firmware |
-| `include/pics.h` | 64×64 RGB565 channel logos (made with [image2cpp](https://javl.github.io/image2cpp/)) |
 | `include/secrets.h.example` | Template for the optional `include/secrets.h` (default settings) |
 | `include/web_pages.h` | HTML of the web interface |
 | `tools/version.py` | Build script that puts the git version into the firmware |
+| `tools/pngdec_fix.py` | Build script: leaves PNGdec's ESP32-S3-only file out of ESP32-C3 builds |
+| `lib/LogoImage/` | Converts a PNG avatar into a 64×64 logo (PNGdec + box filter) |
 | `.github/workflows/build.yml` | GitHub Action: builds the firmware, publishes releases for version tags |
 | `lib/Filters/` | `LowPass.h` and `MovingAverage.h` filters for the LDR reading |
 | `examples/apiTest/` | Twitch Helix / EventSub websocket test |
-| `examples/displayTest/` | Display and smooth text-scrolling test |
+| `examples/displayTest/` | Display and smooth text-scrolling test (with its own `pics.h`) |
 | `examples/ldrTest/` | LDR backlight dimming test |
 | `test/` | Reserved for unit tests (`pio test`) |
-| `C3_partition_minimalSPIFFS.csv` | Partition table with two OTA slots |
+| `C3_partition_minimalSPIFFS.csv` | Partition table with two OTA slots; the `spiffs` partition stores the channel logos |
 
 Each program has its own environment in `platformio.ini`:
 `twitchDisplay` builds `src/`, and `twitchDisplay_apiTest`,
@@ -84,6 +85,23 @@ default values that are used for settings never saved on the device. Only
 needed if you want a firmware that starts already configured; never publish a
 firmware built with it.
 
+## Channels and logos
+
+Enter the channels on the **Settings** page, one name per line (as in
+`twitch.tv/name`; pasted links work too), at most 16. They are shown in this
+order; up to 8 live channels get a tile, more are counted on a "+N" tile.
+Without a saved list the display uses the ten channels it always had.
+
+The display looks the channels up on Twitch at the start and once a day and
+downloads each channel's avatar (the 70×70 version, about 10 KB) only when it
+is new or has changed. It is converted to a 64×64 logo and kept in flash, so
+logos appear instantly after a restart. Until a logo is there, the tile shows
+the channel's initials on a coloured background.
+
+The **Status** page lists every channel with its live state and logo state
+(stored, downloading, or the error) and has a **Reload logos** button. Names
+Twitch does not know are shown on the Settings and Status pages.
+
 ## Status dot
 
 A small dot in the bottom right corner below the grid shows problems. The
@@ -108,7 +126,8 @@ log in as `admin` with your web password.
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
-- **Settings**: WiFi, Twitch credentials, web password, reset to defaults
+- **Settings**: WiFi, Twitch credentials, channel list, web password, reset
+  to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on
 probation" and only confirms itself after it has been online for 60 s. If it
