@@ -1508,7 +1508,10 @@ bool waitForDownloadSlot(){
 // Downloads the colour emoji of the live titles that are not cached yet
 // (network task), so a new title already shows them when it starts
 std::set<uint32_t> emojiMissing;   // not in Twemoji (404): not asked again until a restart
+extern std::set<uint32_t> cjkMissing;
+extern volatile bool cacheMissingReset;
 void fetchMissingEmoji(const std::vector<StreamInfo>& streams){
+  if(cacheMissingReset){ cacheMissingReset = false; emojiMissing.clear(); cjkMissing.clear(); }
   if(!config.colourEmoji || !emojiCacheReady) return;
   std::vector<std::string> names;
   for(const auto& stream : streams)
@@ -2763,6 +2766,13 @@ void handleStatus(){
   b += "<tr><td>Firmware</td><td>" FW_VERSION "</td></tr>";
   b += "<tr><td>Built</td><td>" __DATE__ " " __TIME__ "</td></tr>";
   b += String("<tr><td>Partition</td><td>") + (running ? running->label : "?") + ", " + otaStateName() + "</td></tr>";
+  if(running){
+    uint32_t app = ESP.getSketchSize();
+    b += "<tr><td>Firmware size</td><td>" + String((unsigned)(app / 1024)) + " KB of " + String((unsigned)(running->size / 1024)) + " KB ("
+         + String((unsigned)((uint64_t)app * 100 / running->size)) + " %)</td></tr>";
+  }
+  b += "<tr><td>Flash</td><td>" + String((unsigned)(ESP.getFlashChipSize() / (1024 * 1024))) + " MB</td></tr>";
+  b += "<tr><td>RAM</td><td>" + String((unsigned)(ESP.getHeapSize() / 1024)) + " KB heap</td></tr>";
   b += "<tr><td>Uptime</td><td>" + formatDuration(millis() / 1000) + "</td></tr>";
   b += "<tr><td>Font</td><td>";
   switch(fontState){
@@ -2791,6 +2801,8 @@ void handleStatus(){
          + String((unsigned)(used / 1024)) + " of " + String((unsigned)(cacheBytes / 1024)) + " KB";
   } else if(config.colourEmoji || config.cjk) b += " <span class=\"muted\">(needs font.bin)</span>";
   if(emojiError.length()) b += "<br><span class=\"err\">last problem: " + htmlEscape(emojiError.c_str()) + "</span>";
+  if(emojiCacheReady) b += "<form method=\"post\" action=\"/cache/clear\" onsubmit=\"return confirm('Clear the emoji/CJK cache? Everything is downloaded again when needed.')\">"
+                           "<p><button>Clear emoji/CJK cache</button></p></form>";
   b += "</td></tr>";
   if(!config.requireLogin) b += "<tr><td>Web login</td><td class=\"err\">off: anyone on the network can use this page</td></tr>";
   b += "<tr><td>WiFi</td><td>" + WiFi.SSID() + ", " + String(WiFi.RSSI()) + " dBm</td></tr>";
@@ -2838,6 +2850,27 @@ void handleLogoReload(){
   server.send(303, "text/plain", "");
 }
 
+// "Clear emoji/CJK cache": erases the cache sectors; emoji and CJK characters
+// are downloaded again when titles need them (also those that failed before)
+volatile bool cacheMissingReset = false;   // the network task forgets what it could not get
+void handleCacheClear(){
+  if(!checkAuth()) return;
+  if(emojiCacheReady){
+    xSemaphoreTake(emojiLock, portMAX_DELAY);
+    feedLoopWDT();
+    esp_partition_erase_range(fontPartition, emojiCacheStart, cacheBytes);   // a few seconds
+    feedLoopWDT();
+    cacheIndex.clear();
+    cacheWriteOffset = 0;
+    emojiError = "";
+    xSemaphoreGive(emojiLock);
+    cacheMissingReset = true;
+    DEBUG_I.printf("[Cache] Cleared.\n");
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 // "Show all titles": every live channel's title scrolls once more, in the
 // order of the channel list (after a title that is scrolling right now)
 void handleShowTitles(){
@@ -2871,6 +2904,7 @@ void setupWeb(){
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/logos/reload", HTTP_POST, handleLogoReload);
   server.on("/titles/show", HTTP_POST, handleShowTitles);
+  server.on("/cache/clear", HTTP_POST, handleCacheClear);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);

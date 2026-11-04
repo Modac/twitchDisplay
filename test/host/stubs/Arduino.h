@@ -79,7 +79,7 @@ struct SerialStub {
   size_t write(const uint8_t* b, size_t n){ for(size_t i = 0; i < n; i++) write(b[i]); return n; }
 };
 extern SerialStub Serial;
-struct EspStub { void restart(){ throw "restart"; } uint32_t getFreeHeap(){ return 200000; } uint32_t getMinFreeHeap(){ return 150000; } };
+struct EspStub { void restart(){ throw "restart"; } uint32_t getFreeHeap(){ return 200000; } uint32_t getHeapSize(){ return 290000; } uint32_t getSketchSize(){ return 1447904; } uint32_t getFlashChipSize(){ return 4194304; } uint32_t getMinFreeHeap(){ return 150000; } };
 extern EspStub ESP;
 #define PROGMEM
 

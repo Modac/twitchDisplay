@@ -544,6 +544,8 @@ int main(){
     runUntilTitleDone(); g_largestBlock = 61440;
     server.find("/", HTTP_GET)->fn();
     CHECK(contains(g_lastBody, "<tr><td>Font</td><td>Noto Sans (font.bin ") && !contains(g_lastBody, "built-in font"));
+    CHECK(contains(g_lastBody, "<tr><td>Firmware size</td><td>1413 KB of 1600 KB (88 %)</td></tr>") && contains(g_lastBody, "<tr><td>Flash</td><td>4 MB</td></tr>")
+          && contains(g_lastBody, "<tr><td>RAM</td><td>283 KB heap</td></tr>"));
     reset(); }
 
   printf("T50 font.bin missing or damaged: built-in font, then downloaded from the release\n");
@@ -766,6 +768,19 @@ int main(){
     printf("    updates wait for a piece download that uses the slot\n");
     cjkSlotBusy = true; unsigned long t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 >= 20000);   // gives up after 20 s
     cjkSlotBusy = false; t0 = g_millis; waitForCjkSlot(); CHECK(g_millis - t0 < 10);
+
+    printf("    clear the cache: erased, failed ones asked again\n");
+    { server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "action=\"/cache/clear\"") && contains(g_lastBody, "Clear emoji/CJK cache"));
+      CHECK(!cacheIndex.empty() && !cjkMissing.empty());
+      g_authOk = false; server.find("/cache/clear", HTTP_POST)->fn(); CHECK(g_lastCode == 401 && !cacheIndex.empty()); g_authOk = true;
+      server.find("/cache/clear", HTTP_POST)->fn();
+      CHECK(g_lastCode == 303 && cacheIndex.empty() && cacheWriteOffset == 0 && emojiError.isEmpty());
+      CHECK(std::all_of(g_fontData.begin() + emojiCacheStart, g_fontData.begin() + emojiCacheStart + cacheBytes, [](uint8_t b){ return b == 0xFF; }));
+      CHECK(std::equal(g_fontBin.begin(), g_fontBin.end(), g_fontData.begin()));          // font.bin untouched
+      openFont(); CHECK(fontState == FontState::Ready && cacheIndex.empty());
+      g_requests.clear(); setResponse({{0, "\xe4\xb8\x81"}}); twitchAnswer();            // 丁 was "in no font": looked up again
+      for(int k = 0; k < 3; k++) g_responses.push_back({200, css({{1, "U+3041"}})});
+      loopWithUpdate(); CHECK(cjkUrls().size() == 3 && !cacheMissingReset); runUntilTitleDone(); }
 
     printf("    downloads wait for a pause between titles and for enough RAM\n");
     { reset(); setResponse({{0, "Lang genug"}}); loopWithUpdate(); CHECK(isTitleDisplaying);   // a title scrolls
