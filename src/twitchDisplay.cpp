@@ -19,6 +19,7 @@
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 #include <DNSServer.h>
+#include <esp_rom_crc.h>
 
 #include <deque>
 #include <string>
@@ -257,6 +258,7 @@ struct channelInfo {
   std::string webTitle;     // "<title> | <game>" (UTF-8) for the web interface
   int8_t logoSlot = -1;     // slot of the downloaded logo in flash, -1 = none
   std::string login;        // Twitch login (channel name in the URL)
+  std::string logoStatus;   // for the status page: "stored", "downloading", error text, ...
 };
 
 #define MAX_CHANNELS 16
@@ -293,7 +295,22 @@ struct ChannelRef {
   bool found = false;    // Twitch knows this channel (set by fetchUsers())
 };
 
+#define LOGO_SLOTS      16
+#define LOGO_SLOT_BYTES (LOGO_SIZE*LOGO_SIZE*2)
+#define LOGO_NAMESPACE  "logos"
+
+struct LogoSlot {
+  std::string channelId; // empty: free
+  uint32_t urlHash = 0;  // CRC32 of the avatar URL the logo was made from
+};
+
+bool readLogo(int slot, uint16_t* pixels);
+bool writeLogo(int slot, const uint16_t* pixels);
+void loadLogoIndex(std::array<LogoSlot, LOGO_SLOTS>& index);
+void saveLogoIndexEntry(int slot, const LogoSlot& entry);
+
 std::vector<ChannelRef> netChannels;      // network task's copy of the channel list
+std::array<LogoSlot, LOGO_SLOTS> netLogoIndex; // network task's copy of the logo index
 std::vector<std::string> unknownChannels; // loop(): configured names Twitch does not know
 
 uint16_t live_num = 0;
@@ -315,12 +332,17 @@ struct LiveUpdate {
   std::vector<StreamInfo> streams;
 };
 
+#define LOGO_SLOT_UNCHANGED -2
+
 // Message from the network task to loop() (through updateQueue)
 struct NetMessage {
-  enum class Type { Live, Channels } type = Type::Live;
+  enum class Type { Live, Channels, Logo } type = Type::Live;
   LiveUpdate live;                  // Live: result of a stream update
   std::vector<ChannelRef> channels; // Channels: resolved list, same order as configured
   std::vector<std::string> unknown; // Channels: configured names Twitch does not know
+  std::string channelId;            // Logo: channel the logo belongs to
+  int logoSlot = LOGO_SLOT_UNCHANGED; // Logo: new slot, -1 = none (being rewritten)
+  std::string logoStatus;           // Logo: status text for the status page
 };
 
 TaskHandle_t netTask = nullptr;
@@ -432,7 +454,8 @@ void setup(void) {
 
   // Twitch requests run in their own task so they don't block scrolling;
   // results come back to loop() through updateQueue
-  updateQueue = xQueueCreate(4, sizeof(NetMessage*));
+  updateQueue = xQueueCreate(8, sizeof(NetMessage*));
+  loadLogoIndex(netLogoIndex);
   xTaskCreate(networkTask, "network", NET_TASK_STACK, nullptr, NET_TASK_PRIORITY, &netTask);
 
   DEBUG_I.printf("[%s] Setup completed...\n", DEBUG_TAG);
@@ -548,6 +571,7 @@ bool handleWiFi(){
 
 void applyLiveUpdate(const LiveUpdate& update);
 void applyChannels(const NetMessage& msg);
+void applyLogo(const NetMessage& msg);
 
 void restoreDisplay();
 void confirmFirmwareWhenStable(bool wifiConnected);
@@ -599,7 +623,8 @@ void loop(){
   NetMessage* msg;
   if(xQueueReceive(updateQueue, &msg, 0) == pdTRUE){
     if(msg->type == NetMessage::Type::Live) applyLiveUpdate(msg->live);
-    else applyChannels(*msg);
+    else if(msg->type == NetMessage::Type::Channels) applyChannels(*msg);
+    else applyLogo(*msg);
     delete msg;
   }
 
@@ -884,9 +909,128 @@ FetchResult fetchUsers(std::vector<ChannelRef>& refs){
 }
 
 void saveChannelCache(const std::vector<ChannelRef>& refs);
+void syncLogos(const std::vector<ChannelRef>& refs);
+
+// ---------- Channel logos (network task)
+
+#define LOGO_MAX_DOWNLOAD (48*1024) // the 70x70 avatars are about 10 KB
+
+volatile bool logoReloadRequested = false;     // "Reload logos" on the status page
+
+void sendLogoMessage(const std::string& channelId, int slot, const std::string& status){
+  NetMessage* msg = new NetMessage();
+  msg->type = NetMessage::Type::Logo;
+  msg->channelId = channelId;
+  msg->logoSlot = slot;
+  msg->logoStatus = status;
+  if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
+}
+
+// Twitch serves every avatar in several sizes; the 70x70 one is closest to the
+// 64x64 tiles ("...-300x300.png" -> "...-70x70.png", both URL formats)
+std::string smallAvatarUrl(const std::string& url){
+  size_t dot = url.find_last_of('.');
+  size_t pos = url.rfind("300x300");
+  if (dot != std::string::npos && pos != std::string::npos && pos + 7 == dot) return url.substr(0, pos) + "70x70" + url.substr(dot);
+  return url;
+}
+
+// Downloads a file of at most maxLen bytes. Returns an empty string or the error.
+String downloadToMemory(const std::string& url, std::vector<uint8_t>& data, size_t maxLen){
+  data.clear();
+  HTTPClient http;
+  http.begin(tlsClient, url.c_str());
+  http.setUserAgent("twitchDisplay/" FW_VERSION);
+  http.setTimeout(DOWNLOAD_TIMEOUT);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    String e = "download failed (" + (code <= 0 ? http.errorToString(code) : String(code)) + ")";
+    http.end();
+    return e;
+  }
+  int size = http.getSize();
+  if (size > (int)maxLen) { http.end(); return "image too large"; }
+  auto* stream = http.getStreamPtr();
+  size_t expected = size > 0 ? (size_t)size : maxLen;
+  data.reserve(expected);
+  uint8_t buf[512];
+  unsigned long lastData = millis();
+  while (data.size() < expected) {
+    size_t avail = stream->available();
+    if (avail == 0) {
+      if (size <= 0 && !http.connected()) break; // no length given: until the server closes
+      if (millis() - lastData > DOWNLOAD_TIMEOUT) { http.end(); return "download timed out"; }
+      delay(1);
+      continue;
+    }
+    size_t n = stream->readBytes(buf, std::min(std::min(avail, sizeof(buf)), expected - data.size()));
+    data.insert(data.end(), buf, buf + n);
+    lastData = millis();
+  }
+  http.end();
+  if (size > 0 && data.size() != (size_t)size) return "download incomplete";
+  return "";
+}
+
+// Downloads the logos that are missing or whose avatar changed. A slot is only
+// overwritten once the new logo is ready, so a failed download keeps the old one.
+void syncLogos(const std::vector<ChannelRef>& refs){
+  bool force = logoReloadRequested;
+  logoReloadRequested = false;
+  for (const auto& ref : refs) {
+    if (!ref.found || ref.avatarUrl.empty()) continue;
+    std::string url = smallAvatarUrl(ref.avatarUrl);
+    uint32_t hash = esp_rom_crc32_le(0, (const uint8_t*)url.data(), url.size());
+    int slot = -1;
+    for (int i = 0; i < LOGO_SLOTS; i++) if (netLogoIndex[i].channelId == ref.id) slot = i;
+    if (slot >= 0 && netLogoIndex[slot].urlHash == hash && !force) continue; // up to date
+    if (slot < 0) {
+      // a free slot, or one of a channel that is no longer in the list
+      for (int i = 0; i < LOGO_SLOTS && slot < 0; i++) {
+        const std::string& owner = netLogoIndex[i].channelId;
+        bool inUse = false;
+        for (const auto& r : refs) if (!owner.empty() && r.id == owner) inUse = true;
+        if (!inUse) slot = i;
+      }
+      if (slot < 0) continue; // cannot happen with at most LOGO_SLOTS channels
+    }
+
+    DEBUG_I.printf("[%s] Downloading logo of %s: %s\n", DEBUG_TAG, ref.login.c_str(), url.c_str());
+    sendLogoMessage(ref.id, LOGO_SLOT_UNCHANGED, "downloading");
+    std::vector<uint8_t> png;
+    String error = downloadToMemory(url, png, LOGO_MAX_DOWNLOAD);
+    std::vector<uint16_t> logo(LOGO_SIZE * LOGO_SIZE);
+    if (error.isEmpty()) {
+      const char* e = pngToLogo(png.data(), png.size(), logo.data());
+      if (e) error = e;
+    }
+    png.clear();
+    png.shrink_to_fit();
+    if (error.length()) {
+      DEBUG_W.printf("[%s] Logo of %s: %s\n", DEBUG_TAG, ref.login.c_str(), error.c_str());
+      sendLogoMessage(ref.id, LOGO_SLOT_UNCHANGED, error.c_str());
+      continue;
+    }
+
+    // loop() stops drawing from the slot before it is rewritten
+    sendLogoMessage(ref.id, -1, "updating");
+    if (!netLogoIndex[slot].channelId.empty() && netLogoIndex[slot].channelId != ref.id) sendLogoMessage(netLogoIndex[slot].channelId, -1, "");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    netLogoIndex[slot] = LogoSlot();
+    saveLogoIndexEntry(slot, netLogoIndex[slot]);
+    if (!writeLogo(slot, logo.data())) {
+      sendLogoMessage(ref.id, -1, "could not write flash");
+      continue;
+    }
+    netLogoIndex[slot].channelId = ref.id;
+    netLogoIndex[slot].urlHash = hash;
+    saveLogoIndexEntry(slot, netLogoIndex[slot]);
+    sendLogoMessage(ref.id, slot, "stored");
+  }
+}
 
 #define CHANNEL_SYNC_INTERVAL (24UL*60*60*1000) // look the channels up again once a day
-bool channelSyncRequested = true;               // first lookup right after the start
+volatile bool channelSyncRequested = true;      // first lookup right after the start
 unsigned long lastChannelSync = 0;
 
 // Resolves the channel list and hands it to loop(). False if it has to be retried.
@@ -911,6 +1055,7 @@ bool runChannelSync(){
   netChannels = refs;
   saveChannelCache(refs);
   if (xQueueSend(updateQueue, &msg, portMAX_DELAY) != pdTRUE) delete msg;
+  syncLogos(refs);
   return true;
 }
 
@@ -936,14 +1081,6 @@ void networkTask(void*){
 // fixed slots of the otherwise unused "spiffs" partition (128 KB = 16 slots).
 // An index in NVS says which channel and which avatar URL each slot holds; a
 // slot is only listed there after it has been written completely.
-#define LOGO_SLOTS      16
-#define LOGO_SLOT_BYTES (LOGO_SIZE*LOGO_SIZE*2)
-#define LOGO_NAMESPACE  "logos"
-
-struct LogoSlot {
-  std::string channelId; // empty: free
-  uint32_t urlHash = 0;  // CRC32 of the avatar URL the logo was made from
-};
 
 const esp_partition_t* logoPartition(){
   static const esp_partition_t* partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
@@ -1001,6 +1138,7 @@ void assignLogoSlots(){
   for(channelInfo& ch : channels){
     ch.logoSlot = -1;
     for(int i = 0; i < LOGO_SLOTS; i++) if(!ch.id.empty() && index[i].channelId == ch.id) ch.logoSlot = i;
+    if(ch.logoStatus.empty() || ch.logoStatus == "stored" || ch.logoStatus == "missing") ch.logoStatus = ch.logoSlot >= 0 ? "stored" : "missing";
   }
 }
 
@@ -1181,6 +1319,18 @@ void applyChannels(const NetMessage& msg){
   assignLogoSlots();
   // placeholders show the initials of the name; the title row is redrawn when the title ends
   if (!isTitleDisplaying) redrawLiveChannelPics();
+}
+
+// Takes over a logo state change from the network task
+void applyLogo(const NetMessage& msg){
+  channelInfo* ch = nullptr;
+  for (channelInfo& c : channels) if (!msg.channelId.empty() && c.id == msg.channelId) ch = &c;
+  if (!ch) return;
+  if (msg.logoStatus.length()) ch->logoStatus = msg.logoStatus;
+  if (msg.logoSlot == LOGO_SLOT_UNCHANGED || msg.logoSlot == ch->logoSlot) return;
+  ch->logoSlot = msg.logoSlot;
+  if (ch->isLive && !isTitleDisplaying) redrawLiveChannelPics(slotRow(ch->slotNum));
+  // during a title the tiles are redrawn when it ends
 }
 
 channelInfo* findChannel(const std::string& id){
@@ -1562,10 +1712,15 @@ void handleStatus(){
   for(const channelInfo& ch : channels){
     b += "<tr><td>" + htmlEscape(!ch.name.empty() ? ch.name : !ch.login.empty() ? ch.login : ch.id) + "</td><td>";
     if(ch.id.empty()) b += "<span class=\"err\">not found</span>";
-    else b += ch.isLive ? "<span class=\"ok\">live</span>" : "offline";
+    else {
+      b += ch.isLive ? "<span class=\"ok\">live</span>" : "offline";
+      bool logoOk = ch.logoStatus == "stored" || ch.logoStatus == "downloading" || ch.logoStatus == "updating";
+      b += String(" &middot; logo: <span class=\"") + (logoOk ? "muted" : "err") + "\">" + htmlEscape(ch.logoStatus) + "</span>";
+    }
     b += "</td></tr>";
   }
   b += "</table>";
+  b += "<form method=\"post\" action=\"/logos/reload\"><p><button>Reload logos</button></p></form>";
   if(!unknownChannels.empty()) b += "<p class=\"err\">Some channels are unknown to Twitch, see <a href=\"/settings\">Settings</a>.</p>";
   b += "</div>";
 
@@ -1609,6 +1764,15 @@ void handleUpdatePage(){
   sendPage("Update", body);
 }
 
+void handleLogoReload(){
+  if(!checkAuth()) return;
+  logoReloadRequested = true;
+  channelSyncRequested = true;
+  requestUpdate();
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 void handleReboot(){
   if(!checkAuth()) return;
   sendPage("Restart", "<div class=\"card\"><p>Restarting... <a href=\"/\">Reload</a> in a few seconds.</p></div>");
@@ -1627,6 +1791,7 @@ void setupWeb(){
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUploadDone, handleUploadChunk);
   server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/logos/reload", HTTP_POST, handleLogoReload);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);
