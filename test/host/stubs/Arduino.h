@@ -79,6 +79,7 @@ struct SerialStub {
   void begin(unsigned long){}
   size_t write(uint8_t c){ g_serialOut += (char)c; if(!g_quiet) putchar(c); return 1; }
   size_t write(const uint8_t* b, size_t n){ for(size_t i = 0; i < n; i++) write(b[i]); return n; }
+  void setTxTimeoutMs(uint32_t ms){ txTimeout = ms; } uint32_t txTimeout = 100;
 };
 extern SerialStub Serial;
 struct EspStub { void restart(){ throw "restart"; } uint32_t getFreeHeap(){ return 200000; } uint32_t getHeapSize(){ return 290000; } uint32_t getSketchSize(){ return 1447904; } uint32_t getFlashChipSize(){ return 4194304; } uint32_t getMinFreeHeap(){ return 150000; } };
