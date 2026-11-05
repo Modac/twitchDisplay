@@ -373,8 +373,12 @@ struct Config {
   bool requireLogin;   // web interface needs the password (off: anyone on the network may use it)
   bool colourEmoji;    // emoji in titles: colour images downloaded from Twemoji (false: monochrome only)
   bool cjk;            // Chinese/Japanese/Korean characters: rendered from downloaded font pieces (false: boxes)
-  bool statsInTitle;   // viewers and stream time after the scrolling title
-  bool statsOnLogos;   // viewers and stream time as small badges on the logos
+  bool viewersInTitle; // viewers after the scrolling title
+  bool timeInTitle;    // stream time after the scrolling title
+  bool viewersOnLogos; // viewers as a small badge on the logos (bottom left)
+  bool timeOnLogos;    // stream time as a small badge on the logos (bottom right)
+  bool statsInTitle() const { return viewersInTitle || timeInTitle; }
+  bool statsOnLogos() const { return viewersOnLogos || timeOnLogos; }
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -397,8 +401,12 @@ void loadConfig(){
   config.requireLogin = prefs.getString("login", "1") != "0";
   config.colourEmoji = prefs.getString("emoji", "colour") != "mono";
   config.cjk = prefs.getString("cjk", "on") != "off";
-  config.statsInTitle = prefs.getString("statstitle", "1") != "0";
-  config.statsOnLogos = prefs.getString("statslogos", "1") != "0";
+  // each defaults to the combined setting of v0.8.x (viewers and time together)
+  String inTitle = prefs.getString("statstitle", "1"), onLogos = prefs.getString("statslogos", "1");
+  config.viewersInTitle = prefs.getString("viewtitle", inTitle) != "0";
+  config.timeInTitle    = prefs.getString("timetitle", inTitle) != "0";
+  config.viewersOnLogos = prefs.getString("viewlogos", onLogos) != "0";
+  config.timeOnLogos    = prefs.getString("timelogos", onLogos) != "0";
   prefs.end();
 }
 
@@ -1297,7 +1305,7 @@ void startTitle(channelInfo* channel){
   channelTitleInfo.slot = channel->slotNum;
   xSemaphoreTake(titleLock, portMAX_DELAY);
   titleGeneration++;
-  layoutTitle(channel->streamTitle, config.statsInTitle ? streamStats(*channel) : std::string());
+  layoutTitle(channel->streamTitle, config.statsInTitle() ? streamStats(*channel) : std::string());
   memset(titleAlpha, 0, sizeof(titleAlpha));
   titleEmoji.clear();
   titleWhite.clear();
@@ -2471,7 +2479,7 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   }
   DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
   drawChannelImage(channel);   // downloaded logo, else placeholder
-  if(config.statsOnLogos) drawStatBadges(channel);
+  if(config.statsOnLogos()) drawStatBadges(channel);
   uint16_t x, y;
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
@@ -2517,8 +2525,8 @@ std::string formatUptimeShort(const channelInfo& ch){
 // "  ·  👥 845  ·  3h 12m" after the title (the busts drawn from the monochrome emoji font)
 std::string streamStats(const channelInfo& ch){
   std::string out;
-  if(ch.viewers >= 0) out += " \xc2\xb7 \xf0\x9f\x91\xa5 " + formatViewers(ch.viewers);
-  std::string up = formatUptime(ch);
+  if(config.viewersInTitle && ch.viewers >= 0) out += " \xc2\xb7 \xf0\x9f\x91\xa5 " + formatViewers(ch.viewers);
+  std::string up = config.timeInTitle ? formatUptime(ch) : std::string();
   if(!up.empty()) out += " \xc2\xb7 " + up;
   return out;
 }
@@ -2587,8 +2595,8 @@ void drawStatBadge(const std::string& text, bool right){
   }
 }
 void drawStatBadges(const channelInfo& ch){
-  if(ch.viewers >= 0) drawStatBadge(formatViewers(ch.viewers), false);
-  if(ch.uptime >= 0) drawStatBadge(formatUptimeShort(ch), true);
+  if(config.viewersOnLogos && ch.viewers >= 0) drawStatBadge(formatViewers(ch.viewers), false);
+  if(config.timeOnLogos && ch.uptime >= 0) drawStatBadge(formatUptimeShort(ch), true);
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
@@ -2806,8 +2814,8 @@ void applyLiveUpdate(const LiveUpdate& update){
     redrawLiveChannelPics();
   }
   static unsigned long lastBadgeMinute = 0;   // the stream time on the badges changes every minute
-  if(config.statsOnLogos && millis() - lastBadgeMinute >= 60000UL){ lastBadgeMinute = millis(); statsChanged = true; }
-  if(!layoutChanged && statsChanged && config.statsOnLogos){
+  if(config.timeOnLogos && millis() - lastBadgeMinute >= 60000UL){ lastBadgeMinute = millis(); statsChanged = true; }
+  if(!layoutChanged && statsChanged && config.statsOnLogos()){
     if(isTitleDisplaying){ redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
     else redrawLiveChannelPics();
   }
@@ -3581,13 +3589,17 @@ void sendSettingsPage(const String& message, bool isError){
     b += String("<label>Chinese, Japanese, Korean<select name=\"cjk\"><option value=\"on\"") + (cjk ? " selected" : "") + ">downloaded when a title needs them</option>"
          "<option value=\"off\"" + (cjk ? "" : " selected") + ">not shown (boxes)</option></select></label>";
     b += "<p class=\"hint\">Characters from Noto Sans JP, KR and SC (fontsource), downloaded once per character; a title with many new ones can take half a minute to start.</p>";
-    bool inTitle = server.hasArg("stats_form") ? server.hasArg("statstitle") : config.statsInTitle;
-    bool onLogos = server.hasArg("stats_form") ? server.hasArg("statslogos") : config.statsOnLogos;
-    b += String("<input type=\"hidden\" name=\"stats_form\" value=\"1\"><label class=\"check\"><input type=\"checkbox\" name=\"statstitle\" value=\"1\"")
-         + (inTitle ? " checked" : "") + ">Viewers and stream time after the title</label>";
-    b += String("<label class=\"check\"><input type=\"checkbox\" name=\"statslogos\" value=\"1\"") + (onLogos ? " checked" : "")
-         + ">Viewers and stream time on the logos</label>";
-    b += "<p class=\"hint\">After the title in white, e.g. \"&middot; &#x1F465; 845 &middot; 3h 12m\"; on the logos as two small badges, "
+    b += "<input type=\"hidden\" name=\"stats_form\" value=\"1\">";
+    static const struct { const char* name; bool Config::* field; const char* label; } stats[] = {
+      {"viewtitle", &Config::viewersInTitle, "Viewers after the title"},
+      {"timetitle", &Config::timeInTitle,    "Stream time after the title"},
+      {"viewlogos", &Config::viewersOnLogos, "Viewers on the logos"},
+      {"timelogos", &Config::timeOnLogos,    "Stream time on the logos"}};
+    for(const auto& st : stats){
+      bool on = server.hasArg("stats_form") ? server.hasArg(st.name) : config.*st.field;
+      b += String("<label class=\"check\"><input type=\"checkbox\" name=\"") + st.name + "\" value=\"1\"" + (on ? " checked" : "") + ">" + st.label + "</label>";
+    }
+    b += "<p class=\"hint\">After the title in white, e.g. \"&middot; &#x1F465; 845 &middot; 3h 12m\"; on the logos as small badges, "
          "viewers bottom left, stream time bottom right.</p>";
   }
   if(!unknownChannels.empty()){
@@ -3678,8 +3690,7 @@ void handleSettingsSave(){
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
   if(server.hasArg("stats_form")){
-    prefs.putString("statstitle", server.hasArg("statstitle") ? "1" : "0");
-    prefs.putString("statslogos", server.hasArg("statslogos") ? "1" : "0");
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
   }
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);

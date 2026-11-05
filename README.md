@@ -98,8 +98,8 @@ addition, after some minutes without a title (Settings, default 5, 0 = off)
 a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
 
-**Viewers and stream time** (both on by default, switchable on the Settings
-page): after the title in white, e.g. "· 👥 845 · 3h 12m" (the busts from the
+**Viewers and stream time** (all on by default; on the Settings page each can
+be switched off on its own, after the title and on the logos): after the title in white, e.g. "· 👥 845 · 3h 12m" (the busts from the
 monochrome emoji font), and as two small badges on each logo, viewers bottom
 left and stream time bottom right ("3:12", "40m"). They come with the normal
 Twitch update; the stream time is worked out from the stream's start and the

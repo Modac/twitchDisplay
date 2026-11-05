@@ -982,7 +982,7 @@ int main(){
   CHECK(parseIsoTime("2026-11-05T10:20:00Z") == 1793874000LL && parseHttpDate("Thu, 05 Nov 2026 13:32:30 GMT") == 1793885550LL);
   CHECK(parseIsoTime("") == -1 && parseIsoTime("2026-13-05T10:20:00Z") == -1 && parseHttpDate("garbage") == -1 && parseHttpDate("Thu, 05 Foo 2026 13:32:30 GMT") == -1);
   CHECK(formatViewers(845) == "845" && formatViewers(1234) == "1.2k" && formatViewers(27310) == "27k");
-  CHECK(config.statsInTitle && config.statsOnLogos);                              // on by default
+  CHECK(config.viewersInTitle && config.timeInTitle && config.viewersOnLogos && config.timeOnLogos);   // on by default
   { auto respond = [](){
       g_response = "{\"data\":[{\"user_id\":\"" + channels[0].id + "\",\"user_name\":\"A\",\"title\":\"t\",\"game_name\":\"g\",\"viewer_count\":845,\"started_at\":\"2026-11-05T10:20:00Z\"}]}";
       g_responseDate = "Thu, 05 Nov 2026 13:32:30 GMT"; };
@@ -1000,17 +1000,32 @@ int main(){
     CHECK(badgeWhite(false) > 10 && badgeWhite(true) > 10);                       // "845" bottom left, "3:12" bottom right
     CHECK(formatUptimeShort(channels[0]).substr(0, 3) == "3:1");
     printf("    switched off on the Settings page\n");
+    printf("    viewers and stream time each on their own\n");
+    g_args = {{"ssid","homewifi"},{"stats_form","1"},{"timetitle","1"},{"viewlogos","1"}};   // only the time after the title, only viewers on the logos
+    server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0;
+    CHECK(g_nvs["config"]["viewtitle"] == "0" && g_nvs["config"]["timetitle"] == "1" && g_nvs["config"]["viewlogos"] == "1" && g_nvs["config"]["timelogos"] == "0");
+    loadConfig(); CHECK(!config.viewersInTitle && config.timeInTitle && config.viewersOnLogos && !config.timeOnLogos);
+    CHECK(streamStats(channels[0]).find("\xf0\x9f\x91\xa5") == std::string::npos && contains(streamStats(channels[0]), "3h"));
+    redrawLiveChannelPics(); CHECK(badgeWhite(false) > 10 && badgeWhite(true) == 0);
+    g_args = {{"ssid","homewifi"},{"stats_form","1"},{"viewtitle","1"},{"timelogos","1"}};
+    server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0; loadConfig();
+    CHECK(streamStats(channels[0]) == " \xc2\xb7 \xf0\x9f\x91\xa5 845");
+    redrawLiveChannelPics(); CHECK(badgeWhite(false) == 0 && badgeWhite(true) > 10);
+    printf("    all off\n");
     g_args = {{"ssid","homewifi"},{"stats_form","1"}};
     server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0;
-    CHECK(g_nvs["config"]["statstitle"] == "0" && g_nvs["config"]["statslogos"] == "0");
-    loadConfig(); CHECK(!config.statsInTitle && !config.statsOnLogos);
+    loadConfig(); CHECK(!config.statsInTitle() && !config.statsOnLogos());
     reset(); respond(); loopWithUpdate();
     CHECK(isTitleDisplaying && titleText.whiteFrom == SIZE_MAX);
     while(isTitleDisplaying){ runUntilTitleDone(); loopNoUpdate(1); }
     CHECK(badgeWhite(false) == 0 && badgeWhite(true) == 0);
     g_authOk = true; server.find("/settings", HTTP_GET)->fn();
-    CHECK(contains(g_lastBody, "name=\"statstitle\" value=\"1\">") && contains(g_lastBody, "name=\"statslogos\" value=\"1\">"));   // unchecked
-    g_nvs["config"].erase("statstitle"); g_nvs["config"].erase("statslogos"); loadConfig();
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) CHECK(contains(g_lastBody, std::string("name=\"") + k + "\" value=\"1\">"));   // unchecked
+    printf("    the combined setting of v0.8.x is the default for both\n");
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) g_nvs["config"].erase(k);
+    g_nvs["config"]["statstitle"] = "0"; loadConfig();
+    CHECK(!config.viewersInTitle && !config.timeInTitle && config.viewersOnLogos && config.timeOnLogos);
+    g_nvs["config"].erase("statstitle"); loadConfig();
     g_responseDate = "";
   }
   reset(); g_responses.clear();   // (the SECRET variant's token answer is not needed by the next tests)
