@@ -91,6 +91,10 @@ firmware built with it.
 Enter the channels on the **Settings** page, one name per line (as in
 `twitch.tv/name`; pasted links work too), at most 32. They are shown in this
 order; up to 8 live channels get a tile, more are counted on a "+N" tile.
+The live channels can also be ordered by viewers or by stream time, most or
+fewest / longest or shortest first (Settings, *Order of the live channels*);
+then the smallest ones go behind "+N". The tiles move only between titles,
+never while one scrolls.
 Without a saved list the display uses the ten channels it always had.
 
 A channel's title scrolls when it goes live or changes its title or game. In
@@ -179,7 +183,8 @@ passwords stay hidden, uploads from PlatformIO still need the password).
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
-- **Settings**: WiFi, Twitch credentials, channel list, title repeat, viewers
+- **Settings**: WiFi, Twitch credentials, channel list, order of the live
+  channels, title repeat, viewers
   and stream time, "just went live" dot and frame, emoji,
   CJK characters, web password and login, reset to defaults
 

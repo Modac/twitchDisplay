@@ -1105,6 +1105,59 @@ int main(){
   reset(); g_responses.clear();
   for(auto& c : channels){ c.liveAt = 0; c.liveSpin = false; }
 
+  printf("T58 order of the live channels: list, viewers or stream time (up and down); tiles move only between titles\n");
+  { // channel k: viewers V[k] (-1: unknown), started S[k] minutes before the Date header
+    auto respond = [](std::vector<int> V, std::vector<int> S){
+      std::string j = "{\"data\":[";
+      for(size_t k = 0; k < V.size(); k++){
+        if(k) j += ",";
+        j += "{\"user_id\":\"" + channels[k].id + "\",\"user_name\":\"n" + std::to_string(k) + "\",\"title\":\"T" + std::to_string(k) + "\",\"game_name\":\"g\"";
+        if(V[k] >= 0) j += ",\"viewer_count\":" + std::to_string(V[k]);
+        char st[32]; int m = 12 * 60 - S[k]; snprintf(st, sizeof st, "2026-11-05T%02d:%02d:00Z", m / 60, m % 60);
+        j += std::string(",\"started_at\":\"") + st + "\"}";
+      }
+      g_response = j + "]}"; g_responseDate = "Thu, 05 Nov 2026 12:00:00 GMT"; };
+    auto order = [](){ std::vector<int> o(live_num, -1); for(size_t k = 0; k < channels.size(); k++) if(channels[k].isLive && channels[k].slotNum >= 0) o[channels[k].slotNum] = (int)k; return o; };
+    auto idle = [](){ while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); } };
+    auto setOrder = [](const char* key){ g_nvs["config"]["order"] = key; loadConfig(); };
+    const std::vector<int> V = {300, -1, 5000, 40, 300}, S = {90, 10, 200, 30, 5};
+    g_nvs["config"]["viewlogos"] = "0"; g_nvs["config"]["timelogos"] = "0";   // plain logos, to compare the tiles
+    reset(); setOrder("list"); respond(V, S); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({0, 1, 2, 3, 4}));
+    setOrder("viewers_desc"); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({2, 0, 4, 3, 1}));                         // ties in list order, unknown last
+    setOrder("viewers_asc"); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({3, 0, 4, 2, 1}));
+    setOrder("time_desc"); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({2, 0, 3, 1, 4}));
+    setOrder("time_asc"); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({4, 1, 3, 0, 2}));
+    for(int k = 0; k < 5; k++) CHECK(tileIsPic(channels[k].slotNum, k));   // the tiles show it
+    printf("    while a title scrolls the tiles stay; the new order follows when it ends\n");
+    setOrder("viewers_desc"); loopWithUpdate(); idle();
+    CHECK(order() == std::vector<int>({2, 0, 4, 3, 1}));
+    titleChangeQueue.push_back(&channels[3]); loopNoUpdate(1); CHECK(isTitleDisplaying);   // a title scrolls
+    respond({300, 9000, 5000, 40, 300}, S); loopWithUpdate();                    // channel 1 now has the most viewers
+    CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[3] && order() == std::vector<int>({2, 0, 4, 3, 1}));
+    runUntilTitleDone();
+    CHECK(!isTitleDisplaying && order() == std::vector<int>({1, 2, 0, 4, 3}) && tileIsPic(0, 1) && tileIsPic(4, 3));
+    printf("    more than 8 live: the lowest ones go behind \"+N\"\n");
+    std::vector<int> V10, S10; for(int k = 0; k < 10; k++){ V10.push_back(k * 100); S10.push_back(10); }
+    respond(V10, S10); loopWithUpdate(); idle();
+    CHECK(live_num == 10 && hiddenChannels() == 3 && channels[9].slotNum == 0 && channels[0].slotNum == 9);
+    printf("    Settings page\n");
+    g_authOk = true; server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "<option value=\"viewers_desc\" selected>most viewers first</option>") && contains(g_lastBody, "<option value=\"time_asc\">shortest stream first</option>"));
+    g_args = {{"ssid","homewifi"},{"order","time_desc"}}; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0;
+    CHECK(g_nvs["config"]["order"] == "time_desc");
+    g_args = {{"ssid","homewifi"},{"order","bogus"}}; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0;
+    CHECK(g_nvs["config"]["order"] == "time_desc");                             // unknown values are not stored
+    for(const char* k : {"order", "viewlogos", "timelogos"}) g_nvs["config"].erase(k);
+    loadConfig(); CHECK(config.liveOrder == ORDER_LIST);
+    g_responseDate = "";
+  }
+  reset(); g_responses.clear();
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";

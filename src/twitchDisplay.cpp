@@ -360,6 +360,12 @@ public:
 
 Display tft(TFT_CS, TFT_DC, TFT_RST);
 
+// Order of the live channels' tiles (setting); unknown numbers go last
+enum LiveOrder : uint8_t { ORDER_LIST, ORDER_VIEWERS_DESC, ORDER_VIEWERS_ASC, ORDER_TIME_DESC, ORDER_TIME_ASC, ORDER_COUNT };
+static const char* const LIVE_ORDER_KEYS[ORDER_COUNT] = {"list", "viewers_desc", "viewers_asc", "time_desc", "time_asc"};
+static const char* const LIVE_ORDER_NAMES[ORDER_COUNT] = {
+  "as in the channel list", "most viewers first", "fewest viewers first", "longest stream first", "shortest stream first"};
+
 // Settings, loaded once at boot; saving them restarts the display
 struct Config {
   String wifiSsid;
@@ -377,6 +383,7 @@ struct Config {
   bool timeInTitle;    // stream time after the scrolling title
   bool viewersOnLogos; // viewers as a small badge on the logos (bottom left)
   bool timeOnLogos;    // stream time as a small badge on the logos (bottom right)
+  uint8_t liveOrder;   // order of the live channels' tiles, LiveOrder
   bool liveDot;        // red dot on the logo for 10 minutes after a channel went live
   bool liveFrame;      // spinning red frame after a channel went live, until its title has scrolled
   bool statsInTitle() const { return viewersInTitle || timeInTitle; }
@@ -409,6 +416,9 @@ void loadConfig(){
   config.timeInTitle    = prefs.getString("timetitle", inTitle) != "0";
   config.viewersOnLogos = prefs.getString("viewlogos", onLogos) != "0";
   config.timeOnLogos    = prefs.getString("timelogos", onLogos) != "0";
+  config.liveOrder = ORDER_LIST;
+  { String order = prefs.getString("order", "list");
+    for(uint8_t i = 0; i < ORDER_COUNT; i++) if(order == LIVE_ORDER_KEYS[i]) config.liveOrder = i; }
   config.liveDot        = prefs.getString("livedot", "1") != "0";
   config.liveFrame      = prefs.getString("liveframe", "1") != "0";
   prefs.end();
@@ -436,6 +446,7 @@ void redrawLiveChannelPics(int8_t row = -1);
 struct channelInfo;
 std::string streamStats(const channelInfo& ch);
 void channelWentLive(channelInfo* ch);
+bool assignSlots();
 uint32_t liveUpdates = 0;    // Twitch results applied; the first one after boot finds channels live, not going live
 bool liveHighlight = true;   // dot and spinning frame for channels that just went live (the host tests switch it off)
 bool tileSpinning(int8_t slot);
@@ -1406,6 +1417,7 @@ void stopTitle(){
   titleGeneration++;
   xSemaphoreGive(titleLock);
   lastTitleEndAt = millis();
+  assignSlots();            // the order the tiles waited with while the title scrolled
   redrawLiveChannelPics();
 }
 
@@ -2750,15 +2762,35 @@ void checkLiveDots(){
 
 // Gives every live channel the next slot in list order and offline channels -1.
 // Returns true if any channel's slot changed.
+// Sorted by the setting (channel list order among equals and for unknown
+// numbers); while a title scrolls the tiles keep their places (new live
+// channels go after them) and the new order follows when it ends.
 bool assignSlots(){
-  bool changed = false;
-  int8_t next = 0;
-  for (channelInfo& channel : channels) {
-    int8_t slot = channel.isLive ? next++ : -1;
-    if(channel.slotNum != slot){
-      channel.slotNum = slot;
-      changed = true;
+  // a sort key per live channel (smaller first); stable: list order among equals
+  std::vector<std::pair<int64_t, channelInfo*>> keyed;
+  for (channelInfo& c : channels) {
+    if (!c.isLive) continue;
+    int64_t key = 0;
+    auto rank = [](int32_t v, bool desc){ return v < 0 ? INT64_MAX : desc ? -(int64_t)v : (int64_t)v; };   // unknown last
+    if (isTitleDisplaying) key = c.slotNum < 0 ? 127 : c.slotNum;
+    else switch (config.liveOrder) {
+      case ORDER_VIEWERS_DESC: key = rank(c.viewers, true); break;
+      case ORDER_VIEWERS_ASC:  key = rank(c.viewers, false); break;
+      case ORDER_TIME_DESC:    key = rank(c.uptime, true); break;
+      case ORDER_TIME_ASC:     key = rank(c.uptime, false); break;
+      default: break;
     }
+    keyed.push_back({key, &c});
+  }
+  std::stable_sort(keyed.begin(), keyed.end(), [](const std::pair<int64_t, channelInfo*>& a, const std::pair<int64_t, channelInfo*>& b){ return a.first < b.first; });
+  std::vector<channelInfo*> live;
+  for (auto& k : keyed) live.push_back(k.second);
+  bool changed = false;
+  for (channelInfo& channel : channels) if (!channel.isLive && channel.slotNum != -1) { channel.slotNum = -1; changed = true; }
+  int8_t next = 0;
+  for (channelInfo* channel : live) {
+    if (channel->slotNum != next) { channel->slotNum = next; changed = true; }
+    next++;
   }
   live_num = next;
   return changed;
@@ -3314,8 +3346,11 @@ void handleStatus(){
   b.reserve(2048);
   b += "<div class=\"card\"><h2>Live channels</h2>";
   int live = 0;
-  for(const channelInfo& ch : channels){
-    if(!ch.isLive) continue;
+  std::vector<const channelInfo*> shown(live_num, nullptr);   // in the order of the tiles
+  for(const channelInfo& ch : channels) if(ch.isLive && ch.slotNum >= 0 && ch.slotNum < (int)shown.size()) shown[ch.slotNum] = &ch;
+  shown.erase(std::remove(shown.begin(), shown.end(), nullptr), shown.end());
+  for(const channelInfo* chp : shown){
+    const channelInfo& ch = *chp;
     live++;
     b += "<p><b>" + htmlEscape(ch.name.empty() ? ch.id : ch.name) + "</b>";
     std::string stats;   // viewers and stream time (always shown here, whatever the display settings)
@@ -3773,6 +3808,13 @@ void sendSettingsPage(const String& message, bool isError){
     b += String("<label>Chinese, Japanese, Korean<select name=\"cjk\"><option value=\"on\"") + (cjk ? " selected" : "") + ">downloaded when a title needs them</option>"
          "<option value=\"off\"" + (cjk ? "" : " selected") + ">not shown (boxes)</option></select></label>";
     b += "<p class=\"hint\">Characters from Noto Sans JP, KR and SC (fontsource), downloaded once per character; a title with many new ones can take half a minute to start.</p>";
+    uint8_t order = config.liveOrder;
+    if(server.hasArg("order")) for(uint8_t i = 0; i < ORDER_COUNT; i++) if(server.arg("order") == LIVE_ORDER_KEYS[i]) order = i;
+    b += "<label>Order of the live channels<select name=\"order\">";
+    for(uint8_t i = 0; i < ORDER_COUNT; i++)
+      b += String("<option value=\"") + LIVE_ORDER_KEYS[i] + "\"" + (order == i ? " selected" : "") + ">" + LIVE_ORDER_NAMES[i] + "</option>";
+    b += "</select></label><p class=\"hint\">The first 7 get a tile when more than 8 are live, the rest are counted on the \"+N\" tile. "
+         "Viewers and stream time come with each Twitch update; the tiles move only between titles.</p>";
     b += "<input type=\"hidden\" name=\"stats_form\" value=\"1\">";
     static const struct { const char* name; bool Config::* field; const char* label; } stats[] = {
       {"viewtitle", &Config::viewersInTitle, "Viewers after the title"},
@@ -3875,6 +3917,9 @@ void handleSettingsSave(){
   if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
+  if(server.hasArg("order")){
+    for(uint8_t i = 0; i < ORDER_COUNT; i++) if(server.arg("order") == LIVE_ORDER_KEYS[i]) prefs.putString("order", LIVE_ORDER_KEYS[i]);
+  }
   if(server.hasArg("stats_form")){
     for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
   }
