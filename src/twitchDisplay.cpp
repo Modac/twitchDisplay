@@ -3317,7 +3317,13 @@ void handleStatus(){
   for(const channelInfo& ch : channels){
     if(!ch.isLive) continue;
     live++;
-    b += "<p><b>" + htmlEscape(ch.name.empty() ? ch.id : ch.name) + "</b><br><span class=\"muted\">" + htmlEscape(ch.webTitle) + "</span></p>";
+    b += "<p><b>" + htmlEscape(ch.name.empty() ? ch.id : ch.name) + "</b>";
+    std::string stats;   // viewers and stream time (always shown here, whatever the display settings)
+    if(ch.viewers >= 0) stats = "&#x1F465; " + std::to_string(ch.viewers) + (ch.viewers == 1 ? " viewer" : " viewers");
+    std::string up = formatUptime(ch);
+    if(!up.empty()) stats += (stats.empty() ? "" : " &middot; ") + up;
+    if(!stats.empty()) b += " <span class=\"muted\">" + String(stats.c_str()) + "</span>";
+    b += "<br><span class=\"muted\">" + htmlEscape(ch.webTitle) + "</span></p>";
   }
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";

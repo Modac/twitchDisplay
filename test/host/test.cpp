@@ -1002,6 +1002,8 @@ int main(){
     while(isTitleDisplaying){ runUntilTitleDone(); loopNoUpdate(1); }
     CHECK(badgeWhite(false) > 10 && badgeWhite(true) > 10);                       // "845" bottom left, "3:12" bottom right
     CHECK(formatUptimeShort(channels[0]).substr(0, 3) == "3:1");
+    g_authOk = true; server.find("/", HTTP_GET)->fn();                            // the Status page shows them too
+    CHECK(contains(g_lastBody, "<b>A</b> <span class=\"muted\">&#x1F465; 845 viewers &middot; 3h 12m</span><br>"));
     printf("    switched off on the Settings page\n");
     printf("    viewers and stream time each on their own\n");
     g_args = {{"ssid","homewifi"},{"stats_form","1"},{"timetitle","1"},{"viewlogos","1"}};   // only the time after the title, only viewers on the logos

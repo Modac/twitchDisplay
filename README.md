@@ -170,7 +170,7 @@ log in as `admin` with your web password. The login can be switched off on the
 Settings page; then anyone on your WiFi can use the web interface (stored
 passwords stay hidden, uploads from PlatformIO still need the password).
 
-- **Status**: live channels (with a button that scrolls all their titles once
+- **Status**: live channels with viewers and stream time (with a button that scrolls all their titles once
   more, *Stop titles*, which ends the scrolling title and drops the waiting
   ones, and *Simulate going live*), last Twitch update, firmware version, uptime, why it last restarted,
   the last crash (see below), WiFi, memory, restart button
