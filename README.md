@@ -162,7 +162,8 @@ Settings page; then anyone on your WiFi can use the web interface (stored
 passwords stay hidden, uploads from PlatformIO still need the password).
 
 - **Status**: live channels (with a button that scrolls all their titles once
-  more), last Twitch update, firmware version, uptime, why it last restarted,
+  more, and *Stop titles*, which ends the scrolling title and drops the waiting
+  ones), last Twitch update, firmware version, uptime, why it last restarted,
   the last crash (see below), WiFi, memory, restart button
 - **Update**: *Online update* checks the newest GitHub release and installs
   it with one click; or upload a `firmware.bin` from the browser (phone or PC). The

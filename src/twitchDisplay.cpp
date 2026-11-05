@@ -3157,6 +3157,12 @@ void handleStatus(){
   }
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
+  if(isTitleDisplaying || !titleChangeQueue.empty()){
+    unsigned waiting = titleChangeQueue.size();
+    b += "<form method=\"post\" action=\"/titles/stop\"><p><button>Stop titles</button> <span class=\"muted\">"
+         + String(isTitleDisplaying ? "1 scrolling" : "") + (isTitleDisplaying && waiting ? ", " : "")
+         + (waiting ? String(waiting) + " waiting" : String("")) + "</span></p></form>";
+  }
   b += "</div>";
   b += "<div class=\"card\"><h2>Channels</h2><table>";
   for(const channelInfo& ch : channels){
@@ -3394,6 +3400,16 @@ void handleShowTitles(){
   server.send(303, "text/plain", "");
 }
 
+// "Stop titles": ends the title that scrolls now and forgets the waiting ones
+// (they come again when a title changes, or with the title repeat)
+void handleStopTitles(){
+  if(!checkAuth()) return;
+  titleChangeQueue.clear();
+  if(isTitleDisplaying) stopTitle();   // redraws the tiles; the title repeat counts from now
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 void handleReboot(){
   if(!checkAuth()) return;
   sendPage("Restart", "<div class=\"card\"><p>Restarting... <a href=\"/\">Reload</a> in a few seconds.</p></div>");
@@ -3414,6 +3430,7 @@ void setupWeb(){
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/logos/reload", HTTP_POST, handleLogoReload);
   server.on("/titles/show", HTTP_POST, handleShowTitles);
+  server.on("/titles/stop", HTTP_POST, handleStopTitles);
   server.on("/cache/clear", HTTP_POST, handleCacheClear);
   server.on("/coredump", HTTP_GET, handleCoredumpDownload);
   server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);

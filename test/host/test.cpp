@@ -503,6 +503,15 @@ int main(){
     server.find("/titles/show", HTTP_POST)->fn(); loopNoUpdate(1); CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[0]);
     server.find("/titles/show", HTTP_POST)->fn();                             // pressed twice: no duplicates
     CHECK(titleChangeQueue.size() == 2 && titleChangeQueue[0] == &channels[2] && titleChangeQueue[1] == &channels[5]);
+    printf("    'Stop titles' ends the scrolling title and empties the queue\n");
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "action=\"/titles/stop\"><p><button>Stop titles</button> <span class=\"muted\">1 scrolling, 2 waiting"));
+    g_authOk = false; g_authChallenges = 0; server.find("/titles/stop", HTTP_POST)->fn();
+    CHECK(g_authChallenges == 1 && isTitleDisplaying && titleChangeQueue.size() == 2); g_authOk = true;
+    server.find("/titles/stop", HTTP_POST)->fn();
+    CHECK(g_lastCode == 303 && !isTitleDisplaying && titleChangeQueue.empty() && frame(0) == ST77XX_BLACK);
+    { uint16_t x, y; slotXY(channels[0].slotNum, x, y); CHECK(g_fb[y + 32][x + 32] != 0); }   // tiles drawn again over the title row
+    loopNoUpdate(50); CHECK(!isTitleDisplaying);                              // nothing comes after it
+    server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "/titles/stop"));   // nothing to stop: no button
     reset(); }
 
   printf("T49 fonts: code points, font.bin, glyphs, boxes\n");
