@@ -299,13 +299,19 @@ public:
   // stride wide, from column offsetX) through lut (wire byte order), with the
   // emoji on top. Column by column like drawColumnwise().
   void drawTitleColumns(int16_t x, int16_t y, const uint8_t* alpha, int16_t offsetX, int16_t w, int16_t h, int16_t stride,
-                        const uint16_t* lut, const EmojiDraw* emoji, int emojiCount){
+                        const uint16_t* lut, const EmojiDraw* emoji, int emojiCount,
+                        const uint16_t* lut2 = nullptr, const int* spans = nullptr, int spanCount = 0){
+    // canvas columns in [spans[2k], spans[2k+1]) use lut2 (viewers and stream time in white)
+    auto lutAt = [&](int cx) -> const uint16_t* {
+      for(int k = 0; k < spanCount; k++) if(cx >= spans[2 * k] && cx < spans[2 * k + 1]) return lut2;
+      return lut;
+    };
     auto pixel = [&](int cx, int j, const EmojiDraw* e) -> uint16_t {
       if(e && j >= e->top && j < e->top + e->size){
         uint8_t i = e->index[(cx - e->x) * e->size + (j - e->top)];
         if(i) return e->palette[i];
       }
-      return lut[alpha[j * stride + cx]];
+      return lutAt(cx)[alpha[j * stride + cx]];
     };
     auto emojiAt = [&](int cx) -> const EmojiDraw* {
       for(int k = 0; k < emojiCount; k++) if(cx >= emoji[k].x && cx < emoji[k].x + emoji[k].size) return &emoji[k];
@@ -335,8 +341,11 @@ public:
     for(int16_t i = w - 1; i >= 0; i--){
       int cx = offsetX + i;
       const EmojiDraw* e = emojiAt(cx);
+      const uint16_t* L = lutAt(cx);
+      const uint8_t* col = alpha + cx;
       for(int16_t j = 0; j < h; j++){
-        uint16_t p = pixel(cx, j, e);
+        uint16_t p = L[col[j * stride]];
+        if(e && j >= e->top && j < e->top + e->size){ uint8_t ix = e->index[(cx - e->x) * e->size + (j - e->top)]; if(ix) p = e->palette[ix]; }
         if(n & 1) piece[n >> 1] |= (uint32_t)p << 16; else piece[n >> 1] = p;
         if(++n == 32){ spiFastSend(piece, 64); n = 0; }
       }
@@ -364,6 +373,8 @@ struct Config {
   bool requireLogin;   // web interface needs the password (off: anyone on the network may use it)
   bool colourEmoji;    // emoji in titles: colour images downloaded from Twemoji (false: monochrome only)
   bool cjk;            // Chinese/Japanese/Korean characters: rendered from downloaded font pieces (false: boxes)
+  bool statsInTitle;   // viewers and stream time after the scrolling title
+  bool statsOnLogos;   // viewers and stream time as small badges on the logos
 
   const char* effectiveClientId() const { return clientId.length() ? clientId.c_str() : DEFAULT_CLIENT_ID; }
   bool hasTwitchCredentials() const { return clientSecret.length() || token.length(); }
@@ -386,6 +397,8 @@ void loadConfig(){
   config.requireLogin = prefs.getString("login", "1") != "0";
   config.colourEmoji = prefs.getString("emoji", "colour") != "mono";
   config.cjk = prefs.getString("cjk", "on") != "off";
+  config.statsInTitle = prefs.getString("statstitle", "1") != "0";
+  config.statsOnLogos = prefs.getString("statslogos", "1") != "0";
   prefs.end();
 }
 
@@ -408,6 +421,9 @@ uint16_t ldr;     // last raw LDR reading
 uint16_t ldr_avg; // averaged LDR reading used for the backlight
 
 void redrawLiveChannelPics(int8_t row = -1);
+struct channelInfo;
+std::string streamStats(const channelInfo& ch);
+void drawStatBadges(const channelInfo& ch, uint16_t x, uint16_t y);
 void setupOTA();
 void setupWeb();
 extern String crashInfo;
@@ -428,6 +444,49 @@ void buildChannels();
 void checkLogoPartition();
 void networkTask(void*);
 
+// ---------- Times from Twitch (for the stream time)
+
+static int64_t daysFromCivil(int y, unsigned m, unsigned d){
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+// Reads n digits at p (false if one is not a digit)
+static bool readNum(const char*& p, int n, int& out){
+  out = 0;
+  for(int i = 0; i < n; i++, p++){ if(*p < '0' || *p > '9') return false; out = out * 10 + (*p - '0'); }
+  return true;
+}
+static bool expect(const char*& p, char c){ return *p++ == c; }
+static int64_t toSeconds(int y, int mo, int d, int h, int mi, int se){
+  if(mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 60) return -1;
+  return daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+}
+// "2026-11-05T10:00:00Z" -> seconds since 1970 (-1: not a time)
+int64_t parseIsoTime(const char* p){
+  int y, mo, d, h, mi, se;
+  if(!p || !readNum(p, 4, y) || !expect(p, '-') || !readNum(p, 2, mo) || !expect(p, '-') || !readNum(p, 2, d) || !expect(p, 'T')
+     || !readNum(p, 2, h) || !expect(p, ':') || !readNum(p, 2, mi) || !expect(p, ':') || !readNum(p, 2, se)) return -1;
+  return toSeconds(y, mo, d, h, mi, se);
+}
+// "Thu, 05 Nov 2026 13:12:00 GMT" (the HTTP Date header) -> seconds since 1970 (-1: not a time)
+int64_t parseHttpDate(const char* p){
+  static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  if(!p || strlen(p) < 25 || p[3] != ',' || p[4] != ' ') return -1;
+  p += 5;
+  int d, y, h, mi, se, mo = 0;
+  if(!readNum(p, 2, d) || !expect(p, ' ')) return -1;
+  while(mo < 12 && strncmp(months + 3 * mo, p, 3)) mo++;
+  if(mo == 12) return -1;
+  p += 3;
+  if(!expect(p, ' ') || !readNum(p, 4, y) || !expect(p, ' ') || !readNum(p, 2, h) || !expect(p, ':') || !readNum(p, 2, mi)
+     || !expect(p, ':') || !readNum(p, 2, se)) return -1;
+  return toSeconds(y, mo + 1, d, h, mi, se);
+}
+
 struct channelInfo {
   std::string id;           // Twitch user id, empty until the name is resolved
   bool isLive = false;
@@ -439,6 +498,9 @@ struct channelInfo {
   std::string login;        // Twitch login (channel name in the URL)
   std::string logoStatus;   // for the status page: "stored", "downloading", error text, ...
   uint32_t titleShownSeq = 0; // when its title was shown last (titleShowCount then), 0 = never
+  int32_t viewers = -1;       // viewer count of the last update, -1 = unknown
+  int32_t uptime = -1;        // seconds since the stream started (at uptimeAt), -1 = unknown
+  unsigned long uptimeAt = 0;
 };
 
 #define MAX_CHANNELS 32
@@ -493,6 +555,8 @@ struct StreamInfo {
   std::string name;
   std::string title;  // "<title> | <game>" (UTF-8)
   std::string webTitle; // "<title> | <game>" in UTF-8
+  int32_t viewers = -1;
+  int32_t uptime = -1;  // seconds, from started_at and the response's Date
 };
 
 // Result of one Twitch update, handed from the network task to loop()
@@ -569,6 +633,7 @@ GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 #define CANVAS_W (TITLE_WIDTH + TITLE_MARGIN)
 uint8_t titleAlpha[PIC_SIZE * CANVAS_W];   // coverage of the title text (25 KB); colour emoji are drawn on top while sending
 uint16_t titleLut[256];                    // coverage -> RGB565 of the title colour on black, wire byte order
+uint16_t titleLutWhite[256];               // the same in white (viewers and stream time after the title)
 GFXcanvas1 builtinGlyph(BUILTIN_ADVANCE, PIC_SIZE);  // one character of the built-in font (render task)
 
 void setup(void) {
@@ -595,6 +660,8 @@ void setup(void) {
   for(int a = 0; a < 256; a++){
     uint16_t c = a == 255 ? TITLE_COLOR : (uint16_t)((((TITLE_COLOR >> 11) & 31) * a / 255) << 11 | (((TITLE_COLOR >> 5) & 63) * a / 255) << 5 | ((TITLE_COLOR & 31) * a / 255));
     titleLut[a] = (uint16_t)(c >> 8 | c << 8);
+    uint16_t wc = (uint16_t)((31 * a / 255) << 11 | (63 * a / 255) << 5 | (31 * a / 255));
+    titleLutWhite[a] = (uint16_t)(wc >> 8 | wc << 8);
   }
   builtinGlyph.setTextWrap(false);
   builtinGlyph.cp437(true); // without font.bin titles are converted to CP437, see toDisplayText()
@@ -704,7 +771,9 @@ struct TitleText {
   std::vector<uint32_t> cacheKey;  // cached colour emoji or CJK character to draw (0: draw chars[i] from the fonts)
   uint32_t width = 0;              // of the text, without the gap
   bool builtin = true;             // drawn with the built-in font
+  size_t whiteFrom = SIZE_MAX;     // characters from here on in white (viewers and stream time)
 } titleText;
+std::vector<std::pair<int, int>> titleWhite;   // canvas columns drawn in white (under titleLock)
 
 // Canvas state shared by loop() and the render task, under titleLock:
 // titleAlpha columns [o_X, o_X + TITLE_WIDTH) are visible, the next
@@ -1114,13 +1183,18 @@ void renderBuiltinGlyph(uint8_t c, GlyphBitmap& g){
 }
 
 // Lays out the title text: with font.bin as code points, else in CP437
-void layoutTitle(const std::string& utf8){
+void layoutTitle(const std::string& utf8, const std::string& extra = ""){
   titleText = TitleText();
   if(titleFont.ready()){
     titleText.builtin = false;
-    for(const TitleChar& c : titleChars(utf8.c_str())){
+    std::vector<TitleChar> tcs = titleChars(utf8.c_str());
+    size_t mainCount = tcs.size();
+    if(!extra.empty()){ auto more = titleChars(extra.c_str()); tcs.insert(tcs.end(), more.begin(), more.end()); }
+    for(size_t ci = 0; ci < tcs.size(); ci++){
+      const TitleChar& c = tcs[ci];
+      if(ci == mainCount && titleText.whiteFrom == SIZE_MAX) titleText.whiteFrom = titleText.chars.size();
       uint32_t key = 0;
-      if(!c.emoji.empty() && config.colourEmoji) key = emojiKey(c.emoji);
+      if(!c.emoji.empty() && config.colourEmoji && ci < mainCount) key = emojiKey(c.emoji);   // the stats' busts stay monochrome (white)
       else if(c.emoji.empty() && config.cjk && titleFont.sourceFor(c.cp) == TitleFont::NONE) key = glyphKey(c.cp);   // a downloaded CJK character?
       CacheIndexEntry cached;
       if(key && !cacheLookup(key, &cached)) key = 0;
@@ -1130,7 +1204,9 @@ void layoutTitle(const std::string& utf8){
       titleText.advance.push_back((uint16_t)(key ? cached.advance : titleFont.advance(c.cp, TITLE_EM)));
     }
   } else {
-    for(char c : toDisplayText(utf8.c_str())){
+    std::string text = toDisplayText(utf8.c_str());
+    if(!extra.empty()){ titleText.whiteFrom = text.size(); text += toDisplayText(extra.c_str()); }
+    for(char c : text){
       titleText.chars.push_back((uint8_t)c);
       titleText.cacheKey.push_back(0);
       titleText.advance.push_back(BUILTIN_ADVANCE);
@@ -1156,6 +1232,7 @@ bool renderAheadStep(){
   uint32_t c = gap ? 0 : titleText.chars[pos];
   uint32_t key = gap ? 0 : titleText.cacheKey[pos];
   bool builtin = titleText.builtin;
+  bool white = !gap && pos >= titleText.whiteFrom;
   int advance = done ? TITLE_WIDTH : gap ? TITLE_GAP : titleText.advance[pos];
   // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
   bool room = isTitleDisplaying && (gap ? titleNextX <= CANVAS_W : titleNextX + advance + 8 <= CANVAS_W);
@@ -1181,6 +1258,11 @@ bool renderAheadStep(){
     if(colour) titleEmoji.push_back({titleNextX + (advance - EMOJI_SIZE) / 2, cached.offset, cached.seq});   // centred in its advance
     else if(box) drawGlyphBox(titleNextX, advance);
     else if(!gap) blitTitleGlyph(glyph, titleNextX);
+    if(white){
+      int x0 = titleNextX - 2, x1 = titleNextX + advance + 4;
+      if(!titleWhite.empty() && titleWhite.back().second >= x0) titleWhite.back().second = std::max(titleWhite.back().second, x1);
+      else titleWhite.push_back({x0, x1});
+    }
     titleNextX += advance;
     titleNextItem = item + 1;
   }
@@ -1202,6 +1284,8 @@ void shiftTitleCanvas(int n){
     memset(row + CANVAS_W - n, 0, n);
   }
   for(auto& e : titleEmoji) e.x -= n;
+  for(auto& w : titleWhite){ w.first -= n; w.second -= n; }
+  titleWhite.erase(std::remove_if(titleWhite.begin(), titleWhite.end(), [](const std::pair<int, int>& w){ return w.second <= 0; }), titleWhite.end());
   titleEmoji.erase(std::remove_if(titleEmoji.begin(), titleEmoji.end(), [](const PlacedEmoji& e){ return e.x + EMOJI_SIZE <= 0; }), titleEmoji.end());
   titleNextX -= n;
   o_X -= n;
@@ -1213,9 +1297,10 @@ void startTitle(channelInfo* channel){
   channelTitleInfo.slot = channel->slotNum;
   xSemaphoreTake(titleLock, portMAX_DELAY);
   titleGeneration++;
-  layoutTitle(channel->streamTitle);
+  layoutTitle(channel->streamTitle, config.statsInTitle ? streamStats(*channel) : std::string());
   memset(titleAlpha, 0, sizeof(titleAlpha));
   titleEmoji.clear();
+  titleWhite.clear();
   titleNextItem = 0;
   titleNextX = TITLE_LEAD;
   o_X = 0;
@@ -1276,7 +1361,10 @@ void drawTitleFrame(){
     const uint16_t* palette; const uint8_t* index;
     if(cachedEmojiPixels(e.offset, e.seq, palette, index)) emoji[emojiCount++] = {e.x, EMOJI_TOP, EMOJI_SIZE, index, palette};
   }
-  tft.drawTitleColumns(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), titleAlpha, o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W, titleLut, emoji, emojiCount);
+  int white[8], whiteCount = 0;
+  for(const auto& w : titleWhite) if(whiteCount < 4 && w.first < o_X + TITLE_WIDTH && w.second > o_X){ white[2 * whiteCount] = w.first; white[2 * whiteCount + 1] = w.second; whiteCount++; }
+  tft.drawTitleColumns(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), titleAlpha, o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W, titleLut, emoji, emojiCount,
+                       titleLutWhite, white, whiteCount);
   xSemaphoreGive(titleLock);
   unsigned long drawUs = micros() - now;
   titleDrawUsSum += drawUs;
@@ -1572,8 +1660,11 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
   HTTPClient http;
   http.begin(tlsClient, url);
   commonHttpInit(http);
+  const char* dateHeader[] = {"Date"};
+  http.collectHeaders(dateHeader, 1);
   DEBUG_I.print("[HTTP] GET...\n");
   int httpCode = http.GET();
+  int64_t serverNow = httpCode == HTTP_CODE_OK ? parseHttpDate(http.header("Date").c_str()) : -1;
 
   if (httpCode != HTTP_CODE_OK) {
     DEBUG_W.printf(
@@ -1594,6 +1685,8 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
   stream["user_name"] = true;
   stream["title"] = true;
   stream["game_name"] = true;
+  stream["viewer_count"] = true;
+  stream["started_at"] = true;
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
@@ -1616,6 +1709,9 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
     info.name = stream["user_name"] | "";
     info.title = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
     info.webTitle = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
+    if(stream["viewer_count"].is<int>()) info.viewers = stream["viewer_count"].as<int>();
+    int64_t started = parseIsoTime(stream["started_at"] | "");
+    if(serverNow > 0 && started > 0 && serverNow >= started) info.uptime = (int32_t)(serverNow - started);
     update.streams.push_back(std::move(info));
   }
   return FetchResult::Ok;
@@ -2379,6 +2475,7 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
+  if(config.statsOnLogos) drawStatBadges(channel, x, y);
 }
 
 // Blanks a slot including its frame
@@ -2386,6 +2483,86 @@ void clearSlot(int8_t slot){
   uint16_t x, y;
   slotXY(slot, x, y);
   tft.fillRect(x-PIC_BORDER, y-PIC_BORDER, PIC_SIZE+2*PIC_BORDER, PIC_SIZE+2*PIC_BORDER, ST77XX_BLACK);
+}
+
+// ---------- Viewers and stream time: after the title (in white) and as two
+// small badges on the logo (viewers bottom left, stream time bottom right)
+
+std::string formatViewers(int32_t v){
+  char b[16];
+  if(v >= 10000) snprintf(b, sizeof(b), "%ldk", (long)((v + 500) / 1000));
+  else if(v >= 1000) snprintf(b, sizeof(b), "%ld.%ldk", (long)(v / 1000), (long)(v % 1000 / 100));
+  else snprintf(b, sizeof(b), "%ld", (long)(v < 0 ? 0 : v));
+  return b;
+}
+uint32_t streamSeconds(const channelInfo& ch){ return ch.uptime + (millis() - ch.uptimeAt) / 1000; }
+// "3h 12m" / "40m" after the title
+std::string formatUptime(const channelInfo& ch){
+  if(ch.uptime < 0) return "";
+  uint32_t sec = streamSeconds(ch);
+  char b[16];
+  if(sec >= 3600) snprintf(b, sizeof(b), "%luh %02lum", (unsigned long)(sec / 3600), (unsigned long)(sec / 60 % 60));
+  else snprintf(b, sizeof(b), "%lum", (unsigned long)(sec / 60));
+  return b;
+}
+// "3:12" / "40m" on the badge (narrow)
+std::string formatUptimeShort(const channelInfo& ch){
+  if(ch.uptime < 0) return "";
+  uint32_t sec = streamSeconds(ch);
+  char b[16];
+  if(sec >= 3600) snprintf(b, sizeof(b), "%lu:%02lu", (unsigned long)(sec / 3600), (unsigned long)(sec / 60 % 60));
+  else snprintf(b, sizeof(b), "%lum", (unsigned long)(sec / 60));
+  return b;
+}
+// "  ·  👥 845  ·  3h 12m" after the title (the busts drawn from the monochrome emoji font)
+std::string streamStats(const channelInfo& ch){
+  std::string out;
+  if(ch.viewers >= 0) out += " \xc2\xb7 \xf0\x9f\x91\xa5 " + formatViewers(ch.viewers);
+  std::string up = formatUptime(ch);
+  if(!up.empty()) out += " \xc2\xb7 " + up;
+  return out;
+}
+
+int smallTextWidth(const std::vector<uint32_t>& cps, float em){
+  int w = 0;
+  if(titleFont.ready()) for(uint32_t c : cps) w += titleFont.advance(c, em);
+  else w = 6 * (int)cps.size();
+  return w;
+}
+// Text into a canvas (built-in font without font.bin)
+void drawSmallText(GFXcanvas16& canvas, const std::vector<uint32_t>& cps, int x, int baseline, float em, uint16_t color){
+  if(titleFont.ready()){
+    for(uint32_t c : cps){
+      GlyphBitmap g;
+      if(titleFont.render(c, em, g)) blitGlyph(canvas, g, x, baseline, color);
+      x += titleFont.advance(c, em);
+    }
+  } else {
+    std::string t; for(uint32_t c : cps) t += c < 128 ? (char)c : '?';
+    canvas.setTextSize(1);
+    canvas.setTextColor(color);
+    canvas.setCursor(x, baseline - 7);
+    canvas.print(t.c_str());
+  }
+}
+
+#define STAT_BADGE_EM 11
+#define STAT_BADGE_H  14
+// A small dark badge with its bottom on the logo's bottom edge; right: x is its right edge
+void drawStatBadge(int x, int bottom, const std::string& text, bool right){
+  std::vector<uint32_t> cps;
+  for(char c : text) cps.push_back((uint8_t)c);
+  int textW = smallTextWidth(cps, STAT_BADGE_EM), bw = textW + 5;
+  int bx = right ? x - bw : x, by = bottom - STAT_BADGE_H;
+  GFXcanvas16 badge(bw, STAT_BADGE_H);
+  badge.fillScreen(ST77XX_BLACK);
+  drawSmallText(badge, cps, 3, 11, STAT_BADGE_EM, ST77XX_WHITE);
+  tft.drawRGBBitmap(bx, by, badge.getBuffer(), bw, STAT_BADGE_H);
+}
+void drawStatBadges(const channelInfo& ch, uint16_t x, uint16_t y){
+  if(hiddenChannels() && ch.slotNum >= PLUS_SLOT) return;   // behind "+N"
+  if(ch.viewers >= 0) drawStatBadge(x, y + PIC_SIZE, formatViewers(ch.viewers), false);
+  if(ch.uptime >= 0) drawStatBadge(x + PIC_SIZE, y + PIC_SIZE, formatUptimeShort(ch), true);
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
@@ -2551,6 +2728,7 @@ void applyLiveUpdate(const LiveUpdate& update){
   for (auto &&c : channels) {
     c.isLive = false;
   }
+  bool statsChanged = false;
 
   for (const StreamInfo& stream : update.streams) {
     channelInfo* ch = findChannel(stream.id);
@@ -2562,6 +2740,11 @@ void applyLiveUpdate(const LiveUpdate& update){
     ch->isLive = true;
     ch->name = stream.name;
     ch->webTitle = stream.webTitle;
+    if(ch->viewers != stream.viewers || (ch->uptime < 0) != (stream.uptime < 0)) statsChanged = true;
+    ch->viewers = stream.viewers;
+    ch->uptime = stream.uptime;
+    ch->uptimeAt = millis();
+
     if (ch->streamTitle != stream.title) {
       ch->streamTitle = stream.title;
       // queue channel for title display if not already in queue
@@ -2595,6 +2778,12 @@ void applyLiveUpdate(const LiveUpdate& update){
     }
   } else if(layoutChanged){
     redrawLiveChannelPics();
+  }
+  static unsigned long lastBadgeMinute = 0;   // the stream time on the badges changes every minute
+  if(config.statsOnLogos && millis() - lastBadgeMinute >= 60000UL){ lastBadgeMinute = millis(); statsChanged = true; }
+  if(!layoutChanged && statsChanged && config.statsOnLogos){
+    if(isTitleDisplaying){ redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
+    else redrawLiveChannelPics();
   }
 }
 
@@ -2943,7 +3132,6 @@ void handleStatus(){
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
   b += "</div>";
-
   b += "<div class=\"card\"><h2>Channels</h2><table>";
   for(const channelInfo& ch : channels){
     b += "<tr><td>" + htmlEscape(!ch.name.empty() ? ch.name : !ch.login.empty() ? ch.login : ch.id) + "</td><td>";
@@ -3350,6 +3538,14 @@ void sendSettingsPage(const String& message, bool isError){
     b += String("<label>Chinese, Japanese, Korean<select name=\"cjk\"><option value=\"on\"") + (cjk ? " selected" : "") + ">downloaded when a title needs them</option>"
          "<option value=\"off\"" + (cjk ? "" : " selected") + ">not shown (boxes)</option></select></label>";
     b += "<p class=\"hint\">Characters from Noto Sans JP, KR and SC (fontsource), downloaded once per character; a title with many new ones can take half a minute to start.</p>";
+    bool inTitle = server.hasArg("stats_form") ? server.hasArg("statstitle") : config.statsInTitle;
+    bool onLogos = server.hasArg("stats_form") ? server.hasArg("statslogos") : config.statsOnLogos;
+    b += String("<input type=\"hidden\" name=\"stats_form\" value=\"1\"><label class=\"check\"><input type=\"checkbox\" name=\"statstitle\" value=\"1\"")
+         + (inTitle ? " checked" : "") + ">Viewers and stream time after the title</label>";
+    b += String("<label class=\"check\"><input type=\"checkbox\" name=\"statslogos\" value=\"1\"") + (onLogos ? " checked" : "")
+         + ">Viewers and stream time on the logos</label>";
+    b += "<p class=\"hint\">After the title in white, e.g. \"&middot; &#x1F465; 845 &middot; 3h 12m\"; on the logos as two small badges, "
+         "viewers bottom left, stream time bottom right.</p>";
   }
   if(!unknownChannels.empty()){
     String names;
@@ -3438,6 +3634,10 @@ void handleSettingsSave(){
   if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
+  if(server.hasArg("stats_form")){
+    prefs.putString("statstitle", server.hasArg("statstitle") ? "1" : "0");
+    prefs.putString("statslogos", server.hasArg("statslogos") ? "1" : "0");
+  }
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back

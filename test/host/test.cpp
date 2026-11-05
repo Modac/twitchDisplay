@@ -969,6 +969,43 @@ int main(){
   server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "Last crash"));
   g_resetReason = ESP_RST_POWERON;
 
+  printf("T55 viewers and stream time: after the title (white, busts monochrome) and as badges on the logo, both switchable\n");
+  CHECK(parseIsoTime("2026-11-05T10:20:00Z") == 1793874000LL && parseHttpDate("Thu, 05 Nov 2026 13:32:30 GMT") == 1793885550LL);
+  CHECK(parseIsoTime("") == -1 && parseIsoTime("2026-13-05T10:20:00Z") == -1 && parseHttpDate("garbage") == -1 && parseHttpDate("Thu, 05 Foo 2026 13:32:30 GMT") == -1);
+  CHECK(formatViewers(845) == "845" && formatViewers(1234) == "1.2k" && formatViewers(27310) == "27k");
+  CHECK(config.statsInTitle && config.statsOnLogos);                              // on by default
+  { auto respond = [](){
+      g_response = "{\"data\":[{\"user_id\":\"" + channels[0].id + "\",\"user_name\":\"A\",\"title\":\"t\",\"game_name\":\"g\",\"viewer_count\":845,\"started_at\":\"2026-11-05T10:20:00Z\"}]}";
+      g_responseDate = "Thu, 05 Nov 2026 13:32:30 GMT"; };
+    auto badgeWhite = [](bool right){ uint16_t x, y; slotXY(channels[0].slotNum, x, y); int n = 0;
+      for(int j = PIC_SIZE - 14; j < PIC_SIZE; j++) for(int i = 0; i < 26; i++){ int px = right ? x + PIC_SIZE - 1 - i : x + i; if(g_fb[y + j][px] == ST77XX_WHITE) n++; }
+      return n; };
+    reset(); respond(); loopWithUpdate();
+    CHECK(channels[0].viewers == 845 && channels[0].uptime == 3 * 3600 + 12 * 60 + 30);
+    CHECK(streamStats(channels[0]) == " \xc2\xb7 \xf0\x9f\x91\xa5 845 \xc2\xb7 3h 12m");
+    CHECK(isTitleDisplaying && titleText.whiteFrom != SIZE_MAX);
+    { bool busts = false; for(size_t k = titleText.whiteFrom; k < titleText.chars.size(); k++) if(titleText.chars[k] == 0x1F465){ busts = true; CHECK(titleText.cacheKey[k] == 0); }
+      CHECK(busts && titleFont.sourceFor(0x1F465) == TitleFont::EMOJI); }   // in font.bin, never the colour image
+    { bool white = false; for(int k = 0; k < 3000 && isTitleDisplaying && !white; k++){ loopNoUpdate(1); white = !titleWhite.empty(); } CHECK(white); }
+    while(isTitleDisplaying){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(badgeWhite(false) > 10 && badgeWhite(true) > 10);                       // "845" bottom left, "3:12" bottom right
+    CHECK(formatUptimeShort(channels[0]).substr(0, 3) == "3:1");
+    printf("    switched off on the Settings page\n");
+    g_args = {{"ssid","homewifi"},{"stats_form","1"}};
+    server.find("/settings", HTTP_POST)->fn(); g_args.clear(); rebootAt = 0;
+    CHECK(g_nvs["config"]["statstitle"] == "0" && g_nvs["config"]["statslogos"] == "0");
+    loadConfig(); CHECK(!config.statsInTitle && !config.statsOnLogos);
+    reset(); respond(); loopWithUpdate();
+    CHECK(isTitleDisplaying && titleText.whiteFrom == SIZE_MAX);
+    while(isTitleDisplaying){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(badgeWhite(false) == 0 && badgeWhite(true) == 0);
+    g_authOk = true; server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "name=\"statstitle\" value=\"1\">") && contains(g_lastBody, "name=\"statslogos\" value=\"1\">"));   // unchecked
+    g_nvs["config"].erase("statstitle"); g_nvs["config"].erase("statslogos"); loadConfig();
+    g_responseDate = "";
+  }
+  reset(); g_responses.clear();   // (the SECRET variant's token answer is not needed by the next tests)
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";

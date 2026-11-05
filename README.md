@@ -98,6 +98,13 @@ addition, after some minutes without a title (Settings, default 5, 0 = off)
 a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
 
+**Viewers and stream time** (both on by default, switchable on the Settings
+page): after the title in white, e.g. "· 👥 845 · 3h 12m" (the busts from the
+monochrome emoji font), and as two small badges on each logo, viewers bottom
+left and stream time bottom right ("3:12", "40m"). They come with the normal
+Twitch update; the stream time is worked out from the stream's start and the
+time in Twitch's answer, so the display needs no clock.
+
 Titles are drawn in Noto Sans SemiBold: Latin with all its extensions
 (including Vietnamese), Greek, Cyrillic, Thai (vowel and tone marks without
 shaping, so stacked marks can overlap), typographic quotes and dashes.
@@ -162,7 +169,8 @@ passwords stay hidden, uploads from PlatformIO still need the password).
   file is checked before anything is written (ESP32-C3 application image, not
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
-- **Settings**: WiFi, Twitch credentials, channel list, title repeat, emoji,
+- **Settings**: WiFi, Twitch credentials, channel list, title repeat, viewers
+  and stream time, emoji,
   CJK characters, web password and login, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on

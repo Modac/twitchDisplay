@@ -17,6 +17,7 @@ struct FakeStream {
   size_t available(){ return std::min<size_t>(data.size() - pos, 700); } // arrives in pieces
   size_t readBytes(uint8_t* b, size_t n){ n = std::min(n, data.size() - pos); memcpy(b, data.data() + pos, n); pos += n; return n; }
 };
+inline std::string g_responseDate;
 struct HTTPClient {
   std::istringstream ss; FakeRequest req; bool ended=false; FakeStream fs; int size = -1;
   void begin(const String& u){ req.url=u; req.tls=false; }
@@ -34,5 +35,7 @@ struct HTTPClient {
   int POST(const char* b){ req.method="POST"; req.body=b; return respond(); }
   std::istream& getStream(){ return ss; }
   void end(){ ended=true; }
+  void collectHeaders(const char**, size_t){}
+  String header(const char* n){ return std::string(n) == "Date" ? String(g_responseDate.c_str()) : String(); }
   String errorToString(int){ return String("err"); }
 };
