@@ -2823,11 +2823,18 @@ static float sleepStarLevel(const SleepStar& st, float t){
 // Draws the sky (stars, moon, z's) inside a rectangle of the screen
 static std::vector<GlyphBitmap> sleepGlyphs;     // the z's of the current frame, rendered once
 static SleepRect sleepZRect(const SleepZ& z);
+#define SLEEP_MAX_CANVAS 8192   // bytes per drawing step (the heap has no large free blocks)
 static void sleepRender(SleepRect r, float t, const SleepZ* zs, int nz){
   r.x0 = std::max<int16_t>(r.x0, 0); r.y0 = std::max<int16_t>(r.y0, 0);
   r.x1 = std::min<int16_t>(r.x1, 320); r.y1 = std::min<int16_t>(r.y1, STATUS_Y - 1);   // not over the status dot row
   int w = r.x1 - r.x0, h = r.y1 - r.y0;
   if(w <= 0 || h <= 0) return;
+  int rows = SLEEP_MAX_CANVAS / (2 * w);
+  if(rows < h){   // too big for one canvas: in strips
+    if(rows < 1) rows = 1;
+    for(int y = r.y0; y < r.y1; y += rows) sleepRender({r.x0, (int16_t)y, r.x1, (int16_t)std::min<int>(y + rows, r.y1)}, t, zs, nz);
+    return;
+  }
   GFXcanvas16 c(w, h);
   uint16_t* buf = c.getBuffer();
   if(!buf) return;
@@ -2886,7 +2893,9 @@ static void sleepStart(){
     st.phase = (rnd() % 628) / 100.0f; st.speed = 0.15f + (rnd() % 25) / 100.0f;
   }
   tft.fillScreen(ST77XX_BLACK);
-  sleepRender({0, 0, 320, 170}, 0, nullptr, 0);
+  // the moon (the stars follow with the first frame)
+  sleepRender({(int16_t)(SLEEP_MOON_X - SLEEP_MOON_R - 2), (int16_t)(SLEEP_MOON_Y - SLEEP_MOON_R - 2),
+               (int16_t)(SLEEP_MOON_X + SLEEP_MOON_R + 3), (int16_t)(SLEEP_MOON_Y + SLEEP_MOON_R + 3)}, 0, nullptr, 0);
   if(statusColor != STATUS_OK) tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, statusColor);
   DEBUG_I.printf("[%s] Sleep animation on.\n", DEBUG_TAG);
 }
@@ -2980,7 +2989,7 @@ bool assignSlots(){
 // Draws the pics of all live channels at their assigned slot and blanks the
 // unused slots. With row >= 0 only that row is redrawn.
 void redrawLiveChannelPics(int8_t row){
-  if(sleepActive && !sleepPreviewUntil) return;   // the sleep animation ends on the next loop() and redraws everything
+  if(sleepActive) return;   // tiles are drawn again (with all changes) when the sleep animation ends
   for (channelInfo& channel : channels) {
     if(channel.isLive && (row < 0 || slotRow(channel.slotNum) == row)){
       drawLiveChannelPic(channel, channel.slotNum);

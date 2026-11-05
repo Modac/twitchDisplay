@@ -1,10 +1,11 @@
 #pragma once
 #include "Arduino.h"
 #include <vector>
+inline size_t g_maxCanvasBytes = 0;   // largest canvas allocated (the device has no big free blocks)
 class GFXcanvas16 {
   int16_t w,h; std::vector<uint16_t> buf;
 public:
-  GFXcanvas16(int16_t w,int16_t h):w(w),h(h),buf(w*h,0){}
+  GFXcanvas16(int16_t w,int16_t h):w(w),h(h),buf(w*h,0){ if((size_t)w*h*2 > g_maxCanvasBytes) g_maxCanvasBytes = (size_t)w*h*2; }
   void fillScreen(uint16_t c){ std::fill(buf.begin(),buf.end(),c); }
   int cy = 0, tsz = 1; std::string lastText;
   void setCursor(int16_t,int16_t y){ cy = y; } void setTextWrap(bool){} void setTextColor(uint16_t){} void setTextSize(uint8_t s){ tsz = s; } void cp437(bool=true){}

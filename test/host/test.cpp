@@ -1240,10 +1240,12 @@ int main(){
     reset(); setResponse({}); loopWithUpdate();
     CHECK(live_num == 0 && config.sleepAnim && config.sleepDark == 3800 && !sleepActive);
     darkFor(70000); CHECK(!sleepActive);                                       // light: nothing
+    g_maxCanvasBytes = 0;
     g_light = 4000; darkFor(3000);                                             // dark (the sensor value is averaged over 2 s)
     CHECK(sleepActive);                                                        // no channel live for over a minute already
     CHECK(moonLit());
     darkFor(4000); CHECK(zDrawn() > 20);                                       // z's rising
+    CHECK(g_maxCanvasBytes > 0 && g_maxCanvasBytes <= 8192);                   // drawn in small pieces (the device has no big free memory blocks)
     { uint16_t b = 0; for(int y = 0; y < 160; y++) for(int x = 0; x < 320; x++){ uint16_t c = g_fb[y][x]; if((c >> 11) > (b >> 11)) b = c; }
       CHECK((b >> 11) <= 18); }                                                // dim: no bright red/white
     printf("    a little brighter than the threshold keeps it (no flicker), clearly brighter ends it\n");
@@ -1269,6 +1271,19 @@ int main(){
     server.find("/sleep/show", HTTP_POST)->fn(); loopNoUpdate(1);
     CHECK(sleepActive && moonLit());                                          // in daylight, with the setting off
     darkFor(61000); CHECK(!sleepActive);
+    printf("    the test minute with live channels: no tiles over it; everything is drawn when it ends\n");
+    setResponse({{0, "Titel"}, {1, "Titel"}}); loopWithUpdate();
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    server.find("/sleep/show", HTTP_POST)->fn(); loopNoUpdate(1);
+    CHECK(sleepActive && moonLit());
+    setResponse({{0, "Titel"}, {1, "Titel"}, {2, "Titel neu"}}); loopWithUpdate(); loopNoUpdate(5);   // a new channel during the test minute
+    { uint16_t x, y; slotXY(2, x, y); CHECK(sleepActive && moonLit() && !tileIsPic(2, 2) && !isTitleDisplaying); }
+    darkFor(61000);
+    CHECK(!sleepActive && !moonLit());
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(live_num == 3);
+    for(int k = 0; k < 3; k++){ uint16_t x, y; slotXY(k, x, y); CHECK(g_fb[y + 2][x + 2] != 0); }   // all tiles there
+    setResponse({}); loopWithUpdate();
     printf("    the backup keeps both settings\n");
     g_args.clear(); server.find("/settings/backup", HTTP_GET)->fn();
     CHECK(contains(g_lastBody, "\"sleep\": false") && contains(g_lastBody, "\"sleepdark\": 3900"));
