@@ -299,13 +299,19 @@ public:
   // stride wide, from column offsetX) through lut (wire byte order), with the
   // emoji on top. Column by column like drawColumnwise().
   void drawTitleColumns(int16_t x, int16_t y, const uint8_t* alpha, int16_t offsetX, int16_t w, int16_t h, int16_t stride,
-                        const uint16_t* lut, const EmojiDraw* emoji, int emojiCount){
+                        const uint16_t* lut, const EmojiDraw* emoji, int emojiCount,
+                        const uint16_t* lut2 = nullptr, const int* spans = nullptr, int spanCount = 0){
+    // canvas columns in [spans[2k], spans[2k+1]) use lut2 (e.g. the viewer count in white)
+    auto lutAt = [&](int cx) -> const uint16_t* {
+      for(int k = 0; k < spanCount; k++) if(cx >= spans[2 * k] && cx < spans[2 * k + 1]) return lut2;
+      return lut;
+    };
     auto pixel = [&](int cx, int j, const EmojiDraw* e) -> uint16_t {
       if(e && j >= e->top && j < e->top + e->size){
         uint8_t i = e->index[(cx - e->x) * e->size + (j - e->top)];
         if(i) return e->palette[i];
       }
-      return lut[alpha[j * stride + cx]];
+      return lutAt(cx)[alpha[j * stride + cx]];
     };
     auto emojiAt = [&](int cx) -> const EmojiDraw* {
       for(int k = 0; k < emojiCount; k++) if(cx >= emoji[k].x && cx < emoji[k].x + emoji[k].size) return &emoji[k];
@@ -335,8 +341,11 @@ public:
     for(int16_t i = w - 1; i >= 0; i--){
       int cx = offsetX + i;
       const EmojiDraw* e = emojiAt(cx);
+      const uint16_t* L = lutAt(cx);
+      const uint8_t* col = alpha + cx;
       for(int16_t j = 0; j < h; j++){
-        uint16_t p = pixel(cx, j, e);
+        uint16_t p = L[col[j * stride]];
+        if(e && j >= e->top && j < e->top + e->size){ uint8_t ix = e->index[(cx - e->x) * e->size + (j - e->top)]; if(ix) p = e->palette[ix]; }
         if(n & 1) piece[n >> 1] |= (uint32_t)p << 16; else piece[n >> 1] = p;
         if(++n == 32){ spiFastSend(piece, 64); n = 0; }
       }
@@ -408,6 +417,17 @@ uint16_t ldr;     // last raw LDR reading
 uint16_t ldr_avg; // averaged LDR reading used for the backlight
 
 void redrawLiveChannelPics(int8_t row = -1);
+struct channelInfo;
+void channelWentLive(channelInfo* ch);
+void drawViewerLabels();
+void clearViewerLabels(int row);
+std::string viewerStats(const channelInfo& ch);
+void drawViewerBadge();
+void drawLiveMark(const channelInfo& ch, uint16_t x, uint16_t y);
+extern uint16_t statusColor;
+void drawTileExtras(channelInfo& ch, uint16_t x, uint16_t y);
+void serviceLiveHighlight();
+bool liveHighlightBusy();
 void setupOTA();
 void setupWeb();
 extern String crashInfo;
@@ -428,6 +448,42 @@ void buildChannels();
 void checkLogoPartition();
 void networkTask(void*);
 
+// ---------- Mock-up test: viewer count (V1-V4) and "just went live" (L1-L4)
+// variants, chosen on the Status page (stored in NVS "mock")
+uint8_t mockViewers = 0;   // 0 off, 1 end of the title, 2 under the tile, 3 badge on the logo, 4 badge while the title shows
+uint8_t mockLive = 0;      // 0 off, 1 LIVE badge, 2 red frame blinks, 3 "is live" in the title row, 4 red dot
+#define LIVE_BADGE_MS    (5 * 60000UL)
+#define LIVE_DOT_MS      (10 * 60000UL)
+#define LIVE_BLINK_MS    350
+#define LIVE_BLINKS      3
+#define LIVE_ANNOUNCE_MS 3000
+#define MOCK_RED         0xE104
+
+static int64_t daysFromCivil(int y, unsigned m, unsigned d){
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+// "2026-11-05T10:00:00Z" -> seconds since 1970 (-1: not a time)
+int64_t parseIsoTime(const char* s){
+  int y, mo, d, h, mi, se;
+  if(!s || sscanf(s, "%d-%d-%dT%d:%d:%d", &y, &mo, &d, &h, &mi, &se) != 6) return -1;
+  return daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+}
+// "Thu, 05 Nov 2026 13:12:00 GMT" -> seconds since 1970 (-1: not a time)
+int64_t parseHttpDate(const char* s){
+  char mon[4] = "";
+  int d, y, h, mi, se;
+  if(!s || sscanf(s, "%*3s, %d %3s %d %d:%d:%d", &d, mon, &y, &h, &mi, &se) != 6) return -1;
+  static const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* m = strstr(months, mon);
+  if(!m || strlen(mon) != 3 || (m - months) % 3) return -1;
+  return daysFromCivil(y, (unsigned)((m - months) / 3 + 1), d) * 86400 + h * 3600 + mi * 60 + se;
+}
+
 struct channelInfo {
   std::string id;           // Twitch user id, empty until the name is resolved
   bool isLive = false;
@@ -439,6 +495,10 @@ struct channelInfo {
   std::string login;        // Twitch login (channel name in the URL)
   std::string logoStatus;   // for the status page: "stored", "downloading", error text, ...
   uint32_t titleShownSeq = 0; // when its title was shown last (titleShowCount then), 0 = never
+  int32_t viewers = -1;       // viewer count of the last update, -1 = unknown
+  int32_t uptime = -1;        // seconds since the stream started (at uptimeAt), -1 = unknown
+  unsigned long uptimeAt = 0;
+  unsigned long liveAt = 0;   // millis() when it went live (0: live since boot, or highlight over)
 };
 
 #define MAX_CHANNELS 32
@@ -493,6 +553,8 @@ struct StreamInfo {
   std::string name;
   std::string title;  // "<title> | <game>" (UTF-8)
   std::string webTitle; // "<title> | <game>" in UTF-8
+  int32_t viewers = -1;
+  int32_t uptime = -1;  // seconds, from started_at and the response's Date
 };
 
 // Result of one Twitch update, handed from the network task to loop()
@@ -569,6 +631,7 @@ GFXcanvas16 pic_canvas(PIC_SIZE, PIC_SIZE);
 #define CANVAS_W (TITLE_WIDTH + TITLE_MARGIN)
 uint8_t titleAlpha[PIC_SIZE * CANVAS_W];   // coverage of the title text (25 KB); colour emoji are drawn on top while sending
 uint16_t titleLut[256];                    // coverage -> RGB565 of the title colour on black, wire byte order
+uint16_t titleLutWhite[256];               // the same in white (viewer count, mock-up V1)
 GFXcanvas1 builtinGlyph(BUILTIN_ADVANCE, PIC_SIZE);  // one character of the built-in font (render task)
 
 void setup(void) {
@@ -595,6 +658,8 @@ void setup(void) {
   for(int a = 0; a < 256; a++){
     uint16_t c = a == 255 ? TITLE_COLOR : (uint16_t)((((TITLE_COLOR >> 11) & 31) * a / 255) << 11 | (((TITLE_COLOR >> 5) & 63) * a / 255) << 5 | ((TITLE_COLOR & 31) * a / 255));
     titleLut[a] = (uint16_t)(c >> 8 | c << 8);
+    uint16_t wc = (uint16_t)((31 * a / 255) << 11 | (63 * a / 255) << 5 | (31 * a / 255));
+    titleLutWhite[a] = (uint16_t)(wc >> 8 | wc << 8);
   }
   builtinGlyph.setTextWrap(false);
   builtinGlyph.cp437(true); // without font.bin titles are converted to CP437, see toDisplayText()
@@ -617,6 +682,10 @@ void setup(void) {
   }
 
   loadConfig();
+  {
+    Preferences mock;
+    if(mock.begin("mock", true)){ mockViewers = mock.getUChar("v", 0); mockLive = mock.getUChar("l", 0); mock.end(); }
+  }
   twitchToken = config.token;
   buildChannels();
   checkLogoPartition();
@@ -704,7 +773,9 @@ struct TitleText {
   std::vector<uint32_t> cacheKey;  // cached colour emoji or CJK character to draw (0: draw chars[i] from the fonts)
   uint32_t width = 0;              // of the text, without the gap
   bool builtin = true;             // drawn with the built-in font
+  size_t whiteFrom = SIZE_MAX;     // characters from here on in white (viewer count, V1)
 } titleText;
+std::vector<std::pair<int, int>> titleWhite;   // canvas columns drawn in white (under titleLock)
 
 // Canvas state shared by loop() and the render task, under titleLock:
 // titleAlpha columns [o_X, o_X + TITLE_WIDTH) are visible, the next
@@ -1047,7 +1118,10 @@ void drawTitleIndicator(){
   uint16_t x, y;
   slotXY(channelTitleInfo.slot, x, y);
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_GREEN);
+  if(mockViewers == 2) tft.fillRect(x - PIC_BORDER, y + PIC_SIZE + PIC_BORDER, PIC_SIZE + 2 * PIC_BORDER, PIC_GAP - PIC_BORDER, ST77XX_BLACK);   // its number
   if(titleOnPlusTile()) drawPlusBadge();
+  if(mockViewers == 4) drawViewerBadge();
+  if(channelTitleInfo.channel && !titleOnPlusTile()) drawLiveMark(*channelTitleInfo.channel, x, y);
 }
 
 uint32_t titleShowCount = 0;          // titles shown since boot
@@ -1114,11 +1188,16 @@ void renderBuiltinGlyph(uint8_t c, GlyphBitmap& g){
 }
 
 // Lays out the title text: with font.bin as code points, else in CP437
-void layoutTitle(const std::string& utf8){
+void layoutTitle(const std::string& utf8, const std::string& extra = ""){
   titleText = TitleText();
   if(titleFont.ready()){
     titleText.builtin = false;
-    for(const TitleChar& c : titleChars(utf8.c_str())){
+    std::vector<TitleChar> tcs = titleChars(utf8.c_str());
+    size_t mainCount = tcs.size();
+    if(!extra.empty()){ auto more = titleChars(extra.c_str()); tcs.insert(tcs.end(), more.begin(), more.end()); }
+    for(size_t ci = 0; ci < tcs.size(); ci++){
+      const TitleChar& c = tcs[ci];
+      if(ci == mainCount && titleText.whiteFrom == SIZE_MAX) titleText.whiteFrom = titleText.chars.size();
       uint32_t key = 0;
       if(!c.emoji.empty() && config.colourEmoji) key = emojiKey(c.emoji);
       else if(c.emoji.empty() && config.cjk && titleFont.sourceFor(c.cp) == TitleFont::NONE) key = glyphKey(c.cp);   // a downloaded CJK character?
@@ -1130,7 +1209,9 @@ void layoutTitle(const std::string& utf8){
       titleText.advance.push_back((uint16_t)(key ? cached.advance : titleFont.advance(c.cp, TITLE_EM)));
     }
   } else {
-    for(char c : toDisplayText(utf8.c_str())){
+    std::string text = toDisplayText(utf8.c_str());
+    if(!extra.empty()){ titleText.whiteFrom = text.size(); text += toDisplayText(extra.c_str()); }
+    for(char c : text){
       titleText.chars.push_back((uint8_t)c);
       titleText.cacheKey.push_back(0);
       titleText.advance.push_back(BUILTIN_ADVANCE);
@@ -1156,6 +1237,7 @@ bool renderAheadStep(){
   uint32_t c = gap ? 0 : titleText.chars[pos];
   uint32_t key = gap ? 0 : titleText.cacheKey[pos];
   bool builtin = titleText.builtin;
+  bool white = !gap && pos >= titleText.whiteFrom;
   int advance = done ? TITLE_WIDTH : gap ? TITLE_GAP : titleText.advance[pos];
   // characters may reach a little past their advance; the gap has no pixels and only needs its start on the canvas
   bool room = isTitleDisplaying && (gap ? titleNextX <= CANVAS_W : titleNextX + advance + 8 <= CANVAS_W);
@@ -1181,6 +1263,11 @@ bool renderAheadStep(){
     if(colour) titleEmoji.push_back({titleNextX + (advance - EMOJI_SIZE) / 2, cached.offset, cached.seq});   // centred in its advance
     else if(box) drawGlyphBox(titleNextX, advance);
     else if(!gap) blitTitleGlyph(glyph, titleNextX);
+    if(white){
+      int x0 = titleNextX - 2, x1 = titleNextX + advance + 4;
+      if(!titleWhite.empty() && titleWhite.back().second >= x0) titleWhite.back().second = std::max(titleWhite.back().second, x1);
+      else titleWhite.push_back({x0, x1});
+    }
     titleNextX += advance;
     titleNextItem = item + 1;
   }
@@ -1202,6 +1289,8 @@ void shiftTitleCanvas(int n){
     memset(row + CANVAS_W - n, 0, n);
   }
   for(auto& e : titleEmoji) e.x -= n;
+  for(auto& w : titleWhite){ w.first -= n; w.second -= n; }
+  titleWhite.erase(std::remove_if(titleWhite.begin(), titleWhite.end(), [](const std::pair<int, int>& w){ return w.second <= 0; }), titleWhite.end());
   titleEmoji.erase(std::remove_if(titleEmoji.begin(), titleEmoji.end(), [](const PlacedEmoji& e){ return e.x + EMOJI_SIZE <= 0; }), titleEmoji.end());
   titleNextX -= n;
   o_X -= n;
@@ -1213,9 +1302,10 @@ void startTitle(channelInfo* channel){
   channelTitleInfo.slot = channel->slotNum;
   xSemaphoreTake(titleLock, portMAX_DELAY);
   titleGeneration++;
-  layoutTitle(channel->streamTitle);
+  layoutTitle(channel->streamTitle, mockViewers == 1 ? viewerStats(*channel) : std::string());
   memset(titleAlpha, 0, sizeof(titleAlpha));
   titleEmoji.clear();
+  titleWhite.clear();
   titleNextItem = 0;
   titleNextX = TITLE_LEAD;
   o_X = 0;
@@ -1233,6 +1323,7 @@ void startTitle(channelInfo* channel){
   titleXferUsSum = 0;
   titleDrawUsMax = 0;
   titleWaits = 0;
+  if(mockViewers == 2) clearViewerLabels(1 - slotRow(channelTitleInfo.slot));   // the title covers that row
   if(titleOnPlusTile()) drawPlusTile();   // the hidden channel's logo, frame and badge
   else drawTitleIndicator();
 }
@@ -1276,7 +1367,10 @@ void drawTitleFrame(){
     const uint16_t* palette; const uint8_t* index;
     if(cachedEmojiPixels(e.offset, e.seq, palette, index)) emoji[emojiCount++] = {e.x, EMOJI_TOP, EMOJI_SIZE, index, palette};
   }
-  tft.drawTitleColumns(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), titleAlpha, o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W, titleLut, emoji, emojiCount);
+  int white[8], whiteCount = 0;
+  for(const auto& w : titleWhite) if(whiteCount < 4 && w.first < o_X + TITLE_WIDTH && w.second > o_X){ white[2 * whiteCount] = w.first; white[2 * whiteCount + 1] = w.second; whiteCount++; }
+  tft.drawTitleColumns(GRID_X0, rowY(1-slotRow(channelTitleInfo.slot)), titleAlpha, o_X, TITLE_WIDTH, PIC_SIZE, CANVAS_W, titleLut, emoji, emojiCount,
+                       titleLutWhite, white, whiteCount);
   xSemaphoreGive(titleLock);
   unsigned long drawUs = micros() - now;
   titleDrawUsSum += drawUs;
@@ -1418,13 +1512,14 @@ void loop(){
     delete msg;
   }
 
-  while(!isTitleDisplaying && !titleChangeQueue.empty()) {
+  serviceLiveHighlight();
+  while(!isTitleDisplaying && !liveHighlightBusy() && !titleChangeQueue.empty()) {
     channelInfo* next = titleChangeQueue.front();
     titleChangeQueue.pop_front();
     // channel may have gone offline while it was queued
     if(next->isLive) startTitle(next);
   }
-  if(!isTitleDisplaying) repeatTitleWhenDue();
+  if(!isTitleDisplaying && !liveHighlightBusy()) repeatTitleWhenDue();
   if(isTitleDisplaying && (long)(micros() - nextFrameUs) >= 0) drawTitleFrame();
 
 #ifdef DEBUG_UDP_LDR
@@ -1572,8 +1667,11 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
   HTTPClient http;
   http.begin(tlsClient, url);
   commonHttpInit(http);
+  const char* dateHeader[] = {"Date"};
+  http.collectHeaders(dateHeader, 1);
   DEBUG_I.print("[HTTP] GET...\n");
   int httpCode = http.GET();
+  int64_t serverNow = httpCode == HTTP_CODE_OK ? parseHttpDate(http.header("Date").c_str()) : -1;
 
   if (httpCode != HTTP_CODE_OK) {
     DEBUG_W.printf(
@@ -1594,6 +1692,8 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
   stream["user_name"] = true;
   stream["title"] = true;
   stream["game_name"] = true;
+  stream["viewer_count"] = true;
+  stream["started_at"] = true;
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
@@ -1616,6 +1716,9 @@ FetchResult fetchLiveChannels(LiveUpdate& update){
     info.name = stream["user_name"] | "";
     info.title = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
     info.webTitle = std::string(stream["title"] | "") + " | " + (stream["game_name"] | "");
+    if(stream["viewer_count"].is<int>()) info.viewers = stream["viewer_count"].as<int>();
+    int64_t started = parseIsoTime(stream["started_at"] | "");
+    if(serverNow > 0 && started > 0 && serverNow >= started) info.uptime = (int32_t)(serverNow - started);
     update.streams.push_back(std::move(info));
   }
   return FetchResult::Ok;
@@ -2379,13 +2482,234 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
+  drawTileExtras(channel, x, y);
 }
 
 // Blanks a slot including its frame
 void clearSlot(int8_t slot){
   uint16_t x, y;
   slotXY(slot, x, y);
-  tft.fillRect(x-PIC_BORDER, y-PIC_BORDER, PIC_SIZE+2*PIC_BORDER, PIC_SIZE+2*PIC_BORDER, ST77XX_BLACK);
+  tft.fillRect(x-PIC_BORDER, y-PIC_BORDER, PIC_SIZE+2*PIC_BORDER, PIC_SIZE+2*PIC_BORDER + (mockViewers == 2 ? PIC_GAP - PIC_BORDER : 0), ST77XX_BLACK);
+}
+
+// ---------- Mock-up test: drawing of the variants
+
+std::string formatViewers(int32_t v){
+  char b[16];
+  if(v >= 10000) snprintf(b, sizeof(b), "%ldk", (long)((v + 500) / 1000));
+  else if(v >= 1000) snprintf(b, sizeof(b), "%ld.%ldk", (long)(v / 1000), (long)(v % 1000 / 100));
+  else snprintf(b, sizeof(b), "%ld", (long)(v < 0 ? 0 : v));
+  return b;
+}
+std::string formatUptime(const channelInfo& ch){
+  if(ch.uptime < 0) return "";
+  uint32_t sec = ch.uptime + (millis() - ch.uptimeAt) / 1000;
+  char b[16];
+  if(sec >= 3600) snprintf(b, sizeof(b), "%luh %02lum", (unsigned long)(sec / 3600), (unsigned long)(sec / 60 % 60));
+  else snprintf(b, sizeof(b), "%lum", (unsigned long)(sec / 60));
+  return b;
+}
+// V1: " · 845 viewers · 3h 12m" after the title
+std::string viewerStats(const channelInfo& ch){
+  if(ch.viewers < 0) return "";
+  std::string out = std::string(" \xc2\xb7 ") + formatViewers(ch.viewers) + (ch.viewers == 1 ? " viewer" : " viewers");
+  std::string up = formatUptime(ch);
+  if(!up.empty()) out += " \xc2\xb7 " + up;
+  return out;
+}
+
+int smallTextWidth(const std::vector<uint32_t>& cps, float em){
+  int w = 0;
+  if(titleFont.ready()) for(uint32_t c : cps) w += titleFont.advance(c, em);
+  else w = 6 * (int)cps.size();
+  return w;
+}
+// Text into a canvas (built-in font without font.bin)
+void drawSmallText(GFXcanvas16& canvas, const std::vector<uint32_t>& cps, int x, int baseline, float em, uint16_t color){
+  if(titleFont.ready()){
+    for(uint32_t c : cps){
+      GlyphBitmap g;
+      if(titleFont.render(c, em, g)) blitGlyph(canvas, g, x, baseline, color);
+      x += titleFont.advance(c, em);
+    }
+  } else {
+    canvas.setTextSize(1);
+    canvas.setTextColor(color);
+    canvas.setCursor(x, baseline - 7);
+    std::string t; for(uint32_t c : cps) t += c < 128 ? (char)c : '?';
+    canvas.print(t.c_str());
+  }
+}
+std::vector<uint32_t> asciiCps(const std::string& s){ std::vector<uint32_t> v; for(char c : s) v.push_back((uint8_t)c); return v; }
+
+int badgeWidth(const std::string& text, float em){ return smallTextWidth(asciiCps(text), em) + 8; }
+// A rounded badge with its top left corner at bx/by, em + 4 pixels high
+void drawBadge(int bx, int by, const std::string& text, float em, uint16_t bg, uint16_t fg, bool outline){
+  auto cps = asciiCps(text);
+  int textW = smallTextWidth(cps, em), bw = textW + 8, bh = (int)em + 4;
+  tft.fillRoundRect(bx, by, bw, bh, 4, bg);
+  if(outline) tft.drawRoundRect(bx, by, bw, bh, 4, ST77XX_BLACK);
+  GFXcanvas16 label(bw - 4, bh - 4);
+  label.fillScreen(bg);
+  drawSmallText(label, cps, (label.width() - textW) / 2, (int)lroundf(em * 0.8f), em, fg);
+  tft.drawRGBBitmap(bx + 2, by + 2, label.getBuffer(), label.width(), label.height());
+}
+
+bool channelHidden(const channelInfo& ch){ return hiddenChannels() && ch.slotNum >= PLUS_SLOT; }
+channelInfo* liveShowing = nullptr;      // L2/L3: the channel whose highlight runs now
+
+// L1, L4: on a tile (again after its frame is drawn)
+void drawLiveMark(const channelInfo& ch, uint16_t x, uint16_t y){
+  if(!ch.liveAt || channelHidden(ch)) return;
+  if(mockLive == 1) drawBadge(x - 3, y - 3, "LIVE", 12, MOCK_RED, ST77XX_WHITE, true);
+  if(mockLive == 4){
+    tft.fillCircle(x + PIC_SIZE - 9, y + 8, 6, ST77XX_BLACK);
+    tft.fillCircle(x + PIC_SIZE - 9, y + 8, 5, MOCK_RED);
+  }
+}
+
+// V3, L1, L4: on a tile
+void drawTileExtras(channelInfo& ch, uint16_t x, uint16_t y){
+  if(channelHidden(ch)) return;
+  if(mockViewers == 3 && ch.viewers >= 0) drawBadge(x + 1, y + PIC_SIZE - 1 - 16, formatViewers(ch.viewers), 12, ST77XX_BLACK, ST77XX_WHITE, false);
+  drawLiveMark(ch, x, y);
+}
+
+// V2: the numbers under the tiles (not under the title row, the framed or blinking tile)
+void clearViewerLabels(int row){
+  tft.fillRect(GRID_X0 - PIC_BORDER, rowY(row) + PIC_SIZE + 1, TITLE_WIDTH + 2 * PIC_BORDER, PIC_GAP - 1, ST77XX_BLACK);
+  if(statusColor != STATUS_OK) tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, statusColor);   // the status dot is in that strip
+}
+void drawViewerLabels(){
+  if(mockViewers != 2) return;
+  for(channelInfo& ch : channels){
+    if(!ch.isLive || ch.slotNum < 0 || channelHidden(ch) || ch.viewers < 0 || &ch == liveShowing) continue;
+    if(isTitleDisplaying && (slotRow(ch.slotNum) != slotRow(channelTitleInfo.slot) || ch.slotNum == channelTitleInfo.slot)) continue;
+    uint16_t x, y;
+    slotXY(ch.slotNum, x, y);
+    auto cps = asciiCps(formatViewers(ch.viewers));
+    GFXcanvas16 label(PIC_SIZE, 12);
+    label.fillScreen(ST77XX_BLACK);
+    drawSmallText(label, cps, (PIC_SIZE - smallTextWidth(cps, 12)) / 2, 10, 12, 0xAD55);   // grey
+    tft.drawRGBBitmap(x, y + PIC_SIZE + 2, label.getBuffer(), label.width(), label.height());
+  }
+}
+
+// V4: green badge on the bottom left corner of the frame while the title shows
+void drawViewerBadge(){
+  channelInfo* ch = channelTitleInfo.channel;
+  if(!ch || ch->viewers < 0) return;
+  uint16_t x, y;
+  slotXY(channelTitleInfo.slot, x, y);
+  drawBadge(x - PIC_BORDER, y + PIC_SIZE + PIC_BORDER - 1 - 19, formatViewers(ch->viewers), 15, ST77XX_GREEN, ST77XX_BLACK, true);
+}
+
+// ---------- Mock-up test: "just went live"
+std::deque<channelInfo*> liveQueue;      // L2/L3: waiting for their highlight
+unsigned long liveShowStart = 0;
+int liveShowPhase = -1;
+
+int highlightSlot(const channelInfo& ch){ return channelHidden(ch) ? PLUS_SLOT : ch.slotNum; }
+
+void redrawTiles(){
+  if(!isTitleDisplaying) redrawLiveChannelPics();
+  else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
+}
+
+void channelWentLive(channelInfo* ch){
+  ch->liveAt = millis() ? millis() : 1;
+  DEBUG_I.printf("[%s] %s went live.\n", DEBUG_TAG, ch->name.c_str());
+  if(!mockLive) return;
+  // its title comes next
+  titleChangeQueue.erase(std::remove(titleChangeQueue.begin(), titleChangeQueue.end(), ch), titleChangeQueue.end());
+  if(hasTitleText(ch->streamTitle)) titleChangeQueue.push_front(ch);
+  if((mockLive == 2 || mockLive == 3) && std::find(liveQueue.begin(), liveQueue.end(), ch) == liveQueue.end()) liveQueue.push_back(ch);
+}
+
+bool liveHighlightBusy(){ return liveShowing != nullptr || !liveQueue.empty(); }
+
+// L3: "● <name> is live" in the row the title will scroll over
+void drawAnnouncement(channelInfo& ch, int slot){
+  int row = 1 - slotRow(slot);
+  int y0 = rowY(row);
+  tft.fillRect(GRID_X0 - PIC_BORDER, y0 - PIC_BORDER, TITLE_WIDTH + 2 * PIC_BORDER, PIC_SIZE + 2 * PIC_BORDER, ST77XX_BLACK);
+  if(mockViewers == 2) clearViewerLabels(row);
+  tft.fillCircle(GRID_X0 + 9, y0 + TITLE_BASELINE - 14, 8, MOCK_RED);
+  std::vector<uint32_t> cps = titleCodepoints((ch.name.empty() ? ch.id : ch.name).c_str());
+  for(uint32_t c : asciiCps(" is live")) cps.push_back(c);
+  int x = GRID_X0 + 26, avail = GRID_X0 + TITLE_WIDTH - x;
+  float em = 40;
+  int w = smallTextWidth(cps, em);
+  if(w > avail) em = std::max(22.0f, em * avail / w * 0.95f);
+  if(!titleFont.ready()){
+    tft.setTextSize(3); tft.setTextColor(ST77XX_WHITE); tft.setCursor(x, y0 + 22);
+    std::string t; for(uint32_t c : cps) t += c < 128 ? (char)c : '?';
+    tft.print(t.c_str());
+    return;
+  }
+  for(uint32_t c : cps){
+    int adv = titleFont.advance(c, em);
+    if(x + adv > GRID_X0 + TITLE_WIDTH) break;
+    GlyphBitmap g;
+    if(titleFont.render(c, em, g, TITLE_BASELINE, PIC_SIZE - TITLE_BASELINE) && g.w > 0 && g.h > 0){
+      GFXcanvas16 glyph(g.w, g.h);
+      glyph.fillScreen(ST77XX_BLACK);
+      blitGlyph(glyph, g, -g.xoff, -g.yoff, ST77XX_WHITE);
+      tft.drawRGBBitmap(x + g.xoff, y0 + TITLE_BASELINE + g.yoff, glyph.getBuffer(), g.w, g.h);
+    }
+    x += adv;
+  }
+}
+
+void finishLiveHighlight(){
+  channelInfo* ch = liveShowing;
+  liveShowing = nullptr;
+  if(ch && ch->isLive && hasTitleText(ch->streamTitle)){
+    titleChangeQueue.erase(std::remove(titleChangeQueue.begin(), titleChangeQueue.end(), ch), titleChangeQueue.end());
+    titleChangeQueue.push_front(ch);   // loop() starts it right away (it draws the green frame over the red one)
+    if(mockLive == 2){ uint16_t x, y; slotXY(highlightSlot(*ch), x, y); drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK); }
+  } else redrawLiveChannelPics();
+}
+
+void serviceLiveHighlight(){
+  static unsigned long lastCheck = 0;
+  if(millis() - lastCheck >= 1000){   // L1/L4 end after a few minutes
+    lastCheck = millis();
+    bool redraw = false;
+    for(auto& c : channels) if(c.liveAt && millis() - c.liveAt > (mockLive == 4 ? LIVE_DOT_MS : LIVE_BADGE_MS)){
+      c.liveAt = 0;
+      redraw |= mockLive == 1 || mockLive == 4;
+    }
+    if(redraw) redrawTiles();
+  }
+  if(isTitleDisplaying) return;
+  if(!liveShowing){
+    while(!liveQueue.empty() && (!liveQueue.front()->isLive || liveQueue.front()->slotNum < 0)) liveQueue.pop_front();
+    if(liveQueue.empty()) return;
+    liveShowing = liveQueue.front();
+    liveQueue.pop_front();
+    liveShowStart = millis();
+    liveShowPhase = -1;
+    if(mockLive == 3){
+      int slot = highlightSlot(*liveShowing);
+      uint16_t x, y; slotXY(slot, x, y);
+      drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, MOCK_RED);
+      drawAnnouncement(*liveShowing, slot);
+    }
+  }
+  if(!liveShowing->isLive || liveShowing->slotNum < 0){ finishLiveHighlight(); return; }
+  unsigned long t = millis() - liveShowStart;
+  if(mockLive == 2){
+    int phase = t / LIVE_BLINK_MS;
+    if(phase >= 2 * LIVE_BLINKS){ finishLiveHighlight(); return; }
+    if(phase != liveShowPhase){
+      liveShowPhase = phase;
+      uint16_t x, y; slotXY(highlightSlot(*liveShowing), x, y);
+      drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, phase % 2 == 0 ? MOCK_RED : ST77XX_BLACK);
+    }
+  } else if(mockLive == 3){
+    if(t >= LIVE_ANNOUNCE_MS) finishLiveHighlight();
+  } else finishLiveHighlight();   // the variant was changed meanwhile
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
@@ -2415,6 +2739,7 @@ void redrawLiveChannelPics(int8_t row){
   for (int8_t slot = live_num; slot < MAX_NUM_PICS; slot++){
     if(row < 0 || slotRow(slot) == row) clearSlot(slot);
   }
+  drawViewerLabels();
 }
 
 // ---------- Channel list
@@ -2548,9 +2873,14 @@ void applyLiveUpdate(const LiveUpdate& update){
   setStatus(STATUS_OK);
 
   // slotNum is kept so assignSlots() can detect layout changes
+  std::vector<bool> wasLive;
   for (auto &&c : channels) {
+    wasLive.push_back(c.isLive);
     c.isLive = false;
   }
+  static uint32_t liveUpdates = 0;   // the first update after boot finds channels live, not going live
+  std::vector<channelInfo*> wentLive;
+  bool viewersChanged = false;
 
   for (const StreamInfo& stream : update.streams) {
     channelInfo* ch = findChannel(stream.id);
@@ -2562,6 +2892,11 @@ void applyLiveUpdate(const LiveUpdate& update){
     ch->isLive = true;
     ch->name = stream.name;
     ch->webTitle = stream.webTitle;
+    if(ch->viewers != stream.viewers) viewersChanged = true;
+    ch->viewers = stream.viewers;
+    ch->uptime = stream.uptime;
+    ch->uptimeAt = millis();
+    if(liveUpdates && !wasLive[ch - &channels[0]]) wentLive.push_back(ch);
     if (ch->streamTitle != stream.title) {
       ch->streamTitle = stream.title;
       // queue channel for title display if not already in queue
@@ -2571,7 +2906,9 @@ void applyLiveUpdate(const LiveUpdate& update){
     }
   }
 
+  liveUpdates++;
   bool layoutChanged = assignSlots();
+  for(channelInfo* ch : wentLive) channelWentLive(ch);
 
   if(isTitleDisplaying){
     channelInfo* ch = channelTitleInfo.channel;
@@ -2595,6 +2932,10 @@ void applyLiveUpdate(const LiveUpdate& update){
     }
   } else if(layoutChanged){
     redrawLiveChannelPics();
+  }
+  if(!layoutChanged && viewersChanged && (mockViewers == 2 || mockViewers == 3)){
+    if(isTitleDisplaying){ redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
+    else redrawLiveChannelPics();
   }
 }
 
@@ -2943,6 +3284,22 @@ void handleStatus(){
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
   b += "</div>";
+  {
+    static const char* const vNames[] = {"off", "V1: at the end of the title", "V2: number under each tile", "V3: badge on the logo", "V4: badge while the title shows"};
+    static const char* const lNames[] = {"off", "L1: LIVE badge (5 min)", "L2: red frame blinks, then the title", "L3: \"is live\" in the title row, then the title", "L4: red dot (10 min)"};
+    b += "<div class=\"card\"><h2>Mock-up preview</h2><form method=\"post\" action=\"/mock\"><p>Viewer count<br><select name=\"v\">";
+    for(int i = 0; i < 5; i++) b += String("<option value=\"") + String(i) + "\"" + (mockViewers == i ? " selected" : "") + ">" + vNames[i] + "</option>";
+    b += "</select></p><p>Just went live<br><select name=\"l\">";
+    for(int i = 0; i < 5; i++) b += String("<option value=\"") + String(i) + "\"" + (mockLive == i ? " selected" : "") + ">" + htmlEscape(lNames[i]) + "</option>";
+    b += "</select></p><p><button>Apply</button></p></form>";
+    if(live){
+      b += "<form method=\"post\" action=\"/mock/live\"><p>Pretend this channel just went live<br><select name=\"ch\">";
+      for(size_t i = 0; i < channels.size(); i++) if(channels[i].isLive)
+        b += String("<option value=\"") + String((unsigned)i) + "\">" + htmlEscape(channels[i].name.empty() ? channels[i].id : channels[i].name) + "</option>";
+      b += "</select></p><p><button>Simulate going live</button></p></form>";
+    }
+    b += "</div>";
+  }
 
   b += "<div class=\"card\"><h2>Channels</h2><table>";
   for(const channelInfo& ch : channels){
@@ -3167,6 +3524,30 @@ void handleCoredumpClear(){
   server.send(303, "text/plain", "");
 }
 
+// Mock-up preview: choose the variants (stored), pretend a channel went live
+void handleMockSet(){
+  if(!checkAuth()) return;
+  mockViewers = (uint8_t)constrain(server.arg("v").toInt(), 0, 4);
+  mockLive = (uint8_t)constrain(server.arg("l").toInt(), 0, 4);
+  Preferences mock;
+  if(mock.begin("mock", false)){ mock.putUChar("v", mockViewers); mock.putUChar("l", mockLive); mock.end(); }
+  liveQueue.clear();
+  clearViewerLabels(0); clearViewerLabels(1);
+  redrawTiles();
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+void handleMockLive(){
+  if(!checkAuth()) return;
+  long i = server.arg("ch").toInt();
+  if(i >= 0 && i < (long)channels.size() && channels[i].isLive){
+    channelWentLive(&channels[i]);
+    redrawTiles();
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 // "Show all titles": every live channel's title scrolls once more, in the
 // order of the channel list (after a title that is scrolling right now)
 void handleShowTitles(){
@@ -3203,6 +3584,8 @@ void setupWeb(){
   server.on("/cache/clear", HTTP_POST, handleCacheClear);
   server.on("/coredump", HTTP_GET, handleCoredumpDownload);
   server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);
+  server.on("/mock", HTTP_POST, handleMockSet);
+  server.on("/mock/live", HTTP_POST, handleMockLive);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
   server.on("/reset", HTTP_POST, handleReset);

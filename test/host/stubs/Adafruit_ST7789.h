@@ -111,6 +111,7 @@ public:
     writePixels(bm, (uint32_t)w * h);
   }
   // rounded corners are not simulated
+  void fillCircle(int16_t x,int16_t y,int16_t r,uint16_t c){ for(int j=-r;j<=r;j++) for(int i=-r;i<=r;i++) if(i*i+j*j<=r*r) fillRect(x+i,y+j,1,1,c); }
   void fillRoundRect(int16_t x,int16_t y,int16_t w,int16_t h,int16_t,uint16_t c){ fillRect(x,y,w,h,c); }
   void drawRoundRect(int16_t x,int16_t y,int16_t w,int16_t h,int16_t,uint16_t c){ drawRect(x,y,w,h,c); }
   void drawRect(int16_t x,int16_t y,int16_t w,int16_t h,uint16_t c){ fillRect(x,y,w,1,c); fillRect(x,y+h-1,w,1,c); fillRect(x,y,1,h,c); fillRect(x+w-1,y,1,h,c); }

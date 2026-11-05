@@ -969,6 +969,20 @@ int main(){
   server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "Last crash"));
   g_resetReason = ESP_RST_POWERON;
 
+  printf("T55 mock-up test: viewer count and uptime from the Twitch response\n");
+  CHECK(parseIsoTime("2026-11-05T10:20:00Z") == 1793874000LL && parseHttpDate("Thu, 05 Nov 2026 13:32:30 GMT") == 1793885550LL);
+  CHECK(parseIsoTime("") == -1 && parseHttpDate("garbage") == -1);
+  CHECK(formatViewers(845) == "845" && formatViewers(1234) == "1.2k" && formatViewers(27310) == "27k");
+  reset();
+  g_response = "{\"data\":[{\"user_id\":\"" + channels[0].id + "\",\"user_name\":\"A\",\"title\":\"t\",\"game_name\":\"g\",\"viewer_count\":845,\"started_at\":\"2026-11-05T10:20:00Z\"}]}";
+  g_responseDate = "Thu, 05 Nov 2026 13:32:30 GMT";
+  loopWithUpdate();
+  CHECK(channels[0].viewers == 845 && channels[0].uptime == 3 * 3600 + 12 * 60 + 30);
+  CHECK(contains(viewerStats(channels[0]), "845 viewers \xc2\xb7 3h 12m"));
+  g_responseDate = "";
+  while(isTitleDisplaying){ runUntilTitleDone(); loopNoUpdate(1); }
+  reset(); g_responses.clear();   // (the SECRET variant's token answer is not needed by the next tests)
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";
