@@ -423,7 +423,7 @@ uint16_t ldr_avg; // averaged LDR reading used for the backlight
 void redrawLiveChannelPics(int8_t row = -1);
 struct channelInfo;
 std::string streamStats(const channelInfo& ch);
-void drawStatBadges(const channelInfo& ch, uint16_t x, uint16_t y);
+void drawStatBadges(const channelInfo& ch);
 void setupOTA();
 void setupWeb();
 extern String crashInfo;
@@ -2471,11 +2471,11 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   }
   DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
   drawChannelImage(channel);   // downloaded logo, else placeholder
+  if(config.statsOnLogos) drawStatBadges(channel);
   uint16_t x, y;
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
-  if(config.statsOnLogos) drawStatBadges(channel, x, y);
 }
 
 // Blanks a slot including its frame
@@ -2548,21 +2548,47 @@ void drawSmallText(GFXcanvas16& canvas, const std::vector<uint32_t>& cps, int x,
 
 #define STAT_BADGE_EM 11
 #define STAT_BADGE_H  14
-// A small dark badge with its bottom on the logo's bottom edge; right: x is its right edge
-void drawStatBadge(int x, int bottom, const std::string& text, bool right){
+#define STAT_BADGE_R  4     // radius of the corner that points into the logo
+// A small dark badge in a bottom corner of the logo (in pic_canvas, before it
+// is sent). Only its inner top corner is rounded (smoothly, the logo shows
+// around it); the other corners sit on the logo's edges and stay square.
+void drawStatBadge(const std::string& text, bool right){
   std::vector<uint32_t> cps;
   for(char c : text) cps.push_back((uint8_t)c);
   int textW = smallTextWidth(cps, STAT_BADGE_EM), bw = textW + 5;
-  int bx = right ? x - bw : x, by = bottom - STAT_BADGE_H;
-  GFXcanvas16 badge(bw, STAT_BADGE_H);
-  badge.fillScreen(ST77XX_BLACK);
-  drawSmallText(badge, cps, 3, 11, STAT_BADGE_EM, ST77XX_WHITE);
-  tft.drawRGBBitmap(bx, by, badge.getBuffer(), bw, STAT_BADGE_H);
+  int bx = right ? PIC_SIZE - bw : 0, by = PIC_SIZE - STAT_BADGE_H;
+  uint16_t* buf = pic_canvas.getBuffer();
+  // centre of the rounded corner: top right of the left badge, top left of the right one
+  float cx = right ? bx + STAT_BADGE_R : bx + bw - STAT_BADGE_R, cy = by + STAT_BADGE_R;
+  for(int j = 0; j < STAT_BADGE_H; j++) for(int i = 0; i < bw; i++){
+    int px = bx + i, py = by + j;
+    float dx = right ? cx - (px + 0.5f) : (px + 0.5f) - cx, dy = cy - (py + 0.5f);
+    uint8_t a = 255;
+    if(dx > 0 && dy > 0){
+      float cover = STAT_BADGE_R + 0.5f - sqrtf(dx * dx + dy * dy);
+      a = cover <= 0 ? 0 : cover >= 1 ? 255 : (uint8_t)(cover * 255);
+    }
+    uint16_t& d = buf[py * PIC_SIZE + px];
+    d = blend565(d, ST77XX_BLACK, a);
+  }
+  if(titleFont.ready()){
+    int x = bx + 3;
+    for(uint32_t c : cps){
+      GlyphBitmap g;
+      if(titleFont.render(c, STAT_BADGE_EM, g)) blitGlyph(pic_canvas, g, x, by + 11, ST77XX_WHITE);
+      x += titleFont.advance(c, STAT_BADGE_EM);
+    }
+  } else {
+    std::string t(text);
+    pic_canvas.setTextSize(1);
+    pic_canvas.setTextColor(ST77XX_WHITE);
+    pic_canvas.setCursor(bx + 3, by + 4);
+    pic_canvas.print(t.c_str());
+  }
 }
-void drawStatBadges(const channelInfo& ch, uint16_t x, uint16_t y){
-  if(hiddenChannels() && ch.slotNum >= PLUS_SLOT) return;   // behind "+N"
-  if(ch.viewers >= 0) drawStatBadge(x, y + PIC_SIZE, formatViewers(ch.viewers), false);
-  if(ch.uptime >= 0) drawStatBadge(x + PIC_SIZE, y + PIC_SIZE, formatUptimeShort(ch), true);
+void drawStatBadges(const channelInfo& ch){
+  if(ch.viewers >= 0) drawStatBadge(formatViewers(ch.viewers), false);
+  if(ch.uptime >= 0) drawStatBadge(formatUptimeShort(ch), true);
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
