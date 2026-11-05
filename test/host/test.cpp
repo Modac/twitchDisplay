@@ -1025,7 +1025,7 @@ int main(){
     g_authOk = true; server.find("/settings", HTTP_GET)->fn();
     for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) CHECK(contains(g_lastBody, std::string("name=\"") + k + "\" value=\"1\">"));   // unchecked
     printf("    the combined setting of v0.8.x is the default for both\n");
-    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) g_nvs["config"].erase(k);
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"}) g_nvs["config"].erase(k);
     g_nvs["config"]["statstitle"] = "0"; loadConfig();
     CHECK(!config.viewersInTitle && !config.timeInTitle && config.viewersOnLogos && config.timeOnLogos);
     g_nvs["config"].erase("statstitle"); loadConfig();
@@ -1084,6 +1084,21 @@ int main(){
     CHECK(channels[0].liveSpin && channels[0].liveAt);
     while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
     CHECK(!channels[0].liveSpin);
+    printf("    dot and frame can be switched off on the Settings page\n");
+    CHECK(config.liveDot && config.liveFrame);                                   // on by default
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "Simulate going live"));
+    g_nvs["config"]["livedot"] = "0"; loadConfig();
+    channelWentLive(&channels[0]); CHECK(!channels[0].liveAt && channels[0].liveSpin);
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    g_nvs["config"]["livedot"] = "1"; g_nvs["config"]["liveframe"] = "0"; loadConfig();
+    channelWentLive(&channels[0]); CHECK(channels[0].liveAt && !channels[0].liveSpin);
+    CHECK(std::find(titleChangeQueue.begin(), titleChangeQueue.end(), &channels[0]) != titleChangeQueue.end());   // its title still comes
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    g_nvs["config"]["livedot"] = "0"; loadConfig();
+    server.find("/", HTTP_GET)->fn(); CHECK(!contains(g_lastBody, "Simulate going live"));   // both off: no button
+    g_authOk = true; server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "name=\"livedot\" value=\"1\">") && contains(g_lastBody, "name=\"liveframe\" value=\"1\">"));
+    g_nvs["config"].erase("livedot"); g_nvs["config"].erase("liveframe"); loadConfig();
   }
   reset(); g_responses.clear();
   for(auto& c : channels){ c.liveAt = 0; c.liveSpin = false; }

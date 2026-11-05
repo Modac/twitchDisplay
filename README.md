@@ -98,6 +98,15 @@ addition, after some minutes without a title (Settings, default 5, 0 = off)
 a live channel's title is shown again. The live channels take turns: the one
 whose title was shown longest ago comes next, chance decides among equals.
 
+**Just went live** (both on by default, switchable on the Settings page): a
+channel that goes live gets a red dot in the top right corner of its logo for
+10 minutes, and a red frame with two spinning comets until its title has
+scrolled once (during that title with a green line inside, so it is clear
+whose title it is). Several channels spin independently; channels behind
+"+N" make that tile spin. *Simulate going live* on the Status page shows it
+for a live channel. Channels that are already live when the display starts
+get neither.
+
 **Viewers and stream time** (all on by default; on the Settings page each can
 be switched off on its own, after the title and on the logos): after the title in white, e.g. "· 👥 845 · 3h 12m" (the busts from the
 monochrome emoji font), and as two small badges on each logo, viewers bottom
@@ -162,8 +171,8 @@ Settings page; then anyone on your WiFi can use the web interface (stored
 passwords stay hidden, uploads from PlatformIO still need the password).
 
 - **Status**: live channels (with a button that scrolls all their titles once
-  more, and *Stop titles*, which ends the scrolling title and drops the waiting
-  ones), last Twitch update, firmware version, uptime, why it last restarted,
+  more, *Stop titles*, which ends the scrolling title and drops the waiting
+  ones, and *Simulate going live*), last Twitch update, firmware version, uptime, why it last restarted,
   the last crash (see below), WiFi, memory, restart button
 - **Update**: *Online update* checks the newest GitHub release and installs
   it with one click; or upload a `firmware.bin` from the browser (phone or PC). The
@@ -171,7 +180,7 @@ passwords stay hidden, uploads from PlatformIO still need the password).
   the bootloader or a merged image), the display shows the progress and
   restarts afterwards.
 - **Settings**: WiFi, Twitch credentials, channel list, title repeat, viewers
-  and stream time, emoji,
+  and stream time, "just went live" dot and frame, emoji,
   CJK characters, web password and login, reset to defaults
 
 **Rollback protection**: a firmware installed by an update starts "on

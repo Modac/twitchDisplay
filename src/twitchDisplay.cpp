@@ -377,6 +377,8 @@ struct Config {
   bool timeInTitle;    // stream time after the scrolling title
   bool viewersOnLogos; // viewers as a small badge on the logos (bottom left)
   bool timeOnLogos;    // stream time as a small badge on the logos (bottom right)
+  bool liveDot;        // red dot on the logo for 10 minutes after a channel went live
+  bool liveFrame;      // spinning red frame after a channel went live, until its title has scrolled
   bool statsInTitle() const { return viewersInTitle || timeInTitle; }
   bool statsOnLogos() const { return viewersOnLogos || timeOnLogos; }
 
@@ -407,6 +409,8 @@ void loadConfig(){
   config.timeInTitle    = prefs.getString("timetitle", inTitle) != "0";
   config.viewersOnLogos = prefs.getString("viewlogos", onLogos) != "0";
   config.timeOnLogos    = prefs.getString("timelogos", onLogos) != "0";
+  config.liveDot        = prefs.getString("livedot", "1") != "0";
+  config.liveFrame      = prefs.getString("liveframe", "1") != "0";
   prefs.end();
 }
 
@@ -2628,11 +2632,11 @@ void drawStatBadges(const channelInfo& ch){
 #define LIVE_RED        0xE104
 
 void channelWentLive(channelInfo* ch){
-  ch->liveAt = millis() ? millis() : 1;
-  ch->liveSpin = hasTitleText(ch->streamTitle);   // spins until its title has been shown
+  ch->liveAt = config.liveDot ? (millis() ? millis() : 1) : 0;
+  ch->liveSpin = config.liveFrame && hasTitleText(ch->streamTitle);   // spins until its title has been shown
   DEBUG_I.printf("[%s] %s went live.\n", DEBUG_TAG, ch->name.c_str());
   bool shown = isTitleDisplaying && channelTitleInfo.channel == ch;
-  if(ch->liveSpin && !shown && std::find(titleChangeQueue.begin(), titleChangeQueue.end(), ch) == titleChangeQueue.end())
+  if(hasTitleText(ch->streamTitle) && !shown && std::find(titleChangeQueue.begin(), titleChangeQueue.end(), ch) == titleChangeQueue.end())
     titleChangeQueue.push_back(ch);   // also when its title is the same as last time
 }
 
@@ -3317,7 +3321,7 @@ void handleStatus(){
   }
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
-  if(live){   // test firmware: pretend a channel just went live
+  if(live && (config.liveDot || config.liveFrame)){   // pretend a channel just went live (to try the dot and the frame)
     b += "<form method=\"post\" action=\"/live/simulate\"><p><select name=\"ch\">";
     for(size_t i = 0; i < channels.size(); i++) if(channels[i].isLive)
       b += String("<option value=\"") + String((unsigned)i) + "\">" + htmlEscape(channels[i].name.empty() ? channels[i].id : channels[i].name) + "</option>";
@@ -3578,7 +3582,7 @@ void handleStopTitles(){
   server.send(303, "text/plain", "");
 }
 
-// Test firmware: a live channel behaves as if it had just gone live
+// "Simulate going live": a live channel behaves as if it had just gone live
 void handleSimulateLive(){
   if(!checkAuth()) return;
   long i = server.arg("ch").toInt();
@@ -3768,13 +3772,15 @@ void sendSettingsPage(const String& message, bool isError){
       {"viewtitle", &Config::viewersInTitle, "Viewers after the title"},
       {"timetitle", &Config::timeInTitle,    "Stream time after the title"},
       {"viewlogos", &Config::viewersOnLogos, "Viewers on the logos"},
-      {"timelogos", &Config::timeOnLogos,    "Stream time on the logos"}};
+      {"timelogos", &Config::timeOnLogos,    "Stream time on the logos"},
+      {"livedot",   &Config::liveDot,        "Red dot on the logo for 10 minutes after a channel went live"},
+      {"liveframe", &Config::liveFrame,      "Spinning red frame after a channel went live, until its title has scrolled"}};
     for(const auto& st : stats){
       bool on = server.hasArg("stats_form") ? server.hasArg(st.name) : config.*st.field;
       b += String("<label class=\"check\"><input type=\"checkbox\" name=\"") + st.name + "\" value=\"1\"" + (on ? " checked" : "") + ">" + st.label + "</label>";
     }
     b += "<p class=\"hint\">After the title in white, e.g. \"&middot; &#x1F465; 845 &middot; 3h 12m\"; on the logos as small badges, "
-         "viewers bottom left, stream time bottom right.</p>";
+         "viewers bottom left, stream time bottom right. The Status page can pretend a channel just went live, to try the dot and the frame.</p>";
   }
   if(!unknownChannels.empty()){
     String names;
@@ -3864,7 +3870,7 @@ void handleSettingsSave(){
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
   if(server.hasArg("stats_form")){
-    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
   }
   prefs.end();
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
