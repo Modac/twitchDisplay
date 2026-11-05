@@ -6,7 +6,9 @@
 # font partition lacks it.
 # A manual run ("Run workflow", or the API) with a version (e.g. v1.0.1) on
 # the PlatformIO branch tags its newest commit itself and publishes the
-# release the same way, without pushing a tag by hand.
+# release the same way, without pushing a tag by hand. Running it again with
+# the same version resumes a release that failed halfway (the tag must be on
+# the same commit); GitHub hiccups when tagging or publishing are retried.
 name: Build firmware
 
 on:
@@ -32,7 +34,7 @@ jobs:
       # the release to publish: a pushed version tag, or the version of a manual run
       RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # tags for the version number (git describe)
 
@@ -41,18 +43,31 @@ jobs:
         run: |
           [[ "$RELEASE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "The version must look like v1.2.3"; exit 1; }
           [ "$GITHUB_REF" = "refs/heads/platform/platformio" ] || { echo "Releases are made from platform/platformio"; exit 1; }
-          if git rev-parse -q --verify "refs/tags/$RELEASE" >/dev/null; then echo "$RELEASE exists already"; exit 1; fi
+          if git rev-parse -q --verify "refs/tags/$RELEASE" >/dev/null; then
+            # an earlier run tagged it: resume if it is this commit
+            [ "$(git rev-parse "refs/tags/$RELEASE^{commit}")" = "$(git rev-parse HEAD)" ] \
+              || { echo "$RELEASE exists already on another commit"; exit 1; }
+            echo "$RELEASE is already tagged on this commit, resuming the release"
+            exit 0
+          fi
           git tag "$RELEASE"
-          git push origin "refs/tags/$RELEASE"
+          for wait in 5 10 20 40 0; do
+            git push origin "refs/tags/$RELEASE" && exit 0
+            # GitHub may have created the tag although the push reported an error
+            git ls-remote --exit-code --tags origin "refs/tags/$RELEASE" >/dev/null && exit 0
+            [ "$wait" = 0 ] && break
+            echo "Pushing the tag failed, trying again in $wait s"; sleep "$wait"
+          done
+          echo "Could not push the tag $RELEASE"; exit 1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip                                    # PlatformIO and esptool downloads
           cache-dependency-path: .github/workflows/build.yml
 
       # toolchain and framework (not ~/.platformio/.cache: the downloaded archives, ~1 GB)
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.platformio/packages
@@ -61,7 +76,7 @@ jobs:
 
       # build results and libraries of the last run: only changed files are compiled
       # (the version is in a generated header, see tools/version.py)
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             .pio/build
@@ -87,7 +102,7 @@ jobs:
             0x10000 $B/firmware.bin \
             0x370000 fonts/font.bin
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: firmware-${{ github.sha }}
           path: |
@@ -105,9 +120,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$RELEASE" \
-            .pio/build/twitchDisplay/firmware.bin \
-            .pio/build/twitchDisplay/firmware-merged.bin \
-            .pio/build/twitchDisplay/firmware.elf \
-            fonts/font.bin \
-            --title "$RELEASE" --generate-notes --verify-tag
+          FILES=(.pio/build/twitchDisplay/firmware.bin .pio/build/twitchDisplay/firmware-merged.bin
+                 .pio/build/twitchDisplay/firmware.elf fonts/font.bin)
+          for wait in 10 20 40 60 0; do
+            if gh release view "$RELEASE" >/dev/null 2>&1; then
+              # exists (from an earlier attempt or run): add or replace the files
+              gh release upload "$RELEASE" "${FILES[@]}" --clobber && exit 0
+            else
+              gh release create "$RELEASE" "${FILES[@]}" --title "$RELEASE" --generate-notes --verify-tag && exit 0
+            fi
+            [ "$wait" = 0 ] && break
+            echo "Publishing failed, trying again in $wait s"; sleep "$wait"
+          done
+          echo "Could not publish the release $RELEASE"; exit 1

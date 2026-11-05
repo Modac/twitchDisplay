@@ -261,6 +261,11 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
+If GitHub has a hiccup, the workflow retries tagging and publishing a few
+times. If a release still fails halfway, run the workflow again with the same
+version: it continues with the existing tag (as long as it is on the newest
+commit) and adds whatever is missing to the release.
+
 The release contains
 
 - `firmware.bin`: what the display's **Online update** installs (and what the
