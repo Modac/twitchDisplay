@@ -1158,6 +1158,30 @@ int main(){
   }
   reset(); g_responses.clear();
 
+  printf("T59 'Save and apply': settings take effect without a restart; WiFi, Twitch and channel list only after one\n");
+  { reset(); setResponse({{0,"A"},{1,"B"}}); loopWithUpdate();
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    g_authOk = true; server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "<button name=\"apply\" value=\"1\">Save and apply</button> <button>Save and restart</button>"));
+    String ssidBefore = config.wifiSsid; String listBefore = config.channelList; rebootAt = 0;
+    auto post = [](std::map<std::string,std::string> a){ g_args = a; server.find("/settings", HTTP_POST)->fn(); g_args.clear(); };
+    post({{"ssid", ssidBefore.c_str()}, {"apply","1"}, {"repeatmin","17"}, {"order","viewers_asc"}, {"stats_form","1"}, {"viewtitle","1"}, {"liveframe","1"}, {"emoji","mono"}});
+    CHECK(rebootAt == 0 && contains(g_lastBody, "saved and applied") && !contains(g_lastBody, "after a restart"));
+    CHECK(config.titleRepeatMinutes == 17 && config.liveOrder == ORDER_VIEWERS_ASC && config.viewersInTitle && !config.timeInTitle
+          && !config.viewersOnLogos && !config.liveDot && config.liveFrame && !config.colourEmoji);
+    CHECK(g_nvs["config"]["repeatmin"] == "17" && g_nvs["config"]["order"] == "viewers_asc");   // also stored
+    printf("    WiFi and channel list: stored, used after a restart\n");
+    post({{"ssid","otherwifi"}, {"apply","1"}, {"channels","pietsmiet\ngronkh"}});
+    CHECK(rebootAt == 0 && contains(g_lastBody, "The changes to WiFi and channel list take effect after a restart.") && contains(g_lastBody, "action=\"/reboot\""));
+    CHECK(config.wifiSsid == ssidBefore && config.channelList == listBefore);  // still running with the old ones
+    CHECK(g_nvs["config"]["ssid"] == "otherwifi" && g_nvs["config"]["channels"] == "pietsmiet,gronkh");
+    printf("    without 'apply' it restarts as before\n");
+    post({{"ssid", ssidBefore.c_str()}});
+    CHECK(rebootAt != 0 && contains(g_lastBody, "restarts now")); rebootAt = 0;
+    g_nvs.erase("config"); loadConfig();
+  }
+  reset(); g_responses.clear();
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";

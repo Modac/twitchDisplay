@@ -65,6 +65,10 @@ shows its name and a random password:
 
 **Changing settings later:** web interface -> **Settings**. Stored passwords
 and secrets are never shown; leave a field empty to keep the stored value.
+*Save and apply* uses the new settings right away; changes to WiFi, Twitch
+credentials or the channel list are stored but only used after a restart (the
+page says so and offers a *Restart now* button). *Save and restart* restarts
+the display.
 
 **Setup mode again:**
 - hold the **BOOT** button for 5 seconds while the display is running (not

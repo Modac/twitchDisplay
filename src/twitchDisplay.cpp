@@ -396,31 +396,32 @@ struct Config {
 #define DEFAULT_TITLE_REPEAT_MIN 5
 #define MAX_TITLE_REPEAT_MIN     1440
 
-void loadConfig(){
+// Reads the settings into c (normally the running config)
+void loadConfig(Config& c = config){
   Preferences prefs;
   prefs.begin(PREFS_NAMESPACE, true); // fails harmlessly if nothing was saved yet: defaults are returned
-  config.wifiSsid     = prefs.getString("ssid", WIFI_SSID);
-  config.wifiPassword = prefs.getString("wifipw", WIFI_PW);
-  config.clientId     = prefs.getString("clientid", TWITCH_CLIENT_ID);
-  config.clientSecret = prefs.getString("secret", TWITCH_CLIENT_SECRET);
-  config.token        = prefs.getString("token", TWITCH_TOKEN);
-  config.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
-  config.channelList  = prefs.getString("channels", "");
-  config.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
-  config.requireLogin = prefs.getString("login", "1") != "0";
-  config.colourEmoji = prefs.getString("emoji", "colour") != "mono";
-  config.cjk = prefs.getString("cjk", "on") != "off";
+  c.wifiSsid     = prefs.getString("ssid", WIFI_SSID);
+  c.wifiPassword = prefs.getString("wifipw", WIFI_PW);
+  c.clientId     = prefs.getString("clientid", TWITCH_CLIENT_ID);
+  c.clientSecret = prefs.getString("secret", TWITCH_CLIENT_SECRET);
+  c.token        = prefs.getString("token", TWITCH_TOKEN);
+  c.webPassword  = prefs.getString("webpw", WEB_PASSWORD);
+  c.channelList  = prefs.getString("channels", "");
+  c.titleRepeatMinutes = (uint16_t)prefs.getString("repeatmin", String(DEFAULT_TITLE_REPEAT_MIN)).toInt();
+  c.requireLogin = prefs.getString("login", "1") != "0";
+  c.colourEmoji = prefs.getString("emoji", "colour") != "mono";
+  c.cjk = prefs.getString("cjk", "on") != "off";
   // each defaults to the combined setting of v0.8.x (viewers and time together)
   String inTitle = prefs.getString("statstitle", "1"), onLogos = prefs.getString("statslogos", "1");
-  config.viewersInTitle = prefs.getString("viewtitle", inTitle) != "0";
-  config.timeInTitle    = prefs.getString("timetitle", inTitle) != "0";
-  config.viewersOnLogos = prefs.getString("viewlogos", onLogos) != "0";
-  config.timeOnLogos    = prefs.getString("timelogos", onLogos) != "0";
-  config.liveOrder = ORDER_LIST;
+  c.viewersInTitle = prefs.getString("viewtitle", inTitle) != "0";
+  c.timeInTitle    = prefs.getString("timetitle", inTitle) != "0";
+  c.viewersOnLogos = prefs.getString("viewlogos", onLogos) != "0";
+  c.timeOnLogos    = prefs.getString("timelogos", onLogos) != "0";
+  c.liveOrder = ORDER_LIST;
   { String order = prefs.getString("order", "list");
-    for(uint8_t i = 0; i < ORDER_COUNT; i++) if(order == LIVE_ORDER_KEYS[i]) config.liveOrder = i; }
-  config.liveDot        = prefs.getString("livedot", "1") != "0";
-  config.liveFrame      = prefs.getString("liveframe", "1") != "0";
+    for(uint8_t i = 0; i < ORDER_COUNT; i++) if(order == LIVE_ORDER_KEYS[i]) c.liveOrder = i; }
+  c.liveDot        = prefs.getString("livedot", "1") != "0";
+  c.liveFrame      = prefs.getString("liveframe", "1") != "0";
   prefs.end();
 }
 
@@ -3848,7 +3849,10 @@ void sendSettingsPage(const String& message, bool isError){
          "(stored passwords stay hidden). Uploads from PlatformIO always need the password.</p>";
   }
 
-  b += "<p><button>Save and restart</button></p></form></div>";
+  if(setupMode) b += "<p><button>Save and restart</button></p></form></div>";
+  else b += "<p><button name=\"apply\" value=\"1\">Save and apply</button> <button>Save and restart</button></p>"
+            "<p class=\"hint\">\"Save and apply\" takes effect right away; changes to WiFi, Twitch credentials or the channel list "
+            "need a restart and are used after the next one.</p></form></div>";
 
   b += "<div class=\"card\"><h2>Reset</h2><p class=\"muted\">Removes all settings stored on the display. "
        "Values built into the firmware (include/secrets.h) are used again; without them the display starts in setup mode.</p>"
@@ -3860,6 +3864,48 @@ void sendSettingsPage(const String& message, bool isError){
 void handleSettingsPage(){
   if(!setupMode && !checkAuth()) return;
   sendSettingsPage("", false);
+}
+
+// "Save and apply": the saved settings that work without a restart take
+// effect now; WiFi, Twitch credentials and the channel list keep running as
+// they are until the next restart (the network task and the channel table use them)
+void applySavedSettings(){
+  Config saved;
+  loadConfig(saved);
+  std::vector<const char*> later;
+  if(saved.wifiSsid != config.wifiSsid || saved.wifiPassword != config.wifiPassword) later.push_back("WiFi");
+  if(saved.clientId != config.clientId || saved.clientSecret != config.clientSecret || saved.token != config.token) later.push_back("Twitch credentials");
+  if(saved.channelList != config.channelList) later.push_back("channel list");
+  config.webPassword = saved.webPassword;
+  config.requireLogin = saved.requireLogin;
+  config.titleRepeatMinutes = saved.titleRepeatMinutes;
+  config.colourEmoji = saved.colourEmoji;
+  config.cjk = saved.cjk;
+  config.viewersInTitle = saved.viewersInTitle;
+  config.timeInTitle = saved.timeInTitle;
+  config.viewersOnLogos = saved.viewersOnLogos;
+  config.timeOnLogos = saved.timeOnLogos;
+  config.liveOrder = saved.liveOrder;
+  config.liveDot = saved.liveDot;
+  config.liveFrame = saved.liveFrame;
+  for(auto& c : channels){
+    if(!config.liveDot) c.liveAt = 0;
+    if(!config.liveFrame) c.liveSpin = false;
+  }
+  // tiles: badges, dot, frame and order (while a title scrolls the order follows when it ends)
+  if(!isTitleDisplaying){ assignSlots(); redrawLiveChannelPics(); }
+  else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
+  DEBUG_I.printf("[%s] Settings saved and applied.\n", DEBUG_TAG);
+
+  String b = "<div class=\"card\"><h2>Saved</h2><p class=\"ok\">The settings were saved and applied.</p>";
+  if(!later.empty()){
+    String what;
+    for(size_t i = 0; i < later.size(); i++) what += String(i == 0 ? "" : i + 1 == later.size() ? " and " : ", ") + later[i];
+    b += "<p class=\"err\">The changes to " + what + " take effect after a restart.</p>"
+         "<form method=\"post\" action=\"/reboot\"><p><button>Restart now</button></p></form>";
+  }
+  b += "<p><a href=\"/settings\">Back to the settings</a> &middot; <a href=\"/\">Status</a></p></div>";
+  sendPage("Saved", b);
 }
 
 void handleSettingsSave(){
@@ -3924,6 +3970,7 @@ void handleSettingsSave(){
     for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
   }
   prefs.end();
+  if(!setupMode && server.hasArg("apply")){ applySavedSettings(); return; }
   DEBUG_I.printf("[%s] Settings saved, restarting.\n", DEBUG_TAG);
   // a new firmware that got this far works; the restart must not roll it back
   confirmFirmwareNow();
