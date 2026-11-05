@@ -386,6 +386,8 @@ struct Config {
   uint8_t liveOrder;   // order of the live channels' tiles, LiveOrder
   bool liveDot;        // red dot on the logo for 10 minutes after a channel went live
   bool liveFrame;      // spinning red frame after a channel went live, until its title has scrolled
+  bool sleepAnim;      // dim moon and Zzz animation when it is dark and no channel is live
+  uint16_t sleepDark;  // light sensor value from which it counts as dark (higher = darker)
   bool statsInTitle() const { return viewersInTitle || timeInTitle; }
   bool statsOnLogos() const { return viewersOnLogos || timeOnLogos; }
 
@@ -394,6 +396,7 @@ struct Config {
 } config;
 
 #define DEFAULT_TITLE_REPEAT_MIN 5
+#define DEFAULT_SLEEP_DARK       3800   // light sensor: 1000 in bright light, up to 4095 in the dark
 #define MAX_TITLE_REPEAT_MIN     1440
 
 // Reads the settings into c (normally the running config)
@@ -422,6 +425,8 @@ void loadConfig(Config& c = config){
     for(uint8_t i = 0; i < ORDER_COUNT; i++) if(order == LIVE_ORDER_KEYS[i]) c.liveOrder = i; }
   c.liveDot        = prefs.getString("livedot", "1") != "0";
   c.liveFrame      = prefs.getString("liveframe", "1") != "0";
+  c.sleepAnim      = prefs.getString("sleep", "1") != "0";
+  c.sleepDark      = (uint16_t)constrain(prefs.getString("sleepdark", String(DEFAULT_SLEEP_DARK)).toInt(), 0, 4095);
   prefs.end();
 }
 
@@ -447,6 +452,9 @@ void redrawLiveChannelPics(int8_t row = -1);
 struct channelInfo;
 std::string streamStats(const channelInfo& ch);
 void channelWentLive(channelInfo* ch);
+void serviceSleep();
+extern bool sleepActive;
+extern unsigned long sleepPreviewUntil;
 bool assignSlots();
 uint32_t liveUpdates = 0;    // Twitch results applied; the first one after boot finds channels live, not going live
 bool liveHighlight = true;   // dot and spinning frame for channels that just went live (the host tests switch it off)
@@ -1543,13 +1551,14 @@ void loop(){
     delete msg;
   }
 
-  while(!isTitleDisplaying && !titleChangeQueue.empty()) {
+  serviceSleep();
+  while(!isTitleDisplaying && !sleepActive && !titleChangeQueue.empty()) {
     channelInfo* next = titleChangeQueue.front();
     titleChangeQueue.pop_front();
     // channel may have gone offline while it was queued
     if(next->isLive) startTitle(next);
   }
-  if(!isTitleDisplaying) repeatTitleWhenDue();
+  if(!isTitleDisplaying && !sleepActive) repeatTitleWhenDue();
   if(isTitleDisplaying && (long)(micros() - nextFrameUs) >= 0) drawTitleFrame();
   animateLiveFrames();
   checkLiveDots();
@@ -2739,6 +2748,7 @@ void drawLiveFrame(int8_t slot){
 // loop(): the next frame of every spinning tile that is not covered by the title
 void animateLiveFrames(){
   static unsigned long last = 0;
+  if(sleepActive) return;   // the sleep animation covers the tiles (preview)
   if(millis() - last < LIVE_SPIN_FRAME) return;
   last = millis();
   for(int8_t slot = 0; slot < MAX_NUM_PICS && slot < live_num; slot++){
@@ -2759,6 +2769,172 @@ void checkLiveDots(){
   if(!redraw) return;
   if(!isTitleDisplaying) redrawLiveChannelPics();
   else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }   // the other row is redrawn when the title ends
+}
+
+// ---------- Sleep animation: when it is dark and no channel has been live for
+// a minute, a dim crescent moon with twinkling stars, and Zzz rising from the
+// moon (a new "z" every 2 s, growing into a "Z", fading out). Only the parts
+// that change are redrawn (small rectangles), about 15 frames per second.
+#define SLEEP_AFTER_MS     60000UL   // no channel live for this long
+#define SLEEP_LIGHT_MARGIN 150       // the light must get this much brighter than the threshold to end it
+#define SLEEP_FRAME_MS     66
+#define SLEEP_PREVIEW_MS   60000UL   // "Show sleep animation" on the Status page
+#define SLEEP_STARS        22
+#define SLEEP_Z_PERIOD     2.0f      // seconds between two z's
+#define SLEEP_Z_LIFE       6.0f      // seconds a z is visible
+static const int16_t SLEEP_MOON_X = 70, SLEEP_MOON_Y = 110, SLEEP_MOON_R = 34;
+static const uint8_t SLEEP_Z_RGB[3] = {90, 110, 170}, SLEEP_STAR_RGB[3] = {110, 110, 130}, SLEEP_MOON_RGB[3] = {140, 125, 70};
+
+bool sleepActive = false;
+unsigned long sleepPreviewUntil = 0;   // "Show sleep animation": until then regardless of light and channels
+static unsigned long sleepStartMs = 0;
+struct SleepStar { int16_t x, y; float phase, speed; };
+static SleepStar sleepStars[SLEEP_STARS];
+struct SleepRect { int16_t x0, y0, x1, y1; };      // x1/y1 exclusive
+static std::vector<SleepRect> sleepDrawn;          // where z's were drawn last frame
+
+static uint16_t rgbScaled(const uint8_t rgb[3], float a){
+  a = a < 0 ? 0 : a > 1 ? 1 : a;
+  return (uint16_t)(((int)(rgb[0] * a) >> 3) << 11 | ((int)(rgb[1] * a) >> 2) << 5 | ((int)(rgb[2] * a) >> 3));
+}
+static float sleepEase(float x){ x = x < 0 ? 0 : x > 1 ? 1 : x; return 0.5f - 0.5f * cosf((float)M_PI * x); }
+static float sleepEnvelope(float p){ return p < 0.15f ? sleepEase(p / 0.15f) : p > 0.65f ? sleepEase((1 - p) / 0.35f) : 1.0f; }
+
+// A z alive at time t (seconds): centre, size and brightness
+struct SleepZ { float x, y, size, alpha; };
+static int sleepZs(float t, SleepZ* out){
+  int n = 0;
+  for(int k = (int)floorf((t - SLEEP_Z_LIFE) / SLEEP_Z_PERIOD) - 1; k <= (int)floorf(t / SLEEP_Z_PERIOD); k++){
+    float p = (t - k * SLEEP_Z_PERIOD) / SLEEP_Z_LIFE;
+    if(p < 0 || p > 1 || n == 4) continue;
+    out[n++] = {120 + 90 * sleepEase(p) + 6 * sinf(2 * (float)M_PI * (p * 1.5f + k * 0.37f)), 100 - 85 * p, 12 + 28 * p, sleepEnvelope(p)};
+  }
+  return n;
+}
+static float sleepStarLevel(const SleepStar& st, float t){
+  float s = 0.5f + 0.5f * sinf(st.phase + t * st.speed * 2 * (float)M_PI);
+  return 0.25f + 0.75f * s * s * s;
+}
+
+// Draws the sky (stars, moon, z's) inside a rectangle of the screen
+static std::vector<GlyphBitmap> sleepGlyphs;     // the z's of the current frame, rendered once
+static SleepRect sleepZRect(const SleepZ& z);
+static void sleepRender(SleepRect r, float t, const SleepZ* zs, int nz){
+  r.x0 = std::max<int16_t>(r.x0, 0); r.y0 = std::max<int16_t>(r.y0, 0);
+  r.x1 = std::min<int16_t>(r.x1, 320); r.y1 = std::min<int16_t>(r.y1, STATUS_Y - 1);   // not over the status dot row
+  int w = r.x1 - r.x0, h = r.y1 - r.y0;
+  if(w <= 0 || h <= 0) return;
+  GFXcanvas16 c(w, h);
+  uint16_t* buf = c.getBuffer();
+  if(!buf) return;
+  memset(buf, 0, (size_t)w * h * 2);
+  for(const auto& st : sleepStars){
+    float a = sleepStarLevel(st, t);
+    auto put = [&](int x, int y, float level){ if(x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1) buf[(y - r.y0) * w + (x - r.x0)] = rgbScaled(SLEEP_STAR_RGB, level); };
+    put(st.x, st.y, a);
+    if(a > 0.8f){ float e = (a - 0.8f) * 2; put(st.x - 1, st.y, e); put(st.x + 1, st.y, e); put(st.x, st.y - 1, e); put(st.x, st.y + 1, e); }
+  }
+  // crescent moon: a disc minus an offset disc, smooth edges
+  const float R = SLEEP_MOON_R, ox = R * 0.6f, oy = -R * 0.28f;
+  if(r.x0 < SLEEP_MOON_X + R + 1 && r.x1 > SLEEP_MOON_X - R - 1 && r.y0 < SLEEP_MOON_Y + R + 1 && r.y1 > SLEEP_MOON_Y - R - 1){
+    for(int y = r.y0; y < r.y1; y++) for(int x = r.x0; x < r.x1; x++){
+      float dx = x + 0.5f - SLEEP_MOON_X, dy = y + 0.5f - SLEEP_MOON_Y;
+      float in = R + 0.5f - sqrtf(dx * dx + dy * dy);
+      if(in <= 0) continue;
+      float cut = R + 0.5f - sqrtf((dx - ox) * (dx - ox) + (dy - oy) * (dy - oy));
+      float a = std::min(1.0f, in) * (1 - std::max(0.0f, std::min(1.0f, cut)));
+      if(a > 0) buf[(y - r.y0) * w + (x - r.x0)] = rgbScaled(SLEEP_MOON_RGB, a);
+    }
+  }
+  for(int i = 0; i < nz && i < (int)sleepGlyphs.size(); i++){
+    SleepRect zr = sleepZRect(zs[i]);
+    if(zr.x0 >= r.x1 || r.x0 >= zr.x1 || zr.y0 >= r.y1 || r.y0 >= zr.y1) continue;   // not in this rectangle
+    const GlyphBitmap& g = sleepGlyphs[i];
+    if(!g.w) continue;
+    uint16_t colour = rgbScaled(SLEEP_Z_RGB, zs[i].alpha);
+    int gx = (int)lroundf(zs[i].x - g.w / 2.0f) - r.x0, gy = (int)lroundf(zs[i].y - g.h / 2.0f) - r.y0;
+    for(int y = 0; y < g.h; y++){
+      int py = gy + y;
+      if(py < 0 || py >= h) continue;
+      for(int x = 0; x < g.w; x++){
+        int px = gx + x;
+        uint8_t a = g.alpha[(size_t)y * g.w + x];
+        if(px >= 0 && px < w && a) buf[py * w + px] = blend565(buf[py * w + px], colour, a);
+      }
+    }
+  }
+  tft.drawRGBBitmap(r.x0, r.y0, buf, w, h);
+}
+
+static SleepRect sleepZRect(const SleepZ& z){
+  int half = (int)(z.size * 0.6f) + 2;
+  return {(int16_t)(z.x - half), (int16_t)(z.y - half), (int16_t)(z.x + half + 1), (int16_t)(z.y + half + 1)};
+}
+
+static void sleepStart(){
+  sleepActive = true;
+  sleepStartMs = millis();
+  sleepDrawn.clear();
+  uint32_t seed = 3;
+  auto rnd = [&](){ seed = seed * 1103515245u + 12345u; return (seed >> 8) & 0xFFFF; };
+  for(auto& st : sleepStars){
+    st.x = 150 + rnd() % 166; st.y = 8 + rnd() % 150;
+    st.phase = (rnd() % 628) / 100.0f; st.speed = 0.15f + (rnd() % 25) / 100.0f;
+  }
+  tft.fillScreen(ST77XX_BLACK);
+  sleepRender({0, 0, 320, 170}, 0, nullptr, 0);
+  if(statusColor != STATUS_OK) tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, statusColor);
+  DEBUG_I.printf("[%s] Sleep animation on.\n", DEBUG_TAG);
+}
+static void sleepStop(){
+  sleepActive = false;
+  sleepPreviewUntil = 0;
+  tft.fillScreen(ST77XX_BLACK);
+  redrawLiveChannelPics();
+  if(statusColor != STATUS_OK) tft.fillRect(STATUS_X, STATUS_Y, STATUS_SIZE, STATUS_SIZE, statusColor);
+  DEBUG_I.printf("[%s] Sleep animation off.\n", DEBUG_TAG);
+}
+
+// loop(): starts, animates and ends the sleep animation
+void serviceSleep(){
+  static unsigned long noLiveSince = 0, lastFrame = 0;
+  if(live_num) noLiveSince = 0;
+  else if(!noLiveSince) noLiveSince = millis() ? millis() : 1;
+  bool preview = sleepPreviewUntil && (long)(sleepPreviewUntil - millis()) > 0;
+  if(sleepPreviewUntil && !preview) sleepPreviewUntil = 0;
+  bool dark = ldr_avg >= config.sleepDark || (sleepActive && ldr_avg + SLEEP_LIGHT_MARGIN >= config.sleepDark);
+  bool want = preview || (config.sleepAnim && dark && !live_num && noLiveSince && millis() - noLiveSince >= SLEEP_AFTER_MS);
+  if(!sleepActive){
+    if(want && !isTitleDisplaying) sleepStart();
+    return;
+  }
+  if(!want){ sleepStop(); return; }
+  if(millis() - lastFrame < SLEEP_FRAME_MS) return;
+  lastFrame = millis();
+  float t = (millis() - sleepStartMs) / 1000.0f;
+  SleepZ zs[4];
+  int nz = sleepZs(t, zs);
+  sleepGlyphs.assign(nz, GlyphBitmap());
+  if(titleFont.ready()) for(int i = 0; i < nz; i++) titleFont.render(zs[i].size > 26 ? 'Z' : 'z', zs[i].size, sleepGlyphs[i]);
+  // the z's: where each was and is now (one rectangle each, they move only a little per frame)
+  std::vector<SleepRect> now;
+  for(int i = 0; i < nz; i++) now.push_back(sleepZRect(zs[i]));
+  std::vector<SleepRect> dirty = now;
+  for(const auto& old : sleepDrawn){
+    bool covered = false;
+    for(auto& d : dirty) if(old.x0 < d.x1 && d.x0 < old.x1 && old.y0 < d.y1 && d.y0 < old.y1){
+      d = {std::min(d.x0, old.x0), std::min(d.y0, old.y0), std::max(d.x1, old.x1), std::max(d.y1, old.y1)}; covered = true; break;
+    }
+    if(!covered) dirty.push_back(old);   // a z that has gone: clear where it was
+  }
+  for(const auto& d : dirty) sleepRender(d, t, zs, nz);
+  sleepDrawn = now;
+  // the stars that twinkle outside those rectangles
+  for(const auto& st : sleepStars){
+    bool inside = false;
+    for(const auto& d : dirty) if(st.x >= d.x0 - 1 && st.x <= d.x1 && st.y >= d.y0 - 1 && st.y <= d.y1) inside = true;
+    if(!inside) sleepRender({(int16_t)(st.x - 1), (int16_t)(st.y - 1), (int16_t)(st.x + 2), (int16_t)(st.y + 2)}, t, zs, nz);
+  }
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
@@ -2800,6 +2976,7 @@ bool assignSlots(){
 // Draws the pics of all live channels at their assigned slot and blanks the
 // unused slots. With row >= 0 only that row is redrawn.
 void redrawLiveChannelPics(int8_t row){
+  if(sleepActive && !sleepPreviewUntil) return;   // the sleep animation ends on the next loop() and redraws everything
   for (channelInfo& channel : channels) {
     if(channel.isLive && (row < 0 || slotRow(channel.slotNum) == row)){
       drawLiveChannelPic(channel, channel.slotNum);
@@ -3460,7 +3637,9 @@ void handleStatus(){
   b += "<tr><td>IP address</td><td>" + WiFi.localIP().toString() + "</td></tr>";
   b += "<tr><td>Free memory</td><td>" + String(ESP.getFreeHeap() / 1024) + " KB (lowest " + String(ESP.getMinFreeHeap() / 1024) + " KB, largest block "
        + String((unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024)) + " KB)</td></tr>";
-  b += "<tr><td>Brightness sensor</td><td>" + String(ldr_avg) + "</td></tr>";
+  b += "<tr><td>Brightness sensor</td><td>" + String(ldr_avg) + " <span class=\"muted\">(dark from " + String(config.sleepDark)
+       + (config.sleepAnim ? String(", sleep animation ") + (sleepActive ? "now" : "on") : String(", sleep animation off")) + ")</span>"
+       "<form method=\"post\" action=\"/sleep/show\"><p><button>Show sleep animation (1 minute)</button></p></form></td></tr>";
   b += "<tr><td>Title scrolling</td><td>";
   if(titleFrames < 2) b += "no title shown yet";
   else {
@@ -3624,6 +3803,14 @@ void handleStopTitles(){
   server.send(303, "text/plain", "");
 }
 
+// "Show sleep animation": for a minute, whatever the light and the channels
+void handleShowSleep(){
+  if(!checkAuth()) return;
+  sleepPreviewUntil = millis() + SLEEP_PREVIEW_MS;
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
 // "Simulate going live": a live channel behaves as if it had just gone live
 void handleSimulateLive(){
   if(!checkAuth()) return;
@@ -3662,6 +3849,7 @@ void setupWeb(){
   server.on("/titles/show", HTTP_POST, handleShowTitles);
   server.on("/titles/stop", HTTP_POST, handleStopTitles);
   server.on("/live/simulate", HTTP_POST, handleSimulateLive);
+  server.on("/sleep/show", HTTP_POST, handleShowSleep);
   server.on("/cache/clear", HTTP_POST, handleCacheClear);
   server.on("/coredump", HTTP_GET, handleCoredumpDownload);
   server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);
@@ -3828,13 +4016,18 @@ void sendSettingsPage(const String& message, bool isError){
       {"viewlogos", &Config::viewersOnLogos, "Viewers on the logos"},
       {"timelogos", &Config::timeOnLogos,    "Stream time on the logos"},
       {"livedot",   &Config::liveDot,        "Red dot on the logo for 10 minutes after a channel went live"},
-      {"liveframe", &Config::liveFrame,      "Spinning red frame after a channel went live, until its title has scrolled"}};
+      {"liveframe", &Config::liveFrame,      "Spinning red frame after a channel went live, until its title has scrolled"},
+      {"sleep",     &Config::sleepAnim,      "Sleep animation (moon and Zzz) when it is dark and no channel is live"}};
     for(const auto& st : stats){
       bool on = server.hasArg("stats_form") ? server.hasArg(st.name) : config.*st.field;
       b += String("<label class=\"check\"><input type=\"checkbox\" name=\"") + st.name + "\" value=\"1\"" + (on ? " checked" : "") + ">" + st.label + "</label>";
     }
     b += "<p class=\"hint\">After the title in white, e.g. \"&middot; &#x1F465; 845 &middot; 3h 12m\"; on the logos as small badges, "
          "viewers bottom left, stream time bottom right. The Status page can pretend a channel just went live, to try the dot and the frame.</p>";
+    b += "<label>Dark from (light sensor value)<input type=\"number\" name=\"sleepdark\" min=\"0\" max=\"4095\" value=\""
+         + inputValue("sleepdark", String(config.sleepDark)) + "\"></label>";
+    b += "<p class=\"hint\">Higher is darker (about 1000 in bright light, up to 4095). Now: " + String(ldr_avg)
+         + ". The sleep animation starts when no channel has been live for a minute; the Status page can show it to try.</p>";
   }
   if(!unknownChannels.empty()){
     String names;
@@ -3901,6 +4094,8 @@ void applySavedSettings(const char* done = "The settings were saved and applied.
   config.liveOrder = saved.liveOrder;
   config.liveDot = saved.liveDot;
   config.liveFrame = saved.liveFrame;
+  config.sleepAnim = saved.sleepAnim;
+  config.sleepDark = saved.sleepDark;
   for(auto& c : channels){
     if(!config.liveDot) c.liveAt = 0;
     if(!config.liveFrame) c.liveSpin = false;
@@ -3945,6 +4140,14 @@ void handleSettingsSave(){
     sendSettingsPage("Title repeat: enter minutes from 0 to " + String(MAX_TITLE_REPEAT_MIN) + ".", true);
     return;
   }
+  bool sleepDarkSubmitted = server.hasArg("sleepdark");
+  String sleepDarkText = server.arg("sleepdark"); sleepDarkText.trim();
+  long sleepDarkValue = sleepDarkText.toInt();
+  if(sleepDarkSubmitted && (sleepDarkText.length() == 0 || sleepDarkText.length() > 4 || (sleepDarkValue == 0 && sleepDarkText != "0")
+                            || sleepDarkValue < 0 || sleepDarkValue > 4095)){
+    sendSettingsPage("Dark from: enter a light sensor value from 0 to 4095.", true);
+    return;
+  }
   std::vector<std::string> logins;
   bool channelsSubmitted = server.hasArg("channels");
   if(channelsSubmitted){
@@ -3976,11 +4179,12 @@ void handleSettingsSave(){
   if(server.hasArg("login_form")) prefs.putString("login", server.hasArg("login") ? "1" : "0");
   if(server.hasArg("emoji")) prefs.putString("emoji", server.arg("emoji") == "mono" ? "mono" : "colour");
   if(server.hasArg("cjk")) prefs.putString("cjk", server.arg("cjk") == "off" ? "off" : "on");
+  if(sleepDarkSubmitted) prefs.putString("sleepdark", String(sleepDarkValue));
   if(server.hasArg("order")){
     for(uint8_t i = 0; i < ORDER_COUNT; i++) if(server.arg("order") == LIVE_ORDER_KEYS[i]) prefs.putString("order", LIVE_ORDER_KEYS[i]);
   }
   if(server.hasArg("stats_form")){
-    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
+    for(const char* k : {"viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe", "sleep"}) prefs.putString(k, server.hasArg(k) ? "1" : "0");
   }
   prefs.end();
   if(!setupMode && server.hasArg("apply")){ applySavedSettings(); return; }
@@ -4002,7 +4206,7 @@ void handleSettingsSave(){
 
 #define BACKUP_TYPE      "twitchDisplay settings"
 #define BACKUP_MAX_BYTES 8192
-static const char* const BACKUP_BOOLS[] = {"login", "viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"};
+static const char* const BACKUP_BOOLS[] = {"login", "viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe", "sleep"};
 static const char* const BACKUP_SECRETS[] = {"wifipw", "secret", "token", "webpw"};
 
 void handleBackupDownload(){
@@ -4022,7 +4226,8 @@ void handleBackupDownload(){
   st["emoji"] = c.colourEmoji ? "colour" : "mono";
   st["cjk"] = c.cjk ? "on" : "off";
   st["order"] = LIVE_ORDER_KEYS[c.liveOrder < ORDER_COUNT ? c.liveOrder : 0];
-  const bool values[] = {c.requireLogin, c.viewersInTitle, c.timeInTitle, c.viewersOnLogos, c.timeOnLogos, c.liveDot, c.liveFrame};
+  const bool values[] = {c.requireLogin, c.viewersInTitle, c.timeInTitle, c.viewersOnLogos, c.timeOnLogos, c.liveDot, c.liveFrame, c.sleepAnim};
+  st["sleepdark"] = c.sleepDark;
   for(size_t i = 0; i < sizeof(values); i++) st[BACKUP_BOOLS[i]] = values[i];
   if(secrets){
     st["wifipw"] = c.wifiPassword.c_str();
@@ -4093,6 +4298,10 @@ String restoreSettings(const String& text){
     if(!st["repeatmin"].is<int>() || st["repeatmin"].as<int>() < 0 || st["repeatmin"].as<int>() > MAX_TITLE_REPEAT_MIN)
       return "Backup: invalid title repeat.";
     values.push_back({"repeatmin", String(st["repeatmin"].as<int>())});
+  }
+  if(!st["sleepdark"].isNull()){
+    if(!st["sleepdark"].is<int>() || st["sleepdark"].as<int>() < 0 || st["sleepdark"].as<int>() > 4095) return "Backup: invalid \"dark from\" value.";
+    values.push_back({"sleepdark", String(st["sleepdark"].as<int>())});
   }
   if(str("emoji", v)){ if(v != "colour" && v != "mono") return "Backup: invalid emoji setting."; values.push_back({"emoji", v}); }
   if(str("cjk", v)){ if(v != "on" && v != "off") return "Backup: invalid CJK setting."; values.push_back({"cjk", v}); }

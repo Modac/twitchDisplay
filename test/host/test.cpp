@@ -1233,6 +1233,49 @@ int main(){
   }
   reset(); g_responses.clear();
 
+  printf("T61 sleep animation: dark and no channel live for a minute; ends with light or a live channel\n");
+  { auto moonLit = [](){ return g_fb[115][45] != 0; };                  // on the lit part of the crescent
+    auto zDrawn = [](){ int n = 0; for(int y = 0; y < 110; y++) for(int x = 110; x < 230; x++) if(((g_fb[y][x] & 31) > 6)) n++; return n; };   // blueish z pixels
+    auto darkFor = [](int ms){ for(int i = 0; i < ms / 10; i++) loopNoUpdate(1); };
+    reset(); setResponse({}); loopWithUpdate();
+    CHECK(live_num == 0 && config.sleepAnim && config.sleepDark == 3800 && !sleepActive);
+    darkFor(70000); CHECK(!sleepActive);                                       // light: nothing
+    g_light = 4000; darkFor(3000);                                             // dark (the sensor value is averaged over 2 s)
+    CHECK(sleepActive);                                                        // no channel live for over a minute already
+    CHECK(moonLit());
+    darkFor(4000); CHECK(zDrawn() > 20);                                       // z's rising
+    { uint16_t b = 0; for(int y = 0; y < 160; y++) for(int x = 0; x < 320; x++){ uint16_t c = g_fb[y][x]; if((c >> 11) > (b >> 11)) b = c; }
+      CHECK((b >> 11) <= 18); }                                                // dim: no bright red/white
+    printf("    a little brighter than the threshold keeps it (no flicker), clearly brighter ends it\n");
+    g_light = 3700; darkFor(3000); CHECK(sleepActive);
+    g_light = 3500; darkFor(3000); CHECK(!sleepActive && !moonLit());
+    printf("    a channel going live ends it at once; it comes back a minute after the last one went offline\n");
+    g_light = 4000; darkFor(3000); CHECK(sleepActive);
+    setResponse({{0, "Titel"}}); loopWithUpdate(); loopNoUpdate(1);
+    CHECK(!sleepActive && live_num == 1 && !moonLit());
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    { uint16_t x, y; slotXY(0, x, y); CHECK(tileIsPic(0, 0) || g_fb[y + 20][x + 20] != 0); }
+    setResponse({}); loopWithUpdate(); darkFor(30000); CHECK(!sleepActive);
+    darkFor(32000); CHECK(sleepActive);
+    printf("    switched off on the Settings page; the Status page button shows it for a minute\n");
+    g_args = {{"ssid","homewifi"},{"apply","1"},{"stats_form","1"},{"sleepdark","3900"}};   // "sleep" unticked
+    g_authOk = true; server.find("/settings", HTTP_POST)->fn(); g_args.clear();
+    CHECK(!config.sleepAnim && config.sleepDark == 3900 && g_nvs["config"]["sleep"] == "0" && g_nvs["config"]["sleepdark"] == "3900");
+    loopNoUpdate(1); CHECK(!sleepActive);
+    g_args = {{"ssid","homewifi"},{"sleepdark","5000"}}; server.find("/settings", HTTP_POST)->fn(); g_args.clear();
+    CHECK(contains(g_lastBody, "0 to 4095") && rebootAt == 0);
+    g_light = 2000; darkFor(3000);
+    server.find("/", HTTP_GET)->fn(); CHECK(contains(g_lastBody, "Show sleep animation"));
+    server.find("/sleep/show", HTTP_POST)->fn(); loopNoUpdate(1);
+    CHECK(sleepActive && moonLit());                                          // in daylight, with the setting off
+    darkFor(61000); CHECK(!sleepActive);
+    printf("    the backup keeps both settings\n");
+    g_args.clear(); server.find("/settings/backup", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "\"sleep\": false") && contains(g_lastBody, "\"sleepdark\": 3900"));
+    g_nvs.erase("config"); loadConfig(); g_light = 2000; darkFor(3000);
+  }
+  reset(); g_responses.clear();
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";

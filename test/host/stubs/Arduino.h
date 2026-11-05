@@ -17,7 +17,8 @@ extern void (*g_delayHook)();   // runs while loop() sleeps (the render task's w
 inline void delay(unsigned long ms){ g_millis += ms; if(g_delayHook) g_delayHook(); }
 inline void delayMicroseconds(unsigned long us){ unsigned long t = g_usFrac + us; g_millis += t / 1000; g_usFrac = t % 1000; }
 extern int g_analogReads;
-inline int analogRead(int){ g_analogReads++; return 2000; }
+inline int g_light = 2000;   // light sensor value (higher = darker)
+inline int analogRead(int){ g_analogReads++; return g_light; }
 inline void analogWrite(int,int){}
 inline void pinMode(int,int){}
 inline void digitalWrite(int,int){}

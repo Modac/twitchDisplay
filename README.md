@@ -124,6 +124,13 @@ whose title it is). Several channels spin independently; channels behind
 for a live channel. Channels that are already live when the display starts
 get neither.
 
+**Sleep animation** (on by default, Settings): when it is dark and no channel
+has been live for a minute, a dim crescent moon with twinkling stars shows,
+and Zzz slowly rise from it. It ends as soon as a channel goes live or the
+room gets brighter. "Dark from" is a value of the light sensor (higher is
+darker, up to 4095); the Status page shows the current value and can show the
+animation for a minute to try it.
+
 **Viewers and stream time** (all on by default; on the Settings page each can
 be switched off on its own, after the title and on the logos): after the title in white, e.g. "· 👥 845 · 3h 12m" (the busts from the
 monochrome emoji font), and as two small badges on each logo, viewers bottom
