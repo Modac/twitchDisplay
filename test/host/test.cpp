@@ -1182,6 +1182,57 @@ int main(){
   }
   reset(); g_responses.clear();
 
+  printf("T60 settings backup: download (passwords only when asked), restore all or nothing\n");
+  { auto restore = [](const std::string& file){
+      auto* r = server.find("/settings/restore", HTTP_POST);
+      HTTPUpload& up = server.upload(); up.filename = "twitchDisplay-settings.json";
+      up.status = UPLOAD_FILE_START; r->ufn();
+      for(size_t pos = 0; pos < file.size(); pos += HTTP_UPLOAD_BUFLEN){
+        size_t n = std::min((size_t)HTTP_UPLOAD_BUFLEN, file.size() - pos);
+        memcpy(up.buf, file.data() + pos, n); up.currentSize = n; up.status = UPLOAD_FILE_WRITE; r->ufn();
+      }
+      up.status = UPLOAD_FILE_END; up.currentSize = 0; r->ufn(); r->fn(); };
+    reset(); g_authOk = true; rebootAt = 0;
+    g_nvs["config"]["webpw"] = "webpassword"; g_nvs["config"]["wifipw"] = "wifipassword"; g_nvs["config"]["channels"] = "gronkh,pietsmiet"; g_nvs["config"]["order"] = "time_asc"; loadConfig();
+    server.find("/settings", HTTP_GET)->fn();
+    CHECK(contains(g_lastBody, "action=\"/settings/backup\"") && contains(g_lastBody, "action=\"/settings/restore\" enctype=\"multipart/form-data\""));
+    g_args.clear(); server.find("/settings/backup", HTTP_GET)->fn();
+    CHECK(g_lastCode == 200 && g_respHeaders["Content-Disposition"] == "attachment; filename=\"twitchDisplay-settings.json\"");
+    std::string plain = g_lastBody;
+    CHECK(contains(plain, "\"type\": \"twitchDisplay settings\"") && contains(plain, "\"ssid\": \"homewifi\"") && contains(plain, "\"channels\": \"gronkh,pietsmiet\"")
+          && contains(plain, "\"order\": \"time_asc\"") && contains(plain, "\"livedot\": true"));
+    CHECK(!contains(plain, "wifipw") && !contains(plain, "webpassword") && !contains(plain, "\"token\""));   // no secrets unless asked
+    g_args = {{"secrets","1"}}; server.find("/settings/backup", HTTP_GET)->fn(); g_args.clear();
+    std::string full = g_lastBody;
+    CHECK(contains(full, "\"wifipw\": \"wifipassword\"") && contains(full, "\"webpw\": \"webpassword\""));
+    g_authOk = false; server.find("/settings/backup", HTTP_GET)->fn(); CHECK(g_lastCode == 401); g_authOk = true;
+    printf("    restore: stored and applied, the channel list after a restart\n");
+    std::string changed = plain;
+    auto sub = [&](const std::string& a, const std::string& b){ size_t i = changed.find(a); if(i != std::string::npos) changed.replace(i, a.size(), b); };
+    sub("\"order\": \"time_asc\"", "\"order\": \"viewers_desc\""); sub("\"livedot\": true", "\"livedot\": false"); sub("\"channels\": \"gronkh,pietsmiet\"", "\"channels\": \"bonjwa\"");
+    restore(changed);
+    CHECK(rebootAt == 0 && contains(g_lastBody, "restored from the backup and applied") && contains(g_lastBody, "channel list take effect after a restart"));
+    CHECK(g_nvs["config"]["order"] == "viewers_desc" && g_nvs["config"]["livedot"] == "0" && g_nvs["config"]["channels"] == "bonjwa");
+    CHECK(config.liveOrder == ORDER_VIEWERS_DESC && !config.liveDot && g_nvs["config"]["webpw"] == "webpassword");   // passwords not in the file: kept
+    printf("    bad files change nothing\n");
+    auto nvsBefore = g_nvs;
+    restore("not json");                                                         CHECK(contains(g_lastBody, "no valid JSON"));
+    restore("{\"type\":\"other\",\"settings\":{}}");                       CHECK(contains(g_lastBody, "not a twitchDisplay settings backup"));
+    restore("{\"type\":\"twitchDisplay settings\",\"version\":1,\"settings\":{\"order\":\"list\",\"repeatmin\":99999}}");   CHECK(contains(g_lastBody, "invalid title repeat"));
+    restore("{\"type\":\"twitchDisplay settings\",\"version\":1,\"settings\":{\"channels\":\"bad name!\"}}");   CHECK(contains(g_lastBody, "Invalid channel name"));
+    restore("{\"type\":\"twitchDisplay settings\",\"version\":2,\"settings\":{}}");   CHECK(contains(g_lastBody, "newer firmware"));
+    restore(std::string(9000, ' '));                                             CHECK(contains(g_lastBody, "too large"));
+    { std::string badPw = full; size_t i = badPw.find("\"wifipw\": \"wifipassword\""); badPw.replace(i, std::string("\"wifipw\": \"wifipassword\"").size(), "\"wifipw\": \"x\"");
+      restore(badPw); CHECK(contains(g_lastBody, "WiFi password must have 8 to 63")); }
+    CHECK(g_nvs == nvsBefore && rebootAt == 0);
+    g_authOk = false; restore(changed); CHECK(g_lastCode == 401); g_authOk = true;
+    printf("    a full backup restores the passwords too\n");
+    g_nvs["config"]["webpw"] = "otherpassword"; restore(full);
+    CHECK(g_nvs["config"]["webpw"] == "webpassword" && g_nvs["config"]["channels"] == "gronkh,pietsmiet" && g_nvs["config"]["order"] == "time_asc");
+    g_nvs.erase("config"); loadConfig();
+  }
+  reset(); g_responses.clear();
+
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");
   g_nvs.clear(); g_nvs["config"]["ssid"] = "other"; g_nvs["config"]["token"] = ""; g_nvs["config"]["secret"] = "";
@@ -1679,6 +1730,15 @@ int setupModeTests(){
   g_respHeaders.clear(); server.notFound();
   CHECK(g_lastCode == 302 && g_respHeaders["Location"] == "http://192.168.4.1/settings");
   CHECK(!runLoopFor(2000));
+
+  printf("S2b restoring a backup in setup mode (after a USB flash): stored, then a restart\n");
+  { auto* r = server.find("/settings/restore", HTTP_POST); CHECK(r != nullptr && server.find("/settings/backup", HTTP_GET) != nullptr);
+    std::string file = "{\"type\":\"twitchDisplay settings\",\"version\":1,\"settings\":{\"ssid\":\"homewifi\",\"channels\":\"gronkh\",\"order\":\"viewers_desc\"}}";
+    HTTPUpload& up = server.upload(); up.status = UPLOAD_FILE_START; r->ufn();
+    memcpy(up.buf, file.data(), file.size()); up.currentSize = file.size(); up.status = UPLOAD_FILE_WRITE; r->ufn();
+    up.status = UPLOAD_FILE_END; up.currentSize = 0; r->ufn(); r->fn();       // no login in setup mode (the hotspot password protects)
+    CHECK(g_nvs["config"]["ssid"] == "homewifi" && g_nvs["config"]["channels"] == "gronkh" && rebootAt != 0 && contains(g_lastBody, "enter them on the Settings page"));
+    g_nvs.erase("config"); rebootAt = 0; }
 
   printf("S3 web password is required in setup mode\n");
   g_args = {{"ssid","homewifi"},{"wifipw","wifipassword"}}; server.find("/settings", HTTP_POST)->fn();

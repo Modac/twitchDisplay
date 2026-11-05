@@ -70,6 +70,15 @@ credentials or the channel list are stored but only used after a restart (the
 page says so and offers a *Restart now* button). *Save and restart* restarts
 the display.
 
+**Backup:** Settings -> *Download backup* saves the stored settings as
+`twitchDisplay-settings.json`; passwords, the Twitch secret and the token are
+only included when you tick the box (they are readable in the file, so keep it
+private). *Restore* reads such a file back: everything in it is checked first,
+and nothing is changed if something is invalid. Settings that are not in the
+file stay as they are. Restoring also works in setup mode, e.g. after flashing
+`firmware-merged.bin` (which erases the settings); without passwords in the
+file, enter them on the setup page afterwards.
+
 **Setup mode again:**
 - hold the **BOOT** button for 5 seconds while the display is running (not
   while plugging it in: that starts the chip's USB download mode), or

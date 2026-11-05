@@ -34,6 +34,7 @@ inline uint32_t esp_random(){ return (uint32_t)rand(); }
 inline long map(long x,long a,long b,long c,long d){ return (x-a)*(d-c)/(b-a)+c; }
 class String : public std::string {
 public:
+  bool concat(const char* p, unsigned n){ append(p, n); return true; }
   String(){} String(const char* s):std::string(s){} String(const std::string& s):std::string(s){}
   String(int v):std::string(std::to_string(v)){}
   String(unsigned v):std::string(std::to_string(v)){}

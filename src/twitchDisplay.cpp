@@ -3645,6 +3645,9 @@ void handleReboot(){
 
 void handleSettingsPage();
 void handleSettingsSave();
+void handleBackupDownload();
+void handleRestoreUpload();
+void handleRestoreDone();
 void handleReset();
 void handleUpdateCheck();
 void handleUpdateInstall();
@@ -3664,6 +3667,8 @@ void setupWeb(){
   server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
+  server.on("/settings/backup", HTTP_GET, handleBackupDownload);
+  server.on("/settings/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   server.on("/reset", HTTP_POST, handleReset);
   server.on("/update/check", HTTP_GET, handleUpdateCheck);
   server.on("/update/install", HTTP_POST, handleUpdateInstall);
@@ -3854,6 +3859,14 @@ void sendSettingsPage(const String& message, bool isError){
             "<p class=\"hint\">\"Save and apply\" takes effect right away; changes to WiFi, Twitch credentials or the channel list "
             "need a restart and are used after the next one.</p></form></div>";
 
+  b += "<div class=\"card\"><h2>Backup</h2>";
+  if(!setupMode) b += "<form method=\"get\" action=\"/settings/backup\"><p class=\"muted\">Downloads the stored settings as a file "
+       "(twitchDisplay-settings.json), e.g. before flashing over USB.</p>"
+       "<label class=\"check\"><input type=\"checkbox\" name=\"secrets\" value=\"1\">Include passwords, Twitch secret and token "
+       "(readable in the file: keep it private)</label><p><button>Download backup</button></p></form>";
+  b += "<form method=\"post\" action=\"/settings/restore\" enctype=\"multipart/form-data\"><p class=\"muted\">Restores the settings from a backup file. "
+       "Settings the file does not contain stay as they are; without passwords in the file, enter them here afterwards.</p>"
+       "<p><input type=\"file\" name=\"backup\" accept=\".json,application/json\" required> <button>Restore</button></p></form></div>";
   b += "<div class=\"card\"><h2>Reset</h2><p class=\"muted\">Removes all settings stored on the display. "
        "Values built into the firmware (include/secrets.h) are used again; without them the display starts in setup mode.</p>"
        "<form method=\"post\" action=\"/reset\" onsubmit=\"return confirm('Remove all settings?')\">"
@@ -3869,7 +3882,7 @@ void handleSettingsPage(){
 // "Save and apply": the saved settings that work without a restart take
 // effect now; WiFi, Twitch credentials and the channel list keep running as
 // they are until the next restart (the network task and the channel table use them)
-void applySavedSettings(){
+void applySavedSettings(const char* done = "The settings were saved and applied."){
   Config saved;
   loadConfig(saved);
   std::vector<const char*> later;
@@ -3897,7 +3910,7 @@ void applySavedSettings(){
   else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
   DEBUG_I.printf("[%s] Settings saved and applied.\n", DEBUG_TAG);
 
-  String b = "<div class=\"card\"><h2>Saved</h2><p class=\"ok\">The settings were saved and applied.</p>";
+  String b = String("<div class=\"card\"><h2>Saved</h2><p class=\"ok\">") + done + "</p>";
   if(!later.empty()){
     String what;
     for(size_t i = 0; i < later.size(); i++) what += String(i == 0 ? "" : i + 1 == later.size() ? " and " : ", ") + later[i];
@@ -3982,6 +3995,137 @@ void handleSettingsSave(){
   b += "</div>";
   sendPage("Saved", b);
   drawMessageScreen("Settings saved", ST77XX_GREEN, "Restarting...");
+  rebootAt = millis() + 1500;
+}
+
+// ---------- Settings backup: the stored settings as JSON, restored from such a file
+
+#define BACKUP_TYPE      "twitchDisplay settings"
+#define BACKUP_MAX_BYTES 8192
+static const char* const BACKUP_BOOLS[] = {"login", "viewtitle", "timetitle", "viewlogos", "timelogos", "livedot", "liveframe"};
+static const char* const BACKUP_SECRETS[] = {"wifipw", "secret", "token", "webpw"};
+
+void handleBackupDownload(){
+  if(!setupMode && !checkAuth()) return;
+  bool secrets = server.arg("secrets") == "1";
+  Config c;
+  loadConfig(c);   // what is stored (also changes waiting for a restart)
+  JsonDocument doc;
+  doc["type"] = BACKUP_TYPE;
+  doc["version"] = 1;
+  doc["firmware"] = FW_VERSION;
+  JsonObject st = doc["settings"].to<JsonObject>();
+  st["ssid"] = c.wifiSsid.c_str();
+  st["clientid"] = c.clientId.c_str();
+  st["channels"] = c.channelList.c_str();   // empty: the built-in channels
+  st["repeatmin"] = c.titleRepeatMinutes;
+  st["emoji"] = c.colourEmoji ? "colour" : "mono";
+  st["cjk"] = c.cjk ? "on" : "off";
+  st["order"] = LIVE_ORDER_KEYS[c.liveOrder < ORDER_COUNT ? c.liveOrder : 0];
+  const bool values[] = {c.requireLogin, c.viewersInTitle, c.timeInTitle, c.viewersOnLogos, c.timeOnLogos, c.liveDot, c.liveFrame};
+  for(size_t i = 0; i < sizeof(values); i++) st[BACKUP_BOOLS[i]] = values[i];
+  if(secrets){
+    st["wifipw"] = c.wifiPassword.c_str();
+    st["secret"] = c.clientSecret.c_str();
+    st["token"] = c.token.c_str();
+    st["webpw"] = c.webPassword.c_str();
+  }
+  String out;
+  serializeJsonPretty(doc, out);
+  server.sendHeader("Content-Disposition", "attachment; filename=\"twitchDisplay-settings.json\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", out);
+}
+
+String restoreData;          // the uploaded backup file
+bool restoreTooLarge = false;
+void handleRestoreUpload(){
+  HTTPUpload& up = server.upload();
+  if(up.status == UPLOAD_FILE_START){ restoreData = ""; restoreTooLarge = false; }
+  else if(up.status == UPLOAD_FILE_WRITE){
+    if(restoreData.length() + up.currentSize > BACKUP_MAX_BYTES){ restoreTooLarge = true; return; }
+    restoreData.concat((const char*)up.buf, up.currentSize);
+  }
+}
+
+// Checks a backup file and stores its settings (all or nothing). Returns the error, or "".
+String restoreSettings(const String& text){
+  JsonDocument doc;
+  if(deserializeJson(doc, text.c_str())) return "This is not a backup file (no valid JSON).";
+  if(doc["type"] != BACKUP_TYPE || !doc["settings"].is<JsonObject>()) return "This is not a twitchDisplay settings backup.";
+  if((doc["version"] | 0) > 1) return "The backup is from a newer firmware; update the display first.";
+  JsonObject st = doc["settings"];
+  std::vector<std::pair<String, String>> values;   // NVS key -> value
+  auto str = [&](const char* key, String& out) -> bool {
+    if(!st[key].is<const char*>()) return false;
+    out = st[key].as<const char*>();
+    return true;
+  };
+  String v;
+  if(str("ssid", v)){
+    if(v.isEmpty() || v.length() > 32) return "Backup: invalid WiFi network name.";
+    values.push_back({"ssid", v});
+  }
+  if(str("wifipw", v)){
+    if(v.length() && (v.length() < 8 || v.length() > 63)) return "Backup: the WiFi password must have 8 to 63 characters.";
+    values.push_back({"wifipw", v});
+  }
+  for(const char* key : {"clientid", "secret", "token"}) if(str(key, v)){
+    if(!isTwitchValue(v)) return "Backup: Twitch client ID, secret and token may only contain letters and digits.";
+    values.push_back({key, v});
+  }
+  if(str("webpw", v) && v.length()){   // empty: keep the stored one (a web password is always needed)
+    if(v.length() < 8) return "Backup: the web password must have at least 8 characters.";
+    values.push_back({"webpw", v});
+  }
+  if(str("channels", v)){
+    if(v.isEmpty()) values.push_back({"channels", ""});   // the built-in channels
+    else {
+      std::vector<std::string> logins;
+      String err = parseChannelList(v, logins);
+      if(err.length()) return "Backup: " + err;
+      String list;
+      for(const auto& l : logins){ if(list.length()) list += ","; list += l.c_str(); }
+      values.push_back({"channels", list});
+    }
+  }
+  if(!st["repeatmin"].isNull()){
+    if(!st["repeatmin"].is<int>() || st["repeatmin"].as<int>() < 0 || st["repeatmin"].as<int>() > MAX_TITLE_REPEAT_MIN)
+      return "Backup: invalid title repeat.";
+    values.push_back({"repeatmin", String(st["repeatmin"].as<int>())});
+  }
+  if(str("emoji", v)){ if(v != "colour" && v != "mono") return "Backup: invalid emoji setting."; values.push_back({"emoji", v}); }
+  if(str("cjk", v)){ if(v != "on" && v != "off") return "Backup: invalid CJK setting."; values.push_back({"cjk", v}); }
+  if(str("order", v)){
+    bool known = false;
+    for(const char* k : LIVE_ORDER_KEYS) known |= v == k;
+    if(!known) return "Backup: invalid order of the live channels.";
+    values.push_back({"order", v});
+  }
+  for(const char* key : BACKUP_BOOLS) if(!st[key].isNull()){
+    if(!st[key].is<bool>()) return String("Backup: invalid value for ") + key + ".";
+    values.push_back({key, st[key].as<bool>() ? "1" : "0"});
+  }
+  if(values.empty()) return "The backup contains no settings.";
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, false);
+  for(const auto& kv : values) prefs.putString(kv.first.c_str(), kv.second);
+  prefs.end();
+  DEBUG_I.printf("[%s] %u settings restored from a backup.\n", DEBUG_TAG, (unsigned)values.size());
+  return "";
+}
+
+void handleRestoreDone(){
+  if(!setupMode && !checkAuth()) return;
+  String err = restoreTooLarge ? String("The file is too large for a settings backup.") : restoreData.isEmpty() ? String("No file was uploaded.") : restoreSettings(restoreData);
+  restoreData = "";
+  if(err.length()){ sendSettingsPage(err, true); return; }
+  if(!setupMode){ applySavedSettings("The settings were restored from the backup and applied."); return; }
+  // setup mode: start with the restored settings
+  confirmFirmwareNow();
+  sendPage("Restored", "<div class=\"card\"><h2>Restored</h2><p class=\"ok\">The settings were restored. The display restarts now.</p>"
+           "<p>If the backup had no passwords, the display opens this setup hotspot again: enter them on the Settings page.</p></div>");
+  drawMessageScreen("Settings restored", ST77XX_GREEN, "Restarting...");
   rebootAt = millis() + 1500;
 }
 
@@ -4076,6 +4220,8 @@ void startSetupMode(const char* reason, bool retryLater){
 
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/settings", HTTP_POST, handleSettingsSave);
+  server.on("/settings/backup", HTTP_GET, handleBackupDownload);
+  server.on("/settings/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   server.on("/reset", HTTP_POST, handleReset);
   // firmware upload also works here, so a firmware that can't connect to the
   // WiFi can still be replaced through the hotspot
