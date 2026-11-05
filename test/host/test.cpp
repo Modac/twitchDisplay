@@ -1698,6 +1698,7 @@ int main(){
   CHECK(g_serialOut == "a\r\nb\r\nc\r\nx\r\ny\r\nz\r\n\r\n");
   g_serialOut.clear(); DEBUG_I.printf("[%s] Live channel: %s\n", DEBUG_TAG, "Bonjwa");
   CHECK(g_serialOut == "[TwitchDisplay] Live channel: Bonjwa\r\n");
+  CHECK(Serial.txTimeout == 0);   // the USB serial port never makes loop() wait (a full buffer stalled it into the watchdog)
   printf(fails? "\n%d check(s) FAILED\n" : "\nall checks passed\n", fails);
   return fails?1:0;
 }

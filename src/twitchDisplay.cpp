@@ -55,7 +55,11 @@ static const char DEBUG_TAG[] = "TwitchDisplay";
 class CrlfSerial : public Print {
   bool lastWasCR = false;
 public:
-  void begin(unsigned long baud){ Serial.begin(baud); }
+  // Never wait for the USB serial port: when a computer is connected but
+  // nothing reads (or a USB host that never does), its buffer fills and every
+  // write would wait up to 100 ms (up to 2 s per call), which stalled loop()
+  // until the 30 s watchdog restarted the display. Log lines are dropped then.
+  void begin(unsigned long baud){ Serial.begin(baud); Serial.setTxTimeoutMs(0); }
   size_t write(uint8_t c) override {
     if(c == '\n' && !lastWasCR) Serial.write('\r');
     lastWasCR = (c == '\r');
