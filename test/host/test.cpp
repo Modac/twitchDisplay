@@ -103,6 +103,9 @@ void reset(){
   g_responses.push_back({200, "{\"access_token\":\"tok1\",\"expires_in\":5000000,\"token_type\":\"bearer\"}"});
 #endif
   for(auto& r: g_fb) for(auto& p: r) p=0;
+  liveUpdates = 0;         // like after boot
+  liveHighlight = false;   // only T56 tests the "just went live" dot and frame
+  for(auto& c: channels){ c.liveAt = 0; c.liveSpin = false; }
 }
 // one loop() iteration that performs an update first
 void loopWithUpdate(){ runNetworkUpdate(); loop(); }
@@ -1029,6 +1032,61 @@ int main(){
     g_responseDate = "";
   }
   reset(); g_responses.clear();   // (the SECRET variant's token answer is not needed by the next tests)
+
+  printf("T56 just went live: red dot for 10 minutes, spinning red frame until its title has scrolled, green line inside during it\n");
+  { auto isRed = [](uint16_t c){ return (c >> 11) >= 3 && ((c >> 5) & 63) < 12 && (c & 31) < 8; };
+    auto ringAt = [](int slot, int depth, int side){ uint16_t x, y; slotXY(slot, x, y);   // side 0: left, 1: right (middle of the tile)
+      return side ? g_fb[y + 32][x + PIC_SIZE + depth] : g_fb[y + 32][x - 1 - depth]; };
+    auto ringRed = [&](int slot){ uint16_t x, y; slotXY(slot, x, y); int n = 0;
+      for(int i = -PIC_BORDER; i < PIC_SIZE + PIC_BORDER; i++) for(int j = 1; j <= PIC_BORDER; j++){ if(isRed(g_fb[y - j][x + i])) n++; if(isRed(g_fb[y + PIC_SIZE - 1 + j][x + i])) n++; }
+      return n; };
+    auto dark = [](uint16_t c){ return (c >> 11) <= 1 && ((c >> 5) & 63) <= 2 && (c & 31) <= 1; };
+    auto dotAt = [&](int slot){ uint16_t x, y; slotXY(slot, x, y);   // red centre, black border 1 px below the top, logo above it and right of it
+      return g_fb[y + 11][x + 52] == 0xE104 && dark(g_fb[y + 1][x + 52]) && !dark(g_fb[y][x + 52]) && !dark(g_fb[y + 11][x + 63]); };
+    reset(); liveHighlight = true;
+    std::vector<std::pair<int,std::string>> six; for(int k = 0; k < 6; k++) six.push_back({k, "Titel " + std::to_string(k)});
+    setResponse(six); loopWithUpdate();
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(!channels[0].liveAt && !channels[0].liveSpin && !dotAt(0));          // live at boot: not "just went live"
+    auto eight = six; eight.push_back({6, "Neues Projekt"}); eight.push_back({7, "Speedrun"});
+    setResponse(eight); loopWithUpdate();                                        // two go live at the same time
+    CHECK(channels[6].liveAt && channels[6].liveSpin && channels[7].liveSpin && !channels[0].liveSpin);
+    CHECK(isTitleDisplaying && channelTitleInfo.channel == &channels[6] && titleChangeQueue.size() == 1 && titleChangeQueue[0] == &channels[7]);
+    g_millis += 50; loopNoUpdate(1);
+    CHECK(dotAt(6) && dotAt(7) && !dotAt(5));
+    CHECK(ringAt(6, 0, 0) == ST77XX_GREEN && ringAt(6, 1, 1) == ST77XX_GREEN && ringAt(6, 2, 0) != ST77XX_GREEN);   // own title: green inside
+    CHECK(ringAt(7, 0, 0) != ST77XX_GREEN && ringRed(7) > 100);                  // waiting: red comets
+    { int before = ringRed(6); uint16_t x, y; slotXY(7, x, y); uint16_t a = g_fb[y - 4][x + 10];
+      bool moved = false; for(int k = 0; k < 40 && !moved; k++){ g_millis += 40; loopNoUpdate(1); moved = g_fb[y - 4][x + 10] != a; }
+      CHECK(moved && before > 50); }                                              // it spins
+    runUntilTitleDone(); loopNoUpdate(1);
+    CHECK(!channels[6].liveSpin && channels[7].liveSpin && isTitleDisplaying && channelTitleInfo.channel == &channels[7]);
+    g_millis += 50; loopNoUpdate(1);
+    CHECK(ringAt(6, 3, 0) == 0 && ringRed(6) == 0 && dotAt(6));                  // its frame is gone, the dot stays
+    CHECK(ringAt(7, 0, 0) == ST77XX_GREEN);
+    runUntilTitleDone(); loopNoUpdate(1);
+    CHECK(!channels[7].liveSpin && ringRed(7) == 0 && frame(7) == 0);
+    printf("    the dot goes after 10 minutes\n");
+    g_millis += 10 * 60000UL; loopNoUpdate(2);
+    CHECK(!channels[6].liveAt && !dotAt(6) && !dotAt(7));
+    printf("    'Stop titles' ends the spinning; going offline ends dot and frame; the same title again still spins\n");
+    channels[5].isLive = true; channelWentLive(&channels[5]); redrawLiveChannelPics();
+    CHECK(channels[5].liveSpin && std::find(titleChangeQueue.begin(), titleChangeQueue.end(), &channels[5]) != titleChangeQueue.end());   // queued although its title did not change
+    g_authOk = true; server.find("/titles/stop", HTTP_POST)->fn();
+    CHECK(!channels[5].liveSpin && channels[5].liveAt && ringRed(5) == 0);
+    channelWentLive(&channels[5]);
+    setResponse(six); loopWithUpdate();                                          // 6 and 7 offline (5 stays)
+    setResponse({{0, "Titel 0"}}); loopWithUpdate();
+    CHECK(!channels[5].liveAt && !channels[5].liveSpin);
+    printf("    the Status page button pretends a channel went live\n");
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    g_args = {{"ch", "0"}}; server.find("/live/simulate", HTTP_POST)->fn(); g_args.clear();
+    CHECK(channels[0].liveSpin && channels[0].liveAt);
+    while(isTitleDisplaying || !titleChangeQueue.empty()){ runUntilTitleDone(); loopNoUpdate(1); }
+    CHECK(!channels[0].liveSpin);
+  }
+  reset(); g_responses.clear();
+  for(auto& c : channels){ c.liveAt = 0; c.liveSpin = false; }
 
   printf("T25 settings: NVS values override secrets.h defaults, an empty stored value beats the default\n");
   CHECK(!setupMode && config.wifiSsid == "homewifi" && config.webPassword == "pw" && g_beginSsid == "homewifi" && g_beginPw == "x");

@@ -431,6 +431,14 @@ uint16_t ldr_avg; // averaged LDR reading used for the backlight
 void redrawLiveChannelPics(int8_t row = -1);
 struct channelInfo;
 std::string streamStats(const channelInfo& ch);
+void channelWentLive(channelInfo* ch);
+uint32_t liveUpdates = 0;    // Twitch results applied; the first one after boot finds channels live, not going live
+bool liveHighlight = true;   // dot and spinning frame for channels that just went live (the host tests switch it off)
+bool tileSpinning(int8_t slot);
+void drawLiveFrame(int8_t slot);
+void drawLiveDot();
+void animateLiveFrames();
+void checkLiveDots();
 void drawStatBadges(const channelInfo& ch);
 void setupOTA();
 void setupWeb();
@@ -509,6 +517,8 @@ struct channelInfo {
   int32_t viewers = -1;       // viewer count of the last update, -1 = unknown
   int32_t uptime = -1;        // seconds since the stream started (at uptimeAt), -1 = unknown
   unsigned long uptimeAt = 0;
+  unsigned long liveAt = 0;   // millis() when it went live (red dot for LIVE_DOT_MS), 0 = none
+  bool liveSpin = false;      // red spinning frame until its title has scrolled once
 };
 
 #define MAX_CHANNELS 32
@@ -1123,6 +1133,7 @@ bool titleOnPlusTile();
 void drawTitleIndicator(){
   uint16_t x, y;
   slotXY(channelTitleInfo.slot, x, y);
+  if(tileSpinning(channelTitleInfo.slot)){ drawLiveFrame(channelTitleInfo.slot); return; }
   drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_GREEN);
   if(titleOnPlusTile()) drawPlusBadge();
 }
@@ -1356,6 +1367,7 @@ void drawTitleFrame(){
   o_X += step;
   if(titlePixels >= titleScrollTotal){
     xSemaphoreGive(titleLock);
+    channelTitleInfo.channel->liveSpin = false;   // its title has been shown: the spinning frame ends
     stopTitle();
     return;
   }
@@ -1522,6 +1534,8 @@ void loop(){
   }
   if(!isTitleDisplaying) repeatTitleWhenDue();
   if(isTitleDisplaying && (long)(micros() - nextFrameUs) >= 0) drawTitleFrame();
+  animateLiveFrames();
+  checkLiveDots();
 
 #ifdef DEBUG_UDP_LDR
   static unsigned long lastUdp = 0;
@@ -2432,8 +2446,9 @@ void drawPlusTile(){
   uint16_t x, y;
   slotXY(PLUS_SLOT, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-  drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
   if(titleOnPlusTile()) drawTitleIndicator();   // frame and badge
+  else if(tileSpinning(PLUS_SLOT)) drawLiveFrame(PLUS_SLOT);
+  else drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
 }
 
 // "+N" on the bottom right corner of the green frame: green with a black
@@ -2480,10 +2495,12 @@ void drawLiveChannelPic(channelInfo& channel, uint8_t pic_slot_index){
   DEBUG_I.printf("[%s] Drawing channel pic of %s in slot number %u\n", DEBUG_TAG, channel.id.c_str(), pic_slot_index);
   drawChannelImage(channel);   // downloaded logo, else placeholder
   if(config.statsOnLogos()) drawStatBadges(channel);
+  if(channel.liveAt) drawLiveDot();
   uint16_t x, y;
   slotXY(pic_slot_index, x, y);
   tft.drawRGBBitmap(x, y, pic_canvas.getBuffer(), pic_canvas.width(), pic_canvas.height());
-  drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
+  if(tileSpinning(pic_slot_index)) drawLiveFrame(pic_slot_index);
+  else drawThickRect(x, y, PIC_SIZE, PIC_SIZE, -PIC_BORDER, ST77XX_BLACK);
 }
 
 // Blanks a slot including its frame
@@ -2597,6 +2614,134 @@ void drawStatBadge(const std::string& text, bool right){
 void drawStatBadges(const channelInfo& ch){
   if(config.viewersOnLogos && ch.viewers >= 0) drawStatBadge(formatViewers(ch.viewers), false);
   if(config.timeOnLogos && ch.uptime >= 0) drawStatBadge(formatUptimeShort(ch), true);
+}
+
+// ---------- "Just went live": a red dot on the logo for 10 minutes, and a red
+// frame with two spinning comets until the channel's title has scrolled once.
+// While that title scrolls, the frame keeps spinning with a green line inside.
+#define LIVE_DOT_MS     (10 * 60000UL)
+#define LIVE_DOT_R      7      // red dot radius
+#define LIVE_DOT_BORDER 3      // black border around it
+#define LIVE_SPIN_MS    2200   // one turn of the two comets
+#define LIVE_SPIN_FRAME 40     // ms between frames (25 per second)
+#define LIVE_INNER      2      // green line inside the frame during the channel's own title
+#define LIVE_RED        0xE104
+
+void channelWentLive(channelInfo* ch){
+  ch->liveAt = millis() ? millis() : 1;
+  ch->liveSpin = hasTitleText(ch->streamTitle);   // spins until its title has been shown
+  DEBUG_I.printf("[%s] %s went live.\n", DEBUG_TAG, ch->name.c_str());
+  bool shown = isTitleDisplaying && channelTitleInfo.channel == ch;
+  if(ch->liveSpin && !shown && std::find(titleChangeQueue.begin(), titleChangeQueue.end(), ch) == titleChangeQueue.end())
+    titleChangeQueue.push_back(ch);   // also when its title is the same as last time
+}
+
+// The dot in the top right corner of the logo in pic_canvas, 1 px from both edges (smooth edges)
+void drawLiveDot(){
+  const float R = LIVE_DOT_R + LIVE_DOT_BORDER, cx = PIC_SIZE - 1 - R, cy = 1 + R;
+  uint16_t* buf = pic_canvas.getBuffer();
+  for(int py = 0; py <= (int)(2 * R) + 1; py++) for(int px = PIC_SIZE - 2 - (int)(2 * R); px < PIC_SIZE; px++){
+    float dx = px + 0.5f - cx, dy = py + 0.5f - cy, d = sqrtf(dx * dx + dy * dy);
+    float outer = R + 0.5f - d, inner = LIVE_DOT_R + 0.5f - d;
+    if(outer <= 0) continue;
+    uint16_t& p = buf[py * PIC_SIZE + px];
+    p = blend565(p, ST77XX_BLACK, outer >= 1 ? 255 : (uint8_t)(outer * 255));
+    if(inner > 0) p = blend565(p, LIVE_RED, inner >= 1 ? 255 : (uint8_t)(inner * 255));
+  }
+}
+
+// Is the frame of this slot spinning? (the "+N" tile spins for its hidden channels)
+bool tileSpinning(int8_t slot){
+  if(slot < 0) return false;
+  for(const auto& c : channels){
+    if(!c.isLive || !c.liveSpin || c.slotNum < 0) continue;
+    int8_t s = hiddenChannels() && c.slotNum >= PLUS_SLOT ? PLUS_SLOT : c.slotNum;
+    if(s == slot) return true;
+  }
+  return false;
+}
+
+// Position of each frame pixel around the tile (0..255, clockwise from the top
+// left), in the order drawLiveFrame() sends them: top, bottom, left, right
+static uint8_t liveRingPos[2 * (PIC_SIZE + 2 * PIC_BORDER) * PIC_BORDER + 2 * PIC_SIZE * PIC_BORDER];
+static uint16_t liveCometColour[256];   // brightness behind a comet's head -> colour
+void initLiveFrames(){
+  int n = 0;
+  const float h = PIC_SIZE / 2.0f + PIC_BORDER / 2.0f, c = PIC_SIZE / 2.0f - 0.5f;
+  auto pos = [&](int x, int y){
+    float dx = x - c, dy = y - c, s;
+    if(dy <= -fabsf(dx)) s = dx + h;
+    else if(dx >= fabsf(dy)) s = 3 * h + dy;
+    else if(dy >= fabsf(dx)) s = 5 * h - dx;
+    else s = 7 * h - dy;
+    liveRingPos[n++] = (uint8_t)((int)(s / (8 * h) * 256) & 0xFF);
+  };
+  for(int y = -PIC_BORDER; y < 0; y++) for(int x = -PIC_BORDER; x < PIC_SIZE + PIC_BORDER; x++) pos(x, y);
+  for(int y = PIC_SIZE; y < PIC_SIZE + PIC_BORDER; y++) for(int x = -PIC_BORDER; x < PIC_SIZE + PIC_BORDER; x++) pos(x, y);
+  for(int y = 0; y < PIC_SIZE; y++) for(int x = -PIC_BORDER; x < 0; x++) pos(x, y);
+  for(int y = 0; y < PIC_SIZE; y++) for(int x = PIC_SIZE; x < PIC_SIZE + PIC_BORDER; x++) pos(x, y);
+  for(int d = 0; d < 256; d++){
+    float k = 1 - d / 256.0f / 0.6f;
+    k = k > 0 ? powf(k, 1.6f) : 0;
+    int r = 30 + (int)((255 - 30) * k), g = (int)(40 * k), b = (int)(30 * k);
+    liveCometColour[d] = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+  }
+}
+
+// Draws the spinning frame of a slot for the current time
+void drawLiveFrame(int8_t slot){
+  static bool ready = false;
+  if(!ready){ initLiveFrames(); ready = true; }
+  uint16_t x, y;
+  slotXY(slot, x, y);
+  bool own = isTitleDisplaying && channelTitleInfo.slot == slot;   // its title scrolls: green line inside
+  uint8_t phase = (uint8_t)((millis() % LIVE_SPIN_MS) * 256 / LIVE_SPIN_MS);
+  const int W = PIC_SIZE + 2 * PIC_BORDER;
+  uint16_t buf[W * PIC_BORDER];
+  int n = 0;
+  // depth: distance from the logo (0 = touching it)
+  auto colour = [&](int depth) -> uint16_t {
+    if(own && depth < LIVE_INNER) { n++; return ST77XX_GREEN; }
+    uint8_t d = (uint8_t)((uint8_t)(phase - liveRingPos[n++]) * 2);
+    return liveCometColour[d];
+  };
+  auto send = [&](int16_t rx, int16_t ry, int16_t rw, int16_t rh){ tft.drawRGBBitmap(rx, ry, buf, rw, rh); };
+  int k = 0;
+  for(int j = -PIC_BORDER; j < 0; j++) for(int i = -PIC_BORDER; i < PIC_SIZE + PIC_BORDER; i++)
+    buf[k++] = colour(std::max(-1 - j, std::max(-1 - i, i - PIC_SIZE)));
+  send(x - PIC_BORDER, y - PIC_BORDER, W, PIC_BORDER); k = 0;
+  for(int j = PIC_SIZE; j < PIC_SIZE + PIC_BORDER; j++) for(int i = -PIC_BORDER; i < PIC_SIZE + PIC_BORDER; i++)
+    buf[k++] = colour(std::max(j - PIC_SIZE, std::max(-1 - i, i - PIC_SIZE)));
+  send(x - PIC_BORDER, y + PIC_SIZE, W, PIC_BORDER); k = 0;
+  for(int j = 0; j < PIC_SIZE; j++) for(int i = -PIC_BORDER; i < 0; i++) buf[k++] = colour(-1 - i);
+  send(x - PIC_BORDER, y, PIC_BORDER, PIC_SIZE); k = 0;
+  for(int j = 0; j < PIC_SIZE; j++) for(int i = PIC_SIZE; i < PIC_SIZE + PIC_BORDER; i++) buf[k++] = colour(i - PIC_SIZE);
+  send(x + PIC_SIZE, y, PIC_BORDER, PIC_SIZE);
+}
+
+// loop(): the next frame of every spinning tile that is not covered by the title
+void animateLiveFrames(){
+  static unsigned long last = 0;
+  if(millis() - last < LIVE_SPIN_FRAME) return;
+  last = millis();
+  for(int8_t slot = 0; slot < MAX_NUM_PICS && slot < live_num; slot++){
+    if(!tileSpinning(slot)) continue;
+    if(isTitleDisplaying && slotRow(slot) != slotRow(channelTitleInfo.slot)) continue;   // under the title
+    if(isTitleDisplaying && slot == channelTitleInfo.slot && titleOnPlusTile()) continue;   // keeps its green frame and "+N" badge
+    drawLiveFrame(slot);
+  }
+}
+
+// loop(): the dot goes after 10 minutes
+void checkLiveDots(){
+  static unsigned long last = 0;
+  if(millis() - last < 1000) return;
+  last = millis();
+  bool redraw = false;
+  for(auto& c : channels) if(c.liveAt && millis() - c.liveAt >= LIVE_DOT_MS){ c.liveAt = 0; redraw = true; }
+  if(!redraw) return;
+  if(!isTitleDisplaying) redrawLiveChannelPics();
+  else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }   // the other row is redrawn when the title ends
 }
 
 // Gives every live channel the next slot in list order and offline channels -1.
@@ -2758,11 +2903,14 @@ void applyLiveUpdate(const LiveUpdate& update){
   }
   setStatus(STATUS_OK);
 
+  std::vector<bool> wasLive;
+  for (auto &&c : channels) wasLive.push_back(c.isLive);
   // slotNum is kept so assignSlots() can detect layout changes
   for (auto &&c : channels) {
     c.isLive = false;
   }
   bool statsChanged = false;
+  std::vector<channelInfo*> wentLive;
 
   for (const StreamInfo& stream : update.streams) {
     channelInfo* ch = findChannel(stream.id);
@@ -2778,6 +2926,7 @@ void applyLiveUpdate(const LiveUpdate& update){
     ch->viewers = stream.viewers;
     ch->uptime = stream.uptime;
     ch->uptimeAt = millis();
+    if(liveUpdates && !wasLive[ch - &channels[0]]) wentLive.push_back(ch);
 
     if (ch->streamTitle != stream.title) {
       ch->streamTitle = stream.title;
@@ -2788,7 +2937,10 @@ void applyLiveUpdate(const LiveUpdate& update){
     }
   }
 
+  liveUpdates++;
+  for (auto &&c : channels) if(!c.isLive){ c.liveAt = 0; c.liveSpin = false; }
   bool layoutChanged = assignSlots();
+  if(liveHighlight) for(channelInfo* ch : wentLive) channelWentLive(ch);
 
   if(isTitleDisplaying){
     channelInfo* ch = channelTitleInfo.channel;
@@ -3165,6 +3317,12 @@ void handleStatus(){
   }
   if(!live) b += "<p class=\"muted\">No channel is live.</p>";
   else b += "<form method=\"post\" action=\"/titles/show\"><p><button>Show all titles on the display</button></p></form>";
+  if(live){   // test firmware: pretend a channel just went live
+    b += "<form method=\"post\" action=\"/live/simulate\"><p><select name=\"ch\">";
+    for(size_t i = 0; i < channels.size(); i++) if(channels[i].isLive)
+      b += String("<option value=\"") + String((unsigned)i) + "\">" + htmlEscape(channels[i].name.empty() ? channels[i].id : channels[i].name) + "</option>";
+    b += "</select> <button>Simulate going live</button></p></form>";
+  }
   if(isTitleDisplaying || !titleChangeQueue.empty()){
     unsigned waiting = titleChangeQueue.size();
     b += "<form method=\"post\" action=\"/titles/stop\"><p><button>Stop titles</button> <span class=\"muted\">"
@@ -3413,7 +3571,22 @@ void handleShowTitles(){
 void handleStopTitles(){
   if(!checkAuth()) return;
   titleChangeQueue.clear();
+  for(auto& c : channels) c.liveSpin = false;   // nothing is waiting any more
   if(isTitleDisplaying) stopTitle();   // redraws the tiles; the title repeat counts from now
+  else redrawLiveChannelPics();
+  server.sendHeader("Location", "/", true);
+  server.send(303, "text/plain", "");
+}
+
+// Test firmware: a live channel behaves as if it had just gone live
+void handleSimulateLive(){
+  if(!checkAuth()) return;
+  long i = server.arg("ch").toInt();
+  if(i >= 0 && i < (long)channels.size() && channels[i].isLive){
+    channelWentLive(&channels[i]);
+    if(!isTitleDisplaying) redrawLiveChannelPics();
+    else { redrawLiveChannelPics(slotRow(channelTitleInfo.slot)); drawTitleIndicator(); }
+  }
   server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "");
 }
@@ -3439,6 +3612,7 @@ void setupWeb(){
   server.on("/logos/reload", HTTP_POST, handleLogoReload);
   server.on("/titles/show", HTTP_POST, handleShowTitles);
   server.on("/titles/stop", HTTP_POST, handleStopTitles);
+  server.on("/live/simulate", HTTP_POST, handleSimulateLive);
   server.on("/cache/clear", HTTP_POST, handleCacheClear);
   server.on("/coredump", HTTP_GET, handleCoredumpDownload);
   server.on("/coredump/clear", HTTP_POST, handleCoredumpClear);
