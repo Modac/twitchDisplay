@@ -50,6 +50,8 @@ bool TitleFont::begin(const FontBin& bin){
   end();
   if(!bin.text || !stbtt_InitFont((stbtt_fontinfo*)textInfo, bin.text, 0)) return false;
   hasEmoji = bin.emoji && stbtt_InitFont((stbtt_fontinfo*)emojiInfo, bin.emoji, 0);
+  int x0, y0, x1, y1;
+  capHeight = stbtt_GetCodepointBox((stbtt_fontinfo*)textInfo, 'H', &x0, &y0, &x1, &y1) ? y1 : 0;
   isReady = true;
   return true;
 }
@@ -89,6 +91,56 @@ bool TitleFont::render(uint32_t cp, float em, GlyphBitmap& out) const {
   out.w = (int16_t)(x1 - x0); out.h = (int16_t)(y1 - y0);
   out.alpha.assign((size_t)out.w * out.h, 0);
   stbtt_MakeGlyphBitmap(f, out.alpha.data(), out.w, out.h, out.w, scale, scale, gi);
+  return true;
+}
+
+// Resamples rows [from, from + n) of g into m rows (m < n), area weighted
+static std::vector<uint8_t> squeezeRows(const GlyphBitmap& g, int from, int n, int m){
+  std::vector<uint8_t> out((size_t)m * g.w);
+  float k = (float)n / m;
+  for(int i = 0; i < m; i++){
+    float a = i * k, b = (i + 1) * k;
+    for(int x = 0; x < g.w; x++){
+      float sum = 0;
+      for(int r = (int)a; r < n && r < b; r++){
+        float w = fminf(b, r + 1.0f) - fmaxf(a, (float)r);
+        if(w > 0) sum += w * g.alpha[(size_t)(from + r) * g.w + x];
+      }
+      out[(size_t)i * g.w + x] = (uint8_t)fminf(255.0f, sum / k + 0.5f);
+    }
+  }
+  return out;
+}
+
+void fitGlyph(GlyphBitmap& g, int capPx, int maxAbove, int maxBelow){
+  if(g.w <= 0 || g.h <= 0) return;
+  // above: rows from the top (yoff) to the capital line (-capPx) go into maxAbove - capPx rows
+  int target = maxAbove - capPx, split = -capPx - g.yoff;
+  if(maxAbove > 0 && -g.yoff > maxAbove && target > 0 && split > target && split <= g.h){
+    std::vector<uint8_t> marks = squeezeRows(g, 0, split, target);
+    std::vector<uint8_t> a(marks);
+    a.insert(a.end(), g.alpha.begin() + (size_t)split * g.w, g.alpha.end());
+    g.alpha.swap(a);
+    g.h = (int16_t)(g.h - split + target);
+    g.yoff = (int16_t)-maxAbove;
+  }
+  // below: the rows under the baseline (all of a mark that starts below it) go into the rows left
+  int from = g.yoff < 0 ? -g.yoff : 0, top = g.yoff < 0 ? 0 : g.yoff;
+  int rows = g.h - from, room = maxBelow - top;
+  if(maxBelow > 0 && g.yoff + g.h > maxBelow && room > 0 && rows > room){
+    std::vector<uint8_t> low = squeezeRows(g, from, rows, room);
+    g.alpha.resize((size_t)from * g.w);
+    g.alpha.insert(g.alpha.end(), low.begin(), low.end());
+    g.h = (int16_t)(from + room);
+  }
+}
+
+bool TitleFont::render(uint32_t cp, float em, GlyphBitmap& out, int maxAbove, int maxBelow) const {
+  if(!render(cp, em, out)) return false;
+  if(sourceFor(cp) == TEXT){
+    float scale = stbtt_ScaleForMappingEmToPixels((const stbtt_fontinfo*)textInfo, em);
+    fitGlyph(out, (int)ceilf(capHeight * scale), maxAbove, maxBelow);
+  }
   return true;
 }
 

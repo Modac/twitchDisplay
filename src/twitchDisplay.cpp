@@ -1173,7 +1173,7 @@ bool renderAheadStep(){
   if(!gap && !colour && !cachedGlyph && (c || !key)){
     if(builtin) renderBuiltinGlyph((uint8_t)c, glyph);
     else if(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < GLYPH_MIN_FREE_BLOCK) box = c != ' ';  // no RAM: a box instead of failing
-    else box = !titleFont.render(c, TITLE_EM, glyph);
+    else box = !titleFont.render(c, TITLE_EM, glyph, TITLE_BASELINE, PIC_SIZE - TITLE_BASELINE);   // squeezes stacked marks into the row
   }
 
   xSemaphoreTake(titleLock, portMAX_DELAY);

@@ -100,7 +100,9 @@ whose title was shown longest ago comes next, chance decides among equals.
 
 Titles are drawn in Noto Sans SemiBold: Latin with all its extensions
 (including Vietnamese), Greek, Cyrillic, Thai (vowel and tone marks without
-shaping, so stacked marks can overlap), typographic quotes and dashes. Emoji appear in colour: the display
+shaping, so stacked marks can overlap), typographic quotes and dashes.
+Letters taller than the title row (Vietnamese capitals with two stacked marks
+like Ẫ or Ổ) keep their size; only their marks are squeezed flatter. Emoji appear in colour: the display
 downloads each one once as a [Twemoji](https://github.com/jdecked/twemoji)
 image (CC-BY 4.0) from cdn.jsdelivr.net before the title starts, and keeps
 about 60 of them in flash (the oldest are replaced), from where they are drawn

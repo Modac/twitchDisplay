@@ -52,6 +52,12 @@ public:
   Source sourceFor(uint32_t cp) const;              // which font has cp (text font first)
   int advance(uint32_t cp, float em) const;         // pixels; a box (0.6 em) without glyph
   bool render(uint32_t cp, float em, GlyphBitmap& out) const;  // false: no glyph (draw a box)
+  // As render(), but the glyph fits into maxAbove pixels above and maxBelow
+  // below the baseline: a character taller than that (e.g. Vietnamese capitals
+  // with two stacked marks) keeps its body, and only the part above the
+  // capital height (the marks) is squeezed into the room left; below the
+  // baseline the part under it. 0: no limit.
+  bool render(uint32_t cp, float em, GlyphBitmap& out, int maxAbove, int maxBelow) const;
 
   // Renders cp from any TrueType font in memory (e.g. a downloaded CJK
   // piece); advance in pixels. False if the font has no glyph for cp.
@@ -60,6 +66,7 @@ public:
 private:
   void* textInfo;    // stbtt_fontinfo
   void* emojiInfo;
+  int capHeight = 0;   // font units ('H')
   bool hasEmoji = false;
   bool isReady = false;
 };
@@ -71,6 +78,11 @@ struct TitleChar {
   uint32_t cp = 0;
   std::string emoji;    // empty: not an emoji
 };
+
+// Squeezes the rows of g above the line capPx pixels above the baseline into
+// maxAbove - capPx rows (area average) if g reaches higher than maxAbove, and
+// the rows below the baseline into maxBelow rows if it reaches lower.
+void fitGlyph(GlyphBitmap& g, int capPx, int maxAbove, int maxBelow);
 
 // UTF-8 text -> title characters. Control characters become spaces; emoji
 // sequences (flags, keycaps, skin tones, zero width joiner sequences, tag

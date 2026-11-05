@@ -525,6 +525,28 @@ int main(){
     CHECK(titleFont.render('g', TITLE_EM, g) && TITLE_BASELINE + g.yoff + g.h <= ROW_HEIGHT_FOR_TEST);   // descender fits
     CHECK(titleFont.render(0x1F525, TITLE_EM, g) && g.w > 30);
     CHECK(!titleFont.render(0x65E5, TITLE_EM, g) && titleFont.advance(0x65E5, TITLE_EM) == (int)(TITLE_EM * 0.6f));
+    printf("    stacked marks squeezed into the row: the letter body unchanged, normal letters untouched\n");
+    { const int above = TITLE_BASELINE, below = PIC_SIZE - TITLE_BASELINE;
+      GlyphBitmap plain, fit;
+      for(uint32_t cp : {0x1EAAu /*Ẫ*/, 0x1EC4u /*Ễ*/, 0x1ED4u /*Ổ*/, 0x1E14u /*Ḕ*/, 0x1EA8u /*Ẩ*/}){
+        CHECK(titleFont.render(cp, TITLE_EM, plain) && TITLE_BASELINE + plain.yoff < 0);   // too tall without squeezing
+        CHECK(titleFont.render(cp, TITLE_EM, fit, above, below) && fit.yoff == -above && fit.w == plain.w && fit.xoff == plain.xoff);
+        CHECK(fit.h < plain.h && (int)fit.alpha.size() == fit.w * fit.h);
+        int marks = 0; for(int i = 0; i < fit.w * 10; i++) marks += fit.alpha[i] > 128;   // the marks are still there
+        CHECK(marks > 20);
+        int bodyRows = 39 + plain.yoff + plain.h;    // rows from the capital line down are identical
+        CHECK(memcmp(&plain.alpha[(size_t)(plain.h - bodyRows) * plain.w], &fit.alpha[(size_t)(fit.h - bodyRows) * fit.w], (size_t)bodyRows * plain.w) == 0);
+      }
+      for(uint32_t cp : {(uint32_t)'A', (uint32_t)'g', 0xC4u, 0x1EA1u /*ạ*/, 0x1EC7u /*ệ*/, 0x1EA4u /*Ấ*/, 0x0E39u /*Thai sara uu*/}){
+        titleFont.render(cp, TITLE_EM, plain); titleFont.render(cp, TITLE_EM, fit, above, below);
+        bool fits = TITLE_BASELINE + plain.yoff >= 0 && plain.yoff + plain.h <= below;
+        if(fits) CHECK(plain.h == fit.h && plain.yoff == fit.yoff && plain.alpha == fit.alpha);
+        CHECK(TITLE_BASELINE + fit.yoff >= 0 && fit.yoff + fit.h <= below);
+      }
+      CHECK(titleFont.render(0x0E38, TITLE_EM, plain) && plain.yoff + plain.h > below);          // Thai sara u reaches below the row
+      CHECK(titleFont.render(0x0E38, TITLE_EM, fit, above, below) && fit.yoff + fit.h == below && fit.yoff == plain.yoff);
+      CHECK(titleFont.render(0x1F525, TITLE_EM, plain) && titleFont.render(0x1F525, TITLE_EM, fit, above, below) && plain.alpha == fit.alpha);   // emoji untouched
+    }
 
     printf("    a title with emoji and a character no font has (box)\n");
     reset(); setResponse({{0,"Stream \xf0\x9f\x94\xa5 \xe6\x97\xa5 \xd0\x96"}}); loopWithUpdate();
